@@ -1,3 +1,6 @@
+"""
+The model to handle interaction with the camera
+"""
 from harvesters.core import Harvester, ImageAcquirer
 import cv2
 import numpy as np

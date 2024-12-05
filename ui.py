@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
-import sys
+"""This is the ViewModel in the MVVM pattern.
+
+All user interaction with the ui is handled in here and communicated to the modle (cam.py)
+"""
 
 import numpy as np
 import pyqtgraph as pg
@@ -8,6 +10,7 @@ from PyQt6 import QtWidgets
 import cam
 from MainWindow import Ui_MainWindow
 from VideoThread import VideoThread
+
 
 class MainWindow(QtWidgets.QMainWindow):
     """Main window for the application.
@@ -36,28 +39,24 @@ class MainWindow(QtWidgets.QMainWindow):
         # Setup and add the ImageItem for displaying the video feed
         self.image_item = pg.ImageItem()
         self.ui.graphicsView.addItem(self.image_item)
-        self.videothread: None | VideoThread = None
 
+        # Initialize variables
+        self.videothread: None | VideoThread = None
+        self.is_running: bool = False
+        self.source: str = "random"
+
+        self.setup_ui_components()
+
+    def setup_ui_components(self) -> None:
+        """Setup UI components and connect signals."""
         # Connect the buttons to their respective functions
         self.ui.pb_connect.clicked.connect(self.connect_video)
         self.ui.pb_live.clicked.connect(self.toggle_video)
         self.ui.actionExit.triggered.connect(self.close)
+
+        # Disable certain elements initially
         self.ui.pb_live.setDisabled(True)
         self.ui.lbl_status.setStyleSheet("color: red;")
-
-        # Initialize the video source and set the default source to "random"
-        self.is_running: bool = False
-        self.source: str = "random"
-        self.ui.cb_source.addItem("random")
-
-        # Detect all available cameras for opencv:
-        self.cam_indices: list[int] = cam.returnCameraIndices()
-        # Add the available opencv video sources to the combobox
-        [self.ui.cb_source.addItem(f"Webcam {i}") for i in self.cam_indices]
-
-        # Detect all available cameras for harvesters:
-        self.harvester_cams: list[dict] = cam.returnHarvesterCameras()
-        [self.ui.cb_source.addItem(f"{cam['display_name']}") for cam in self.harvester_cams if cam["model"] != "Unknown Model"]
 
         # TODO:
         self.ui.pb_acquire.setDisabled(True)
@@ -69,6 +68,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.le_seconds.setDisabled(True)
         self.ui.le_black_level.setDisabled(True)
         self.ui.progressBar.setDisabled(True)
+
+        self.populate_video_sources()
+
+    def populate_video_sources(self) -> None:
+        """Populate combobox with available video sources."""
+        self.ui.cb_source.addItem("random")
+
+        # Add OpenCV camera indices
+        cam_indices: list[int] = cam.returnCameraIndices()
+        [self.ui.cb_source.addItem(f"Webcam {i}") for i in cam_indices]
+
+        # Add Harvester cameras
+        harvester_cams: list[dict] = cam.returnHarvesterCameras()
+        [
+            self.ui.cb_source.addItem(f"{cam['display_name']}")
+            for cam in harvester_cams
+            if cam["model"] != "Unknown Model"
+        ]
 
     def connect_video(self) -> None:
         """Read the video source and start the video thread"""
@@ -121,14 +138,3 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_image(self, frame: np.ndarray) -> None:
         self.image_item.setImage(frame)
-
-
-def main() -> None:
-    app = QtWidgets.QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
