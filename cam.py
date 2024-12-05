@@ -1,9 +1,29 @@
 """
 The model to handle interaction with the camera
 """
+
 from harvesters.core import Harvester, ImageAcquirer
 import cv2
 import numpy as np
+import os
+from pathlib import Path
+import glob
+
+
+def find_common_cti_files() -> list[str]:
+    ctis = []
+    env_var = os.getenv("GENICAM_GENTL64_PATH")
+    if env_var:
+        ctis.extend(glob.glob(f"{env_var}/*.cti"))
+    cti = (
+        r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti"
+    )
+    if Path(cti).exists():
+        ctis.append(cti)
+    cti = "/usr/local/activesilicon/lib64/TLActiveSilicon.cti"
+    if Path(cti).exists():
+        ctis.append(cti)
+    return ctis
 
 
 def setup_cam(
@@ -64,7 +84,9 @@ def setup_webcam(idx: int) -> cv2.VideoCapture:
     return cap
 
 
-def returnHarvesterCameras(cti: str = r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti") -> list[dict]:
+def returnHarvesterCameras(
+    cti: str = r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti",
+) -> list[dict]:
     h = Harvester()
     h.add_file(cti)
     # Enumerate the available devices that GenTL Producers can handle:
