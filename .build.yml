@@ -1,0 +1,14 @@
+image: archlinux
+oauth: git.sr.ht/REPOSITORIES:RW git.sr.ht/PROFILE:RO
+secrets:
+  - 30dbc432-69bb-452b-af37-58ccea4d9a11
+packages:
+  - hut
+  - pandoc
+sources:
+  - git@git.sr.ht:~weidtn/harvesters_pg
+tasks:
+  - update-readme: |
+      cd harvesters_pg
+      pandoc -o README.html README.org
+      hut git -r harvesters_pg update --readme README.html
