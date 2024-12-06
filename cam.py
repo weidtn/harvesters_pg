@@ -8,9 +8,11 @@ import numpy as np
 import os
 from pathlib import Path
 import glob
+import logging
 
 
 def find_common_cti_files() -> list[str]:
+    logging.info("Looking for *.cti files...")
     ctis = []
     env_var = os.getenv("GENICAM_GENTL64_PATH")
     if env_var:
@@ -23,6 +25,7 @@ def find_common_cti_files() -> list[str]:
     cti = "/usr/local/activesilicon/lib64/TLActiveSilicon.cti"
     if Path(cti).exists():
         ctis.append(cti)
+    logging.info(f"Found *.cti files: {ctis}")
     return ctis
 
 
@@ -76,7 +79,15 @@ def setup_cam(
     nodes = ia.remote_device.node_map
     nodes.AcquisitionFrameRate.value = fps
     nodes.BlackLevel.value = blacklevel
+    warmup_cam(ia)
     return h, ia
+
+
+def warmup_cam(ia, frames: int = 10):
+    logging.info(f"Warming up camera by collecting {frames} frames.")
+    for _ in range(frames):
+        buffer = ia.fetch()
+        buffer.queue()
 
 
 def setup_webcam(idx: int) -> cv2.VideoCapture:
@@ -84,18 +95,19 @@ def setup_webcam(idx: int) -> cv2.VideoCapture:
     return cap
 
 
-def returnHarvesterCameras(
-    cti: str = r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti",
+def return_harvester_cameras(
+    ctis: list[str] = [r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti"],
 ) -> list[dict]:
     h = Harvester()
-    h.add_file(cti)
+    [h.add_file(cti) for cti in ctis]
     # Enumerate the available devices that GenTL Producers can handle:
     h.update()
     devices = [cam.property_dict for cam in h.device_info_list]
+    h.reset()
     return devices
 
 
-def returnCameraIndices() -> list[int]:
+def get_camera_indices() -> list[int]:
     # checks the first 10 indices for opencv detectable cameras.
     arr = []
     for i in range(10):
@@ -123,3 +135,11 @@ def get_webcam_image(cap: cv2.VideoCapture) -> np.ndarray:
 
 def get_random_image(_: None) -> np.ndarray:
     return np.random.randint(0, 255, (1920, 1080), dtype=np.uint8)
+
+
+def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
+    with ia.fetch() as buffer:
+        component = buffer.payload.components[0]
+        img = component.dataimg = buffer.payload.components[0].data
+        img = np.reshape(img, (buffer.payload.components[0].height, buffer.payload.components[0].width))
+    return img

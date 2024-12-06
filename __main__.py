@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+os.environ['OPENCV_LOG_LEVEL'] = 'OFF'
 import sys
 from PyQt6 import QtWidgets
 from ui import MainWindow

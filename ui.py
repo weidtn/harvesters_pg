@@ -76,18 +76,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.cb_source.addItem("random")
 
         # Add OpenCV camera indices
-        cam_indices: list[int] = cam.returnCameraIndices()
+        cam_indices: list[int] = cam.get_camera_indices()
         [self.ui.cb_source.addItem(f"Webcam {i}") for i in cam_indices]
 
         # Add Harvester cameras
         ctis = cam.find_common_cti_files()
-        for cti in ctis:
-            harvester_cams: list[dict] = cam.returnHarvesterCameras(cti)
-            [
-                self.ui.cb_source.addItem(f"{cam['display_name']}")
-                for cam in harvester_cams
-                if cam["model"] != "Unknown Model"
-            ]
+        harvester_cams: list[dict] = cam.return_harvester_cameras(ctis)
+        [
+            self.ui.cb_source.addItem(f"{cam['display_name']}")
+            for cam in harvester_cams
+            if cam["model"] != "Unknown Model"
+        ]
 
     def connect_video(self) -> None:
         """Read the video source and start the video thread"""
