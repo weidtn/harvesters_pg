@@ -8,6 +8,6 @@ uv run __main__.py
 #+end_src
 
 * Configuration
-Available cameras should be automatically detected on startup. GenTL Producers (*.cti files) will be detected in the path given by the environment variable GENICAM_GENTL64_PATH (analogous to [[https://github.com/AravisProject/aravis][aravis]]).
+Available cameras should be automatically detected on startup. GenTL Producers (*.cti files) will be detected in the path given by the environment variable ~GENICAM_GENTL64_PATH~ (analogous to [[https://github.com/AravisProject/aravis][aravis]]).
 
 * TODO Add configuration file
