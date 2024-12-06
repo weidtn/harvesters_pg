@@ -2,7 +2,8 @@ import cv2
 import numpy as np
 import cam
 
-h, ia = cam.setup_cam()
+ctis = cam.find_common_cti_files()
+h, ia = cam.setup_cam(ctis[0])
 
 try:
     while True:
