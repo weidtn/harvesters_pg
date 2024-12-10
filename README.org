@@ -1,5 +1,5 @@
 * Introduction
-This program is an image acquisition software mainly intended for cameras, by using the [[https://github.com/genicam/harvesters][Harvester]] package. Furthermore it is possible to use more generic cameras via OpenCV.
+This program is an image acquisition software mainly intended for cameras, by using the [[https://github.com/genicam/harvesters][Harvester]] package in combination with [[https://www.pyqtgraph.org/][PyQtGraph]] (thats where the pg in the name comes from). Furthermore it is possible to use more generic cameras via OpenCV.
 
 * Installation
 Do yourself a favour and install [[https://github.com/astral-sh/uv][uv]]. Running this program is then as easy as going into the directory and executing:
@@ -11,3 +11,7 @@ uv run __main__.py
 Available cameras should be automatically detected on startup. GenTL Producers (*.cti files) will be detected in the path given by the environment variable ~GENICAM_GENTL64_PATH~ (analogous to [[https://github.com/AravisProject/aravis][aravis]]).
 
 * TODO Add configuration file
+Configuration files (probably .ini) should be read at the beginning, so default values can be set and saved.
+
+* TODO Add recording
+Until now only liveview of the camera is possible. Recording into different file formats (.avi .mov .h5) will be implemented
