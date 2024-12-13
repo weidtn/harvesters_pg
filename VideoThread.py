@@ -66,7 +66,7 @@ class VideoThread(QtCore.QThread):
         while self._run_flag:
             frame = self.image_func(self.cap)
             self.change_pixmap_signal.emit(frame)
-            time.sleep(0.03)  # Add a small delay to control frame rate
+            time.sleep(1/30)  # Add a small delay to control frame rate
 
     def stop(self) -> None:
         self._run_flag = False
