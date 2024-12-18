@@ -73,7 +73,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def populate_video_sources(self) -> None:
         """Populate combobox with available video sources."""
-        self.ui.cb_source.addItem("random")
 
         # Add OpenCV camera indices
         cam_indices: list[int] = cam.get_camera_indices()
@@ -87,6 +86,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for cam in harvester_cams
             if cam["model"] != "Unknown Model"
         ]
+        self.ui.cb_source.addItem("random")
 
     def connect_video(self) -> None:
         """Read the video source and start the video thread"""
