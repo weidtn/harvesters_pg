@@ -80,108 +80,113 @@
          </widget>
         </item>
         <item>
-         <layout class="QVBoxLayout" name="verticalLayout_3">
-          <item>
-           <layout class="QHBoxLayout" name="horizontalLayout_8">
-            <item>
-             <widget class="QLabel" name="lbl_fps">
-              <property name="text">
-               <string>FPS</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLineEdit" name="le_fps">
-              <property name="text">
-               <string>30</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLabel" name="lbl_fps_minmax">
-              <property name="text">
-               <string>(1-2123)</string>
-              </property>
-             </widget>
-            </item>
-           </layout>
-          </item>
-          <item>
-           <layout class="QHBoxLayout" name="horizontalLayout_5">
-            <item>
-             <widget class="QLabel" name="lbl_exposure">
-              <property name="text">
-               <string>Exposure</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLineEdit" name="le_exposure">
-              <property name="text">
-               <string>1000</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLabel" name="lbl_exposure_minmax">
-              <property name="text">
-               <string>(1-1000)</string>
-              </property>
-             </widget>
-            </item>
-           </layout>
-          </item>
-          <item>
-           <layout class="QHBoxLayout" name="horizontalLayout_6">
-            <item>
-             <widget class="QLabel" name="lbl_analog_gain">
-              <property name="text">
-               <string>Analog Gain</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLineEdit" name="le_analog_gain">
-              <property name="text">
-               <string>1</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLabel" name="lbl_analog_gain_minmax_2">
-              <property name="text">
-               <string>(1-4x)</string>
-              </property>
-             </widget>
-            </item>
-           </layout>
-          </item>
-          <item>
-           <layout class="QHBoxLayout" name="horizontalLayout_7">
-            <item>
-             <widget class="QLabel" name="lbl_black_level">
-              <property name="text">
-               <string>Black Level</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLineEdit" name="le_black_level">
-              <property name="text">
-               <string>255</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLabel" name="lbl_black_level_minmax">
-              <property name="text">
-               <string>(1-255)</string>
-              </property>
-             </widget>
-            </item>
-           </layout>
-          </item>
-         </layout>
+         <widget class="QWidget" name="settings" native="true">
+          <property name="enabled">
+           <bool>true</bool>
+          </property>
+          <layout class="QVBoxLayout" name="vLay_settings">
+           <item>
+            <layout class="QHBoxLayout" name="hLay_FPS">
+             <item>
+              <widget class="QLabel" name="lbl_fps">
+               <property name="text">
+                <string>FPS</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLineEdit" name="le_fps">
+               <property name="text">
+                <string>30</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="lbl_fps_minmax">
+               <property name="text">
+                <string>(1-2123)</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="hLay_exposure">
+             <item>
+              <widget class="QLabel" name="lbl_exposure">
+               <property name="text">
+                <string>Exposure</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLineEdit" name="le_exposure">
+               <property name="text">
+                <string>1000</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="lbl_exposure_minmax">
+               <property name="text">
+                <string>(1-1000)</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="hLay_analog_gain">
+             <item>
+              <widget class="QLabel" name="lbl_analog_gain">
+               <property name="text">
+                <string>Analog Gain</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLineEdit" name="le_analog_gain">
+               <property name="text">
+                <string>1</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="lbl_analog_gain_minmax_2">
+               <property name="text">
+                <string>(1-4x)</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="hLay_black_level">
+             <item>
+              <widget class="QLabel" name="lbl_black_level">
+               <property name="text">
+                <string>Black Level</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLineEdit" name="le_black_level">
+               <property name="text">
+                <string>255</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="lbl_black_level_minmax">
+               <property name="text">
+                <string>(1-255)</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+          </layout>
+         </widget>
         </item>
        </layout>
       </item>
@@ -256,7 +261,7 @@
      <x>0</x>
      <y>0</y>
      <width>1158</width>
-     <height>22</height>
+     <height>21</height>
     </rect>
    </property>
    <widget class="QMenu" name="menuFile">

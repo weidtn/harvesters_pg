@@ -59,16 +59,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.lbl_status.setStyleSheet("color: red;")
 
         # TODO:
-        self.ui.pb_acquire.setDisabled(True)
-        self.ui.pb_settings.setDisabled(True)
-        self.ui.le_analog_gain.setDisabled(True)
-        self.ui.le_exposure.setDisabled(True)
-        self.ui.le_fps.setDisabled(True)
-        self.ui.le_frames.setDisabled(True)
-        self.ui.le_seconds.setDisabled(True)
-        self.ui.le_black_level.setDisabled(True)
-        self.ui.progressBar.setDisabled(True)
-
+        self.ui.settings.setHidden(True)
         self.populate_video_sources()
 
     def populate_video_sources(self) -> None:
