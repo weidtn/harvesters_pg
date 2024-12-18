@@ -65,19 +65,18 @@ def setup_cam(
     ia = h.create(0)
 
     nodes = ia.remote_device.node_map
-
     # Check if the FPS are okay:
     max_fps = nodes.AcquisitionFrameRateMax.value
     if fps > max_fps:
         fps = max_fps
         logging.warning(f"FPS is too high for the camera. Setting it to the maximum possible: {fps}")
+    nodes.AcquisitionFrameRate.value = fps
 
     max_exposure = int((1.0/fps)*1e6 - 1)
     if exposure >= max_exposure:
         exposure = int(max_exposure)
         logging.warning(f"Exposure time is too high for given FPS. Setting it to the maximum: {exposure}")
 
-    # ia.remote_device.node_map.ChunkSelector.value = 'ExposureTime'
     nodes.ExposureTime.set_value(exposure)
 
     # Allow the ImageAcquire object to start image acquisition:
@@ -85,7 +84,6 @@ def setup_cam(
     nodes.Width.value = width
 
     ia.start()
-    nodes.AcquisitionFrameRate.value = fps
     nodes.BlackLevel.value = blacklevel
     warmup_cam(ia)
     return h, ia
