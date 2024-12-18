@@ -7,6 +7,7 @@ from typing import Callable
 import time
 from harvesters.core import Harvester, ImageAcquirer
 
+
 class VideoThread(QtCore.QThread):
     """Worker thread for capturing video frames.
 
@@ -46,8 +47,7 @@ class VideoThread(QtCore.QThread):
         else:
             # TODO: Manage the cti files better
             cti = cam.find_common_cti_files()[0]
-            self.harvester, self.cap = cam.setup_cam(cti = cti)
-
+            self.harvester, self.cap = cam.setup_cam(cti=cti)
 
     def __del__(self) -> None:
         if type(self.cap) is cv2.VideoCapture:
@@ -55,10 +55,12 @@ class VideoThread(QtCore.QThread):
         elif type(self.cap) is None:
             pass
         else:
-            self.harvester.reset()
-            self.harvester = None
-            self.cap.stop()
-            self.cap.destroy()
+            if self.harvester is not None:
+                self.harvester.reset()
+                self.harvester = None
+            if self.cap is not None:
+                self.cap.stop()
+                self.cap.destroy()
 
     def run(self) -> None:
         """Capture video frames and emit the frame to the main thread."""
@@ -66,7 +68,7 @@ class VideoThread(QtCore.QThread):
         while self._run_flag:
             frame = self.image_func(self.cap)
             self.change_pixmap_signal.emit(frame)
-            time.sleep(1/30)  # Add a small delay to control frame rate
+            time.sleep(1 / 30)  # Add a small delay to control frame rate
 
     def stop(self) -> None:
         self._run_flag = False
