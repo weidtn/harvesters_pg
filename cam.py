@@ -38,7 +38,7 @@ def setup_cam(
     width: int = 1920,
     fps: int = 30,
     blacklevel: int = 255,
-    exposure: int = int((1.0/30)*1e6 - 1),
+    exposure: int = 5000,
 ) -> tuple[Harvester, ImageAcquirer]:
     """Set the camera up using the Harvester API.
 
