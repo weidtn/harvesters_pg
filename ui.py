@@ -24,7 +24,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     Attributes:
         ui (Ui_MainWindow): The UI object created using Qt Designer
-        image_item (pg.ImageItem): The ImageItem to display the video feed
         videothread (VideoThread | None): The worker thread to capture video frames
         is_running (bool): Flag to control the video feed
         source (str): The video source
@@ -37,8 +36,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.setupUi(self)
 
         # Setup and add the ImageItem for displaying the video feed
-        self.image_item = pg.ImageItem()
-        self.ui.graphicsView.addItem(self.image_item)
+        self.ui.ImageView.getHistogramWidget().setHidden(True)
+        self.ui.ImageView.ui.menuBtn.setHidden(True)
+        self.ui.ImageView.ui.roiBtn.setHidden(True)
+        self.ui.ImageView.getView().setAspectLocked(True)
+        # Disable menu
+        self.ui.ImageView.getView().setMenuEnabled(False)
+        self.Image = self.ui.ImageView
 
         # Initialize variables
         self.videothread: None | VideoThread = None
@@ -129,4 +133,4 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pause_video()
 
     def update_image(self, frame: np.ndarray) -> None:
-        self.image_item.setImage(frame)
+        self.Image.setImage(frame, autoRange=False)

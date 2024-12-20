@@ -19,9 +19,9 @@ class Ui_MainWindow(object):
         self.gridLayout.setObjectName("gridLayout")
         self.verticalLayout_2 = QtWidgets.QVBoxLayout()
         self.verticalLayout_2.setObjectName("verticalLayout_2")
-        self.graphicsView = GraphicsView(parent=self.centralwidget)
-        self.graphicsView.setObjectName("graphicsView")
-        self.verticalLayout_2.addWidget(self.graphicsView)
+        self.ImageView = ImageView(parent=self.centralwidget)
+        self.ImageView.setObjectName("ImageView")
+        self.verticalLayout_2.addWidget(self.ImageView)
         self.horizontalLayout = QtWidgets.QHBoxLayout()
         self.horizontalLayout.setObjectName("horizontalLayout")
         self.cb_source = QtWidgets.QComboBox(parent=self.centralwidget)
@@ -42,7 +42,6 @@ class Ui_MainWindow(object):
         font = QtGui.QFont()
         font.setPointSize(20)
         font.setBold(False)
-        font.setWeight(50)
         self.lbl_status.setFont(font)
         self.lbl_status.setScaledContents(False)
         self.lbl_status.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -181,4 +180,4 @@ class Ui_MainWindow(object):
         self.pb_acquire.setText(_translate("MainWindow", "Record"))
         self.menuFile.setTitle(_translate("MainWindow", "File"))
         self.actionExit.setText(_translate("MainWindow", "Exit"))
-from pyqtgraph import GraphicsView
+from pyqtgraph import ImageView
