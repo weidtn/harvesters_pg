@@ -66,9 +66,11 @@ class VideoThread(QtCore.QThread):
         """Capture video frames and emit the frame to the main thread."""
 
         while self._run_flag:
-            frame = self.image_func(self.cap)
-            self.change_pixmap_signal.emit(frame)
-            time.sleep(0.1)  # Add a small delay to control frame rate
+            try:
+                frame = self.image_func(self.cap)
+                self.change_pixmap_signal.emit(frame)
+            except Exception as e:
+                pass
 
     def stop(self) -> None:
         self._run_flag = False
