@@ -5,11 +5,12 @@ All user interaction with the ui is handled in here and communicated to the modl
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6 import QtWidgets
+from PyQt6 import QtWidgets, QtCore
 
 import cam
 from MainWindow import Ui_MainWindow
 from VideoThread import VideoThread
+import importexport
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -20,7 +21,7 @@ class MainWindow(QtWidgets.QMainWindow):
     The video feed is displayed using pyqtgraph's ImageItem.
     The user can select the video source from a combobox and connect to the source using the "Connect" button.
     The "Start"/"Stop" button starts and pauses the video feed.
-    The "Record" button is disabled for now, but will be used to record a given number of frames into a hdf5 file.
+    The "Record" button can be used to record a given number of frames into a hdf5 file.
 
     Attributes:
         ui (Ui_MainWindow): The UI object created using Qt Designer
@@ -48,6 +49,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.videothread: None | VideoThread = None
         self.is_running: bool = False
         self.source: str = "random"
+        self.recording: np.ndarray = np.array([])
 
         self.setup_ui_components()
 
@@ -57,13 +59,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.pb_connect.clicked.connect(self.connect_video)
         self.ui.pb_live.clicked.connect(self.toggle_video)
         self.ui.actionExit.triggered.connect(self.close)
+        self.ui.pb_acquire.clicked.connect(self.on_btn_acquire_clicked)
+        self.ui.pb_acquire.setDisabled(True)
+        self.ui.pb_save.clicked.connect(self.save)
+        self.ui.sb_frames.editingFinished.connect(self.on_frames_changed)
+        self.on_frames_changed() # run once to setup the seconds display:
+        self.ui.sb_seconds.editingFinished.connect(self.on_seconds_changed)
+        self.ui.actionOpen.triggered.connect(self.open_file)
 
         # Disable certain elements initially
         self.ui.pb_live.setDisabled(True)
         self.ui.lbl_status.setStyleSheet("color: red;")
 
-        # TODO:
         self.ui.settings.setHidden(True)
+        self.ui.sb_fps.editingFinished.connect(self.on_fps_changed)
+        self.ui.sb_exposure.editingFinished.connect(self.on_exposure_changed)
+        self.ui.sb_analog_gain.editingFinished.connect(self.on_analog_gain_changed)
+        self.ui.sb_black_level.editingFinished.connect(self.on_blacklevel_changed)
+
         self.populate_video_sources()
 
     def populate_video_sources(self) -> None:
@@ -90,10 +103,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.videothread = VideoThread(self.source)
             self.videothread.change_pixmap_signal.connect(self.update_image)
             self.ui.pb_live.setDisabled(False)
+            self.ui.pb_acquire.setDisabled(False)
             self.ui.pb_connect.setText("Disconnect")
             self.ui.pb_connect.clicked.disconnect()
             self.ui.pb_connect.clicked.connect(self.disconnect_video)
             self.ui.cb_source.setDisabled(True)
+            self.on_source_connected()
 
     def disconnect_video(self) -> None:
         """Stop the video thread and reset the UI"""
@@ -106,12 +121,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.pb_connect.clicked.disconnect()
             self.ui.pb_connect.clicked.connect(self.connect_video)
             self.ui.cb_source.setDisabled(False)
+            self.ui.pb_acquire.setDisabled(True)
             self.ui.pb_live.setText("Start")
             self.ui.lbl_status.setStyleSheet("color: red;")
+            self.ui.settings.setHidden(True)
 
     def start_video(self) -> None:
         if not self.videothread:
             raise ValueError("Video thread not started")
+        self.ui.pb_save.setDisabled(True)
         self.videothread.start()
         self.videothread.resume()
         self.is_running = True
@@ -133,4 +151,110 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pause_video()
 
     def update_image(self, frame: np.ndarray) -> None:
-        self.Image.setImage(frame, autoRange=False)
+        self.Image.setImage(frame, autoRange=False, autoHistogramRange=False)
+
+    def on_btn_acquire_clicked(self) -> None:
+        self.ui.pb_save.setDisabled(True)
+        n_frames = int(self.ui.sb_frames.text())
+        self.pause_video()
+        self.acquire(n_frames, self.ui.progressBar)
+        self.ui.pb_save.setDisabled(False)
+        self.update_image(self.recording)
+
+    def toggle_settings(self) -> None:
+        if self.ui.settings.isHidden():
+            self.ui.settings.setHidden(False)
+        else:
+            self.ui.settings.setHidden(True)
+
+    def acquire(self,n_frames: int, progressbar: None | QtWidgets.QProgressBar) -> None:
+        if not self.videothread:
+            raise ValueError("Video thread not started")
+        if self.source == "random":
+            imgs = cam.record_random_frames(n_frames, progressbar)
+        elif "Webcam" in self.source:
+            imgs = cam.record_webcam_frames(self.videothread.cap, n_frames, progressbar)
+        else:
+            imgs = cam.record_harvester_frames(self.videothread.cap, n_frames, progressbar)
+        self.recording = imgs
+
+
+    def save(self) -> None:
+        """Save the recorded frames to a hdf5 file."""
+        # Get filename with a file dialog
+        filename, filter = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save File", "", "HDF5 Files (*.h5);;Images (*.png);;All Files (*)"
+        )
+        fps = self.ui.sb_fps.text()
+        self.ui.progressBar.setMaximum(0)
+        self.ui.progressBar.setValue(0)
+        self.ui.progressBar.setFormat("Saving...")
+        if filter == "HDF5 Files (*.h5)":
+            if ".h5" not in filename:
+                filename += ".h5"
+            importexport.save_frames_to_h5(self.recording, fps, filename)
+        elif filter == "Images (*.png)":
+            if ".png" not in filename:
+                filename += ".png"
+            importexport.save_frames_to_png(self.recording, filename)
+        self.ui.progressBar.setMaximum(1)
+        self.ui.progressBar.setValue(1)
+        self.ui.progressBar.setFormat("%p%")
+        print(f"Saved recording to {filename}")
+
+    def on_frames_changed(self) -> None:
+        """Update the progress bar maximum value."""
+        n_frames = self.ui.sb_frames.value()
+        fps = self.ui.sb_fps.value()
+        self.ui.sb_seconds.setValue(n_frames / fps)
+
+    def on_seconds_changed(self) -> None:
+        """Update the number of frames based on the seconds."""
+        seconds = self.ui.sb_seconds.value()
+        fps = self.ui.sb_fps.value()
+        self.ui.sb_frames.setValue(int(seconds * fps))
+
+
+    def on_source_connected(self) -> None:
+        """Update the source based on the combobox."""
+        self.source = self.ui.cb_source.currentText()
+        if "random" in self.source:
+            self.ui.settings.setHidden(True)
+        if "Webcam" in self.source:
+            self.ui.settings.setHidden(True)
+        if "SVS-Vistek" in self.source:
+            self.setup_settings() # get minmax values for settings
+            self.ui.settings.setHidden(False)
+
+    def on_fps_changed(self)-> None:
+        """Update the fps based on the settings."""
+        self.videothread.cap.remote_device.node_map.AcquisitionFrameRate.value = self.ui.sb_fps.value()
+        self.on_frames_changed()
+
+    def on_exposure_changed(self)-> None:
+        """Update the exposure based on the settings."""
+        self.videothread.cap.remote_device.node_map.ExposureTime.value = self.ui.sb_exposure.value()
+
+    def on_analog_gain_changed(self)-> None:
+        """Update the gain based on the settings."""
+        self.videothread.cap.remote_device.node_map.AnalogGain.value = f"x{self.ui.sb_analog_gain.value()}"
+
+    def on_blacklevel_changed(self)-> None:
+        """Update the blacklevel based on the settings."""
+        self.videothread.cap.remote_device.node_map.BlackLevel.value = self.ui.sb_black_level.value()
+
+
+    def setup_settings(self) -> None:
+        ia = self.videothread.cap
+        node_map = ia.remote_device.node_map
+        self.ui.sb_fps.setMaximum(node_map.AcquisitionFrameRateMax.value)
+
+
+    def open_file(self) -> None:
+        """Open a file dialog to load a video file."""
+        filename, filter = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open File", "", "HDF5 Files (*.h5);;All Files (*)"
+        )
+        if filter == "HDF5 Files (*.h5)":
+            self.recording = importexport.load_frames_from_h5(filename)
+        self.update_image(self.recording)

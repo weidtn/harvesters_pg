@@ -1,5 +1,6 @@
 """The model to handle interaction with the camera."""
 
+from PyQt6.QtWidgets import QProgressBar
 from harvesters.core import Harvester, ImageAcquirer
 import cv2
 import numpy as np
@@ -7,6 +8,8 @@ import os
 from pathlib import Path
 import glob
 import logging
+from tqdm import trange
+import time
 
 
 def find_common_cti_files() -> list[str]:
@@ -69,17 +72,20 @@ def setup_cam(
     max_fps = nodes.AcquisitionFrameRateMax.value
     if fps > max_fps:
         fps = max_fps
-        logging.warning(f"FPS is too high for the camera. Setting it to the maximum possible: {fps}")
+        logging.warning(
+            f"FPS is too high for the camera. Setting it to the maximum possible: {fps}"
+        )
     nodes.AcquisitionFrameRate.value = fps
 
-    max_exposure = int((1.0/fps)*1e6 - 1)
+    max_exposure = int((1.0 / fps) * 1e6 - 1)
     if exposure >= max_exposure:
         exposure = int(max_exposure)
-        logging.warning(f"Exposure time is too high for given FPS. Setting it to the maximum: {exposure}")
+        logging.warning(
+            f"Exposure time is too high for given FPS. Setting it to the maximum: {exposure}"
+        )
 
     nodes.ExposureTime.set_value(exposure)
 
-    # Allow the ImageAcquire object to start image acquisition:
     nodes.Height.value = height
     nodes.Width.value = width
 
@@ -119,7 +125,9 @@ def setup_webcam(idx: int) -> cv2.VideoCapture:
 
 
 def return_harvester_cameras(
-    ctis: list[str] = [r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti"],
+    ctis: list[str] = [
+        r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti"
+    ],
 ) -> list[dict]:
     """Return the cameras detected by the Harvester API.
 
@@ -185,6 +193,30 @@ def get_webcam_image(cap: cv2.VideoCapture) -> np.ndarray:
     return gray
 
 
+def record_webcam_frames(
+    cap: cv2.VideoCapture, n_frames: int, progress: None | QProgressBar
+) -> np.ndarray:
+    """Record n_frames from the webcam.
+
+    Args:
+        cap (cv2.VideoCapture): The video capture object.
+        n_frames (int): The number of frames to record.
+
+    Returns:
+        np.ndarray: The recorded frames as a numpy array.
+    """
+    if progress is not None:
+        progress.setMaximum(n_frames - 1)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frames = np.zeros((n_frames, width, height), dtype=np.uint8)
+    for i in trange(n_frames, desc="Recording frames"):
+        frames[i] = get_webcam_image(cap)
+        if progress is not None:
+            progress.setValue(i)
+    return frames
+
+
 def get_random_image(_: None) -> np.ndarray:
     """Get a random image.
 
@@ -195,6 +227,25 @@ def get_random_image(_: None) -> np.ndarray:
         np.ndarray: A random image.
     """
     return np.random.randint(0, 255, (1920, 1080), dtype=np.uint8)
+
+
+def record_random_frames(n_frames: int, progress: None | QProgressBar) -> np.ndarray:
+    """Record n_frames of random images.
+
+    Args:
+        n_frames (int): The number of frames to record.
+
+    Returns:
+        np.ndarray: The recorded frames as a numpy array.
+    """
+    if progress is not None:
+        progress.setMaximum(n_frames - 1)
+    frames = np.zeros((n_frames, 1920, 1080), dtype=np.uint8)
+    for i in trange(n_frames, desc="Recording frames"):
+        frames[i] = get_random_image(None)
+        if progress is not None:
+            progress.setValue(i)
+    return frames
 
 
 def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
@@ -208,9 +259,14 @@ def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
         np.ndarray: The image as a numpy array.
     """
     with ia.fetch() as buffer:
-        component = buffer.payload.components[0]
-        img = component.dataimg = buffer.payload.components[0].data
-        img = np.reshape(img, (buffer.payload.components[0].height, buffer.payload.components[0].width)).T
+        if buffer:
+            component = buffer.payload.components[0]
+            img = (
+                np.frombuffer(component.data, dtype=np.uint8)
+                .reshape(component.height, component.width)
+                .T
+            )
+            img = img.copy()
     return img
 
 
@@ -231,3 +287,31 @@ def get_remote_nodes(ia: ImageAcquirer) -> dict:
         except Exception as e:
             logging.warning(f"Error while getting node {node}'s value: {e}")
     return dict
+
+
+def record_harvester_frames(
+    ia: ImageAcquirer, n_frames: int, progress: None | QProgressBar
+) -> np.ndarray:
+    """Record n_frames from the camera.
+
+    Args:
+        ia (ImageAcquirer): The ImageAcquirer object.
+        n_frames (int): The number of frames to record.
+
+    Returns:
+        np.ndarray: The recorded frames as a numpy array.
+    """
+    if progress is not None:
+        progress.setMaximum(n_frames - 1)
+    width = ia.remote_device.node_map.Width.value
+    height = ia.remote_device.node_map.Height.value
+    frames = np.zeros((n_frames, width, height), dtype=np.uint8)
+    for i in trange(n_frames):
+        frames[i] = get_harvester_image(ia)
+        if progress is not None:
+            progress.setValue(i)
+    return np.array(frames)
+
+
+def set_exposure(ia, exposure):
+    ia.remote_device.node_map.ExposureTime.value = exposure

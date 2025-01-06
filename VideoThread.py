@@ -24,6 +24,7 @@ class VideoThread(QtCore.QThread):
     """
 
     change_pixmap_signal = QtCore.pyqtSignal(np.ndarray)
+    acquisition_finished_signal = QtCore.pyqtSignal()
 
     def __init__(self, source) -> None:
         super().__init__()
@@ -69,12 +70,14 @@ class VideoThread(QtCore.QThread):
             try:
                 frame = self.image_func(self.cap)
                 self.change_pixmap_signal.emit(frame)
+                time.sleep(1/30) # 30 fps
             except Exception as e:
-                pass
+                print(e)
+
 
     def stop(self) -> None:
         self._run_flag = False
-        self.wait()
 
     def resume(self) -> None:
         self._run_flag = True
+
