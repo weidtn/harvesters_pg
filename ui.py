@@ -2,10 +2,11 @@
 
 All user interaction with the ui is handled in here and communicated to the modle (cam.py)
 """
-
+import os
+os.environ['OPENCV_LOG_LEVEL'] = 'OFF'
+import sys
+from PyQt6 import QtWidgets
 import numpy as np
-import pyqtgraph as pg
-from PyQt6 import QtWidgets, QtCore
 
 import cam
 from MainWindow import Ui_MainWindow
@@ -258,3 +259,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if filter == "HDF5 Files (*.h5)":
             self.recording = importexport.load_frames_from_h5(filename)
         self.update_image(self.recording)
+
+def main() -> None:
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
