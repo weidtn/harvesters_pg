@@ -45,13 +45,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.ImageView.getView().setAspectLocked(True)
         # Disable menu
         self.ui.ImageView.getView().setMenuEnabled(False)
-        self.Image = self.ui.ImageView
 
         # Initialize variables
         self.videothread: None | VideoThread = None
         self.is_running: bool = False
         self.source: str = "random"
         self.recording: np.ndarray = np.array([])
+        self.ctis: list[str] = []
 
         self.setup_ui_components()
 
@@ -68,6 +68,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.on_frames_changed() # run once to setup the seconds display:
         self.ui.sb_seconds.editingFinished.connect(self.on_seconds_changed)
         self.ui.actionOpen.triggered.connect(self.open_file)
+        self.ui.actionSelect_GenTLProducer.triggered.connect(self.find_cti_dialog)
 
         # Disable certain elements initially
         self.ui.pb_live.setDisabled(True)
@@ -89,8 +90,8 @@ class MainWindow(QtWidgets.QMainWindow):
         [self.ui.cb_source.addItem(f"Webcam {i}") for i in cam_indices]
 
         # Add Harvester cameras
-        ctis = cam.find_common_cti_files()
-        harvester_cams: list[dict] = cam.return_harvester_cameras(ctis)
+        self.ctis.extend(cam.find_common_cti_files())
+        harvester_cams: list[dict] = cam.return_harvester_cameras(self.ctis)
         [
             self.ui.cb_source.addItem(f"{cam['display_name']}")
             for cam in harvester_cams
@@ -268,6 +269,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if filter == "HDF5 Files (*.h5)":
             self.recording = importexport.load_frames_from_h5(filename)
         self.update_image(self.recording)
+
+    def find_cti_dialog(self)-> None:
+        """ Open a dialog to find the GenTL Producer file."""
+        filename, filter = QtWidgets.QFileDialog.getOpenFileName(self, "Select GenTL Producer", "", "GenTL Producer (*.cti)")
+        if filename:
+            self.ctis.append(filename)
+            self.populate_video_sources()
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
