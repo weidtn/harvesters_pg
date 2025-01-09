@@ -7,6 +7,7 @@ os.environ['OPENCV_LOG_LEVEL'] = 'OFF'
 import sys
 from PyQt6 import QtWidgets
 import numpy as np
+import datetime
 
 import cam
 from MainWindow import Ui_MainWindow
@@ -186,14 +187,22 @@ class MainWindow(QtWidgets.QMainWindow):
         filename, filter = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save File", "", "HDF5 Files (*.h5);;Images (*.png);;All Files (*)"
         )
-        fps = self.ui.sb_fps.text()
+        metadata: dict = {"timestamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")}
+        if type(self.videothread.cap) is cam.VideoCapture:
+            metadata["fps"] = cam.get_webcam_fps(self.videothread.cap)
+        elif self.source == "random":
+            metadata["fps"] = 30
+        elif type(self.videothread.cap) is cam.ImageAcquirer:
+            nodemap = cam.get_all_attributes_harvesters(self.videothread.cap)
+            [metadata.update({k: v}) for k, v in nodemap.items()]
+            metadata["fps"] = self.ui.sb_fps.value()
         self.ui.progressBar.setMaximum(0)
         self.ui.progressBar.setValue(0)
         self.ui.progressBar.setFormat("Saving...")
         if filter == "HDF5 Files (*.h5)":
             if ".h5" not in filename:
                 filename += ".h5"
-            importexport.save_frames_to_h5(self.recording, fps, filename)
+            importexport.save_frames_to_h5(self.recording, filename, metadata=metadata)
         elif filter == "Images (*.png)":
             if ".png" not in filename:
                 filename += ".png"

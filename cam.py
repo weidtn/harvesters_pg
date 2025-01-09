@@ -2,6 +2,7 @@
 
 from PyQt6.QtWidgets import QProgressBar
 from harvesters.core import Harvester, ImageAcquirer
+from cv2 import VideoCapture
 import cv2
 import numpy as np
 import os
@@ -111,7 +112,7 @@ def warmup_cam(ia, frames: int = 10) -> None:
         buffer.queue()
 
 
-def setup_webcam(idx: int) -> cv2.VideoCapture:
+def setup_webcam(idx: int) -> VideoCapture:
     """Set the webcam up using OpenCV.
 
     Args:
@@ -120,8 +121,12 @@ def setup_webcam(idx: int) -> cv2.VideoCapture:
     Returns:
         cv2.VideoCapture: The video capture object.
     """
-    cap = cv2.VideoCapture(idx)
+    cap = VideoCapture(idx)
     return cap
+
+
+def get_webcam_fps(cap):
+    return cap.get(cv2.CAP_PROP_FPS)
 
 
 def return_harvester_cameras(
@@ -155,7 +160,7 @@ def get_camera_indices() -> list[int]:
     arr = []
     for i in range(10):
         try:
-            cap = cv2.VideoCapture(i)
+            cap = VideoCapture(i)
         except cv2.error:
             continue
         if cap.read()[0]:
@@ -179,11 +184,11 @@ def disconnect_cam(h: Harvester, ia: ImageAcquirer) -> None:
     h.reset()
 
 
-def get_webcam_image(cap: cv2.VideoCapture) -> np.ndarray:
+def get_webcam_image(cap: VideoCapture) -> np.ndarray:
     """Get an image from the webcam.
 
     Args:
-        cap (cv2.VideoCapture): The video capture object.
+        cap (VideoCapture): The video capture object.
 
     Returns:
         np.ndarray: The image as a numpy array.
@@ -194,12 +199,12 @@ def get_webcam_image(cap: cv2.VideoCapture) -> np.ndarray:
 
 
 def record_webcam_frames(
-    cap: cv2.VideoCapture, n_frames: int, progress: None | QProgressBar
+    cap: VideoCapture, n_frames: int, progress: None | QProgressBar
 ) -> np.ndarray:
     """Record n_frames from the webcam.
 
     Args:
-        cap (cv2.VideoCapture): The video capture object.
+        cap (VideoCapture): The video capture object.
         n_frames (int): The number of frames to record.
 
     Returns:
@@ -315,3 +320,22 @@ def record_harvester_frames(
 
 def set_exposure(ia, exposure):
     ia.remote_device.node_map.ExposureTime.value = exposure
+
+
+def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:
+    """Get all attributes of the camera.
+
+    Args:
+        ia (ImageAcquirer): The ImageAcquirer object.
+
+    Returns:
+        dict: A dictionary containing all attributes of the camera.
+    """
+    nodes = ia.remote_device.node_map
+    dict = {}
+    for node in dir(nodes):
+        try:
+            dict[node] = getattr(ia.remote_device.node_map, node)
+        except Exception as e:
+            logging.warning(f"Error while getting node {node}: {e}")
+    return dict
