@@ -1,17 +1,21 @@
 * Introduction
-This program is an image acquisition software mainly intended for cameras, by using the [[https://github.com/genicam/harvesters][Harvester]] package in combination with [[https://www.pyqtgraph.org/][PyQtGraph]] (thats where the pg in the name comes from). Furthermore it is possible to use more generic cameras via OpenCV.
+This program is an image acquisition software mainly intended for cameras, by using the [[https://github.com/genicam/harvesters][Harvester]] package in combination with [[https://www.pyqtgraph.org/][PyQtGraph]] (that's where the pg in the name comes from). Furthermore it is possible to use more generic cameras via OpenCV.
 
 * Installation
 Do yourself a favour and install [[https://github.com/astral-sh/uv][uv]]. Running this program is then as easy as going into the directory and executing:
 #+begin_src
-uv run __main__.py
+uv run ui.py
 #+end_src
 
 * Configuration
-Available cameras should be automatically detected on startup. GenTL Producers (*.cti files) will be detected in the path given by the environment variable ~GENICAM_GENTL64_PATH~ (analogous to [[https://github.com/AravisProject/aravis][aravis]]).
+Available cameras should be automatically detected on startup. GenTL Producers (*.cti files) will be detected in the path given by the environment variable ~GENICAM_GENTL64_PATH~ (analogous to [[https://github.com/AravisProject/aravis][aravis]]). If no GenTL Producer could be found, you can manually select the file via the menu bar settings.
+
+* Recording
+It is possible to record video. The frames can be inspected in the main window and saved as image sequence or in a h5 file.
+
+* Replay
+It is possible to load a h5 file and show the video, click on File and open to do so.
 
 * TODO Add configuration file
 Configuration files (probably .ini) should be read at the beginning, so default values can be set and saved.
 
-* TODO Add recording
-Until now only liveview of the camera is possible. Recording into different file formats (.avi .mov .h5) will be implemented
