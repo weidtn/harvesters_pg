@@ -25,7 +25,7 @@ def save_frames_to_h5(
         for k, v in metadata.items():
             try:
                 dset.attrs.create(k, v)
-            except TypeError as e:
+            except Exception as e:
                 print(f"Could not save metadata {k} with value {v}: {e}")
 
 
