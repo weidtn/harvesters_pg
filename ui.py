@@ -43,6 +43,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.ImageView.ui.menuBtn.setHidden(True)
         self.ui.ImageView.ui.roiBtn.setHidden(True)
         self.ui.ImageView.getView().setAspectLocked(True)
+        self.Image = self.ui.ImageView
         # Disable menu
         self.ui.ImageView.getView().setMenuEnabled(False)
 
