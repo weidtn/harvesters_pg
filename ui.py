@@ -134,7 +134,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.videothread:
             raise ValueError("Video thread not started")
         self.ui.pb_save.setDisabled(True)
-        self.videothread.start()
+        self.videothread._start()
         self.videothread.resume()
         self.is_running = True
         self.ui.pb_live.setText("Pause")
@@ -159,6 +159,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_btn_acquire_clicked(self) -> None:
         self.ui.pb_save.setDisabled(True)
+        self.recording = np.array([])
         n_frames = int(self.ui.sb_frames.text())
         self.pause_video()
         self.acquire(n_frames, self.ui.progressBar)

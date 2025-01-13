@@ -215,6 +215,7 @@ def record_webcam_frames(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frames = np.zeros((n_frames, width, height), dtype=np.uint8)
+    warmup_cam(cap, frames=30)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_webcam_image(cap)
         if progress is not None:
@@ -272,6 +273,8 @@ def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
                 .T
             )
             img = img.copy()
+        else: # If no buffer is available, return a black image
+            img = np.zeros((ia.remote_device.node_map.Width.value, ia.remote_device.node_map.Height.value), dtype=np.uint8)
     return img
 
 
@@ -311,10 +314,12 @@ def record_harvester_frames(
     width = ia.remote_device.node_map.Width.value
     height = ia.remote_device.node_map.Height.value
     frames = np.zeros((n_frames, width, height), dtype=np.uint8)
+    ia.start()
     for i in trange(n_frames):
         frames[i] = get_harvester_image(ia)
         if progress is not None:
             progress.setValue(i)
+    ia.stop()
     return np.array(frames)
 
 

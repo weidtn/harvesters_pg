@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-from PyQt6 import QtCore
-import cam
-import numpy as np
-import cv2
-from typing import Callable
 import time
+from typing import Callable
+
+import cv2
+import numpy as np
 from harvesters.core import Harvester, ImageAcquirer
+from PyQt6 import QtCore
+
+import cam
 
 
 class VideoThread(QtCore.QThread):
@@ -28,7 +30,6 @@ class VideoThread(QtCore.QThread):
 
     def __init__(self, source) -> None:
         super().__init__()
-        self._run_flag: bool = True
         self.source: str = source
         self.image_functions = {
             "Webcam": cam.get_webcam_image,
@@ -76,8 +77,17 @@ class VideoThread(QtCore.QThread):
 
 
     def stop(self) -> None:
+        if type(self.cap) is ImageAcquirer:
+            self.cap.stop()
         self._run_flag = False
 
     def resume(self) -> None:
+        if type(self.cap) is ImageAcquirer:
+            self.cap.start()
         self._run_flag = True
 
+    def _start(self) -> None:
+        super().start()
+        self._run_flag = True
+        if type(self.cap) is ImageAcquirer:
+            self.cap.start()
