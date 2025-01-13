@@ -22,7 +22,11 @@ def save_frames_to_h5(
             compression="gzip",
             compression_opts=complevel,
         )
-        [dset.attrs.create(k, v) for k, v in metadata.items()]
+        for k, v in metadata.items():
+            try:
+                dset.attrs.create(k, v)
+            except TypeError as e:
+                print(f"Could not save metadata {k} with value {v}: {e}")
 
 
 def save_frames_to_png(frames: np.ndarray, filename: str) -> None:
