@@ -162,8 +162,12 @@ class MainWindow(QtWidgets.QMainWindow):
             levels = (frame.T.flatten()[8:].min(), frame.T[8:].max())
         else:
             levels = (0, 255)
-        self.Image.setImage(frame, autoRange=True, autoHistogramRange=False, levels=levels)
-        self.ui.lbl_img_minmax.setText(f"Min: {frame.T.flatten()[8:].min()} - Max: {frame.T.flatten()[8:].max()}")
+        self.Image.setImage(
+            frame, autoRange=False, autoHistogramRange=False, levels=levels
+        )
+        self.ui.lbl_img_minmax.setText(
+            f"Min: {frame.T.flatten()[8:].min()} - Max: {frame.T.flatten()[8:].max()}"
+        )
 
     def on_btn_acquire_clicked(self) -> None:
         self.ui.pb_save.setDisabled(True)
