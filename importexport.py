@@ -26,7 +26,7 @@ def save_frames_to_h5(
             try:
                 dset.attrs.create(k, v)
             except Exception as e:
-                print(f"Could not save metadata {k} with value {v}: {e}")
+                pass
 
 
 def save_frames_to_png(frames: np.ndarray, filename: str) -> None:

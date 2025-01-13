@@ -335,7 +335,7 @@ def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:
     dict = {}
     for node in dir(nodes):
         try:
-            dict[node] = getattr(ia.remote_device.node_map, node)
+            dict[node] = getattr(ia.remote_device.node_map, node).value
         except Exception as e:
-            logging.warning(f"Error while getting node {node}: {e}")
+            pass
     return dict
