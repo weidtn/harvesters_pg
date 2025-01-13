@@ -18,6 +18,30 @@
     <item row="0" column="0">
      <layout class="QVBoxLayout" name="verticalLayout_2">
       <item>
+       <layout class="QHBoxLayout" name="horizontalLayout_6">
+        <property name="topMargin">
+         <number>0</number>
+        </property>
+        <item>
+         <widget class="QCheckBox" name="cb_autolevel">
+          <property name="toolTip">
+           <string>Whether the displayed Image should be automatically scaled or not. This is just for displaying!</string>
+          </property>
+          <property name="text">
+           <string>Auto Level</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="lbl_img_minmax">
+          <property name="text">
+           <string>Min: 0 Max: 255</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
        <widget class="ImageView" name="ImageView"/>
       </item>
       <item>
