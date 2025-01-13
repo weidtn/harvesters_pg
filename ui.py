@@ -2,8 +2,10 @@
 
 All user interaction with the ui is handled in here and communicated to the modle (cam.py)
 """
+
 import os
-os.environ['OPENCV_LOG_LEVEL'] = 'OFF'
+
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 import sys
 from PyQt6 import QtWidgets
 import numpy as np
@@ -66,10 +68,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.pb_acquire.setDisabled(True)
         self.ui.pb_save.clicked.connect(self.save)
         self.ui.sb_frames.editingFinished.connect(self.on_frames_changed)
-        self.on_frames_changed() # run once to setup the seconds display:
+        self.on_frames_changed()  # run once to setup the seconds display:
         self.ui.sb_seconds.editingFinished.connect(self.on_seconds_changed)
         self.ui.actionOpen.triggered.connect(self.open_file)
         self.ui.actionSelect_GenTLProducer.triggered.connect(self.find_cti_dialog)
+        self.ui.pb_settings.clicked.connect(self.print_frame_counter)
 
         # Disable certain elements initially
         self.ui.pb_live.setDisabled(True)
@@ -79,7 +82,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.sb_fps.editingFinished.connect(self.on_fps_changed)
         self.ui.sb_exposure.editingFinished.connect(self.on_exposure_changed)
         self.ui.sb_analog_gain.editingFinished.connect(self.on_analog_gain_changed)
-        self.ui.sb_black_level.editingFinished.connect(self.on_blacklevel_changed)
+        self.ui.hsli_black_level.valueChanged.connect(self.on_blacklevel_changed)
 
         self.populate_video_sources()
 
@@ -172,7 +175,9 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.ui.settings.setHidden(True)
 
-    def acquire(self,n_frames: int, progressbar: None | QtWidgets.QProgressBar) -> None:
+    def acquire(
+        self, n_frames: int, progressbar: None | QtWidgets.QProgressBar
+    ) -> None:
         if not self.videothread:
             raise ValueError("Video thread not started")
         if self.source == "random":
@@ -180,9 +185,12 @@ class MainWindow(QtWidgets.QMainWindow):
         elif "Webcam" in self.source:
             imgs = cam.record_webcam_frames(self.videothread.cap, n_frames, progressbar)
         else:
-            imgs = cam.record_harvester_frames(self.videothread.cap, n_frames, progressbar)
+            imgs = cam.record_harvester_frames(
+                self.videothread.cap, n_frames, progressbar
+            )
         self.recording = imgs
-
+        self.timestamps = [cam.extract_timestamp(img)/25_000_000 for img in imgs]
+        self.frame_counters = [cam.extract_frame_counter(img) for img in imgs]
 
     def save(self) -> None:
         """Save the recorded frames to a hdf5 file."""
@@ -199,6 +207,8 @@ class MainWindow(QtWidgets.QMainWindow):
             nodemap = cam.get_all_attributes_harvesters(self.videothread.cap)
             [metadata.update({k: v}) for k, v in nodemap.items()]
             metadata["fps"] = self.ui.sb_fps.value()
+            metadata["timestamps"] = self.timestamps
+            metadata["frame_counters"] = self.frame_counters
         self.ui.progressBar.setMaximum(0)
         self.ui.progressBar.setValue(0)
         self.ui.progressBar.setFormat("Saving...")
@@ -227,7 +237,6 @@ class MainWindow(QtWidgets.QMainWindow):
         fps = self.ui.sb_fps.value()
         self.ui.sb_frames.setValue(int(seconds * fps))
 
-
     def on_source_connected(self) -> None:
         """Update the source based on the combobox."""
         self.source = self.ui.cb_source.currentText()
@@ -236,32 +245,48 @@ class MainWindow(QtWidgets.QMainWindow):
         if "Webcam" in self.source:
             self.ui.settings.setHidden(True)
         if "SVS-Vistek" in self.source:
-            self.setup_settings() # get minmax values for settings
+            self.setup_settings()  # get minmax values for settings
             self.ui.settings.setHidden(False)
 
-    def on_fps_changed(self)-> None:
+    def on_fps_changed(self) -> None:
         """Update the fps based on the settings."""
-        self.videothread.cap.remote_device.node_map.AcquisitionFrameRate.value = self.ui.sb_fps.value()
+        self.videothread.cap.remote_device.node_map.AcquisitionFrameRate.value = (
+            self.ui.sb_fps.value()
+        )
+        self.ui.lbl_exposure_minmax.setText(
+            f"(2 - {cam.get_max_exposure(self.ui.sb_fps.value())})"
+        )
+        self.on_exposure_changed()
+        self.ui.sb_exposure.setMaximum(cam.get_max_exposure(self.ui.sb_fps.value()))
         self.on_frames_changed()
 
-    def on_exposure_changed(self)-> None:
+    def on_exposure_changed(self) -> None:
         """Update the exposure based on the settings."""
-        self.videothread.cap.remote_device.node_map.ExposureTime.value = self.ui.sb_exposure.value()
+        exposure = cam.cap_at_max_exposure(
+            self.ui.sb_exposure.value(), self.ui.sb_fps.value()
+        )
+        self.ui.sb_exposure.setValue(exposure)
+        cam.set_exposure(self.videothread.cap, self.ui.sb_exposure.value())
 
-    def on_analog_gain_changed(self)-> None:
+    def on_analog_gain_changed(self) -> None:
         """Update the gain based on the settings."""
-        self.videothread.cap.remote_device.node_map.AnalogGain.value = f"x{self.ui.sb_analog_gain.value()}"
+        self.videothread.cap.remote_device.node_map.Gain.value = self.ui.sb_analog_gain.value()
 
-    def on_blacklevel_changed(self)-> None:
+
+    def on_blacklevel_changed(self) -> None:
         """Update the blacklevel based on the settings."""
-        self.videothread.cap.remote_device.node_map.BlackLevel.value = self.ui.sb_black_level.value()
-
+        self.ui.lbl_black_level_current.setText(str(self.ui.hsli_black_level.value()))
+        self.videothread.cap.remote_device.node_map.BlackLevel.value = (
+            self.ui.hsli_black_level.value()
+        )
 
     def setup_settings(self) -> None:
         ia = self.videothread.cap
         node_map = ia.remote_device.node_map
         self.ui.sb_fps.setMaximum(node_map.AcquisitionFrameRateMax.value)
-
+        self.ui.lbl_fps_minmax.setText(
+            f"(1 - {node_map.AcquisitionFrameRateMax.value})"
+        )
 
     def open_file(self) -> None:
         """Open a file dialog to load a video file."""
@@ -272,18 +297,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self.recording = importexport.load_frames_from_h5(filename)
         self.update_image(self.recording)
 
-    def find_cti_dialog(self)-> None:
-        """ Open a dialog to find the GenTL Producer file."""
-        filename, filter = QtWidgets.QFileDialog.getOpenFileName(self, "Select GenTL Producer", "", "GenTL Producer (*.cti)")
+    def find_cti_dialog(self) -> None:
+        """Open a dialog to find the GenTL Producer file."""
+        filename, filter = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select GenTL Producer", "", "GenTL Producer (*.cti)"
+        )
         if filename:
             self.ctis.append(filename)
             self.populate_video_sources()
+
+    def print_frame_counter(self) -> None:
+        print("frame_counter", cam.extract_frame_counter(self.Image.getImageItem().image))
+        print("timestamp", cam.extract_timestamp(self.Image.getImageItem().image) / 25_000_000)
+
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()

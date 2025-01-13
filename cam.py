@@ -41,8 +41,8 @@ def setup_cam(
     height: int = 1080,
     width: int = 1920,
     fps: int = 30,
-    blacklevel: int = 255,
-    exposure: int = 5000,
+    blacklevel: int = 125,
+    exposure: int = 999,
 ) -> tuple[Harvester, ImageAcquirer]:
     """Set the camera up using the Harvester API.
 
@@ -78,17 +78,14 @@ def setup_cam(
         )
     nodes.AcquisitionFrameRate.value = fps
 
-    max_exposure = int((1.0 / fps) * 1e6 - 1)
-    if exposure >= max_exposure:
-        exposure = int(max_exposure)
-        logging.warning(
-            f"Exposure time is too high for given FPS. Setting it to the maximum: {exposure}"
-        )
-
+    exposure = cap_at_max_exposure(exposure, fps)
     nodes.ExposureTime.set_value(exposure)
 
     nodes.Height.value = height
     nodes.Width.value = width
+
+    nodes.InfoFieldFrameCounterEnable.value = True
+    nodes.InfoFieldTimeStampEnable.value = True
 
     ia.start()
     nodes.BlackLevel.value = blacklevel
@@ -273,8 +270,14 @@ def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
                 .T
             )
             img = img.copy()
-        else: # If no buffer is available, return a black image
-            img = np.zeros((ia.remote_device.node_map.Width.value, ia.remote_device.node_map.Height.value), dtype=np.uint8)
+        else:  # If no buffer is available, return a black image
+            img = np.zeros(
+                (
+                    ia.remote_device.node_map.Width.value,
+                    ia.remote_device.node_map.Height.value,
+                ),
+                dtype=np.uint8,
+            )
     return img
 
 
@@ -344,3 +347,78 @@ def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:
         except Exception as e:
             pass
     return dict
+
+
+def get_max_exposure(fps: int) -> int:
+    return int((1.0 / fps) * 1e6 - 1)
+
+
+def cap_at_max_exposure(exposure: int, fps: int) -> int:
+    max_exposure = get_max_exposure(fps)
+    if exposure > max_exposure:
+        exposure = max_exposure
+        logging.warning(
+            f"Exposure time is too high for given FPS. Setting it to the maximum: {exposure}"
+        )
+    return exposure
+
+
+def get_max_fps_harvesters(ia: ImageAcquirer) -> int:
+    return ia.remote_device.node_map.AcquisitionFrameRateMax.value
+
+
+def extract_frame_counter(img: np.ndarray) -> dict:
+    """Extract the superimposed frame counter from the image.
+
+    If enabled, a frame counter will be superimposed upon each captured frame or ROI.
+    The frame counter occupies 4 pixels in the upper left corner of each frame starting
+    with pixel number "0". After each activation, the counter starts with "0". When reaching
+    the maximal value or after each acquisition start command it will restart with "0".
+
+    Args:
+        img (np.ndarray): The image to extract the frame counter from.
+
+    Returns:
+        int: The frame counter.
+    """
+    pixels = img.T.flatten()[:4].astype(np.uint32)
+
+    # Extract frame counter parts
+    lsb = pixels[0]
+    mid = pixels[1]
+    msb = pixels[2]
+    roi = pixels[3]
+
+    # Combine frame counter parts (little endian)
+    frame_counter = lsb | (mid << 8) | (msb << 16)
+    _ = roi  # Unused
+
+    return frame_counter
+
+
+def extract_timestamp(img: np.ndarray) -> int:
+    """Extract the superimposed timestamp from the image.
+
+    If enabled, a 32 bit time stamp will be superimposed on each captured frame or ROI.
+    The frequency of the time stamp counter amounts to 25 MHz (period = 40 nanoseconds).
+    The frame counter occupies 4 pixels in the upper left corner of each frame,
+    starting with pixel number 4. The time stamp counter is reset to zero when the camera is powered up.
+
+    Args:
+        img (np.ndarray): The image to extract the timestamp from.
+
+    Returns:
+        int: The timestamp in 40 ns.
+    """
+    pixels = img.T.flatten()[4:8].astype(np.uint32)
+
+    # Extract timestamp parts
+    lsb = pixels[0]  # Pixel 4: bits 0-7
+    mid_low = pixels[1] << 8  # Pixel 5: bits 8-15
+    mid_high = pixels[2] << 16  # Pixel 6: bits 16-23
+    msb = pixels[3] << 24  # Pixel 7: bits 24-31
+
+    # Combine timestamp parts (little endian)
+    timestamp = msb | mid_high | mid_low | lsb
+
+    return timestamp

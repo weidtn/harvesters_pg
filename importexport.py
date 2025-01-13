@@ -22,6 +22,12 @@ def save_frames_to_h5(
             compression="gzip",
             compression_opts=complevel,
         )
+        if "timestamps" in metadata:
+            f.create_dataset("timestamps", data=metadata["timestamps"], compression="gzip", compression_opts=complevel)
+            metadata.pop("timestamps")
+        if "frame_counters" in metadata:
+            f.create_dataset("frame_counters", data=metadata["frame_counters"], compression="gzip", compression_opts=complevel)
+            metadata.pop("frame_counters")
         for k, v in metadata.items():
             try:
                 dset.attrs.create(k, v)

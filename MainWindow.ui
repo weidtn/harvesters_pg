@@ -108,7 +108,7 @@
                 </sizepolicy>
                </property>
                <property name="text">
-                <string>FPS</string>
+                <string>FPS [Hz]</string>
                </property>
                <property name="alignment">
                 <set>Qt::AlignmentFlag::AlignCenter</set>
@@ -117,14 +117,20 @@
              </item>
              <item>
               <widget class="QSpinBox" name="sb_fps">
+               <property name="toolTip">
+                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;This feature defines the acquisition rate in [Hz].&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+               </property>
                <property name="wrapping">
                 <bool>false</bool>
                </property>
                <property name="buttonSymbols">
                 <enum>QAbstractSpinBox::ButtonSymbols::NoButtons</enum>
                </property>
+               <property name="minimum">
+                <number>1</number>
+               </property>
                <property name="maximum">
-                <number>2000</number>
+                <number>1000</number>
                </property>
                <property name="value">
                 <number>30</number>
@@ -144,6 +150,19 @@
                </property>
               </widget>
              </item>
+             <item>
+              <spacer name="horizontalSpacer_2">
+               <property name="orientation">
+                <enum>Qt::Orientation::Horizontal</enum>
+               </property>
+               <property name="sizeHint" stdset="0">
+                <size>
+                 <width>40</width>
+                 <height>20</height>
+                </size>
+               </property>
+              </spacer>
+             </item>
             </layout>
            </item>
            <item>
@@ -157,7 +176,7 @@
                 </sizepolicy>
                </property>
                <property name="text">
-                <string>Exposure</string>
+                <string>Exposure [μs]</string>
                </property>
                <property name="alignment">
                 <set>Qt::AlignmentFlag::AlignCenter</set>
@@ -166,11 +185,14 @@
              </item>
              <item>
               <widget class="QSpinBox" name="sb_exposure">
+               <property name="toolTip">
+                <string>This feature defines the duration of exposure [μs].</string>
+               </property>
                <property name="buttonSymbols">
                 <enum>QAbstractSpinBox::ButtonSymbols::NoButtons</enum>
                </property>
                <property name="minimum">
-                <number>1</number>
+                <number>2</number>
                </property>
                <property name="maximum">
                 <number>100000</number>
@@ -192,6 +214,19 @@
                 <string>(1-1000)</string>
                </property>
               </widget>
+             </item>
+             <item>
+              <spacer name="horizontalSpacer_3">
+               <property name="orientation">
+                <enum>Qt::Orientation::Horizontal</enum>
+               </property>
+               <property name="sizeHint" stdset="0">
+                <size>
+                 <width>40</width>
+                 <height>20</height>
+                </size>
+               </property>
+              </spacer>
              </item>
             </layout>
            </item>
@@ -221,11 +256,14 @@
                  <verstretch>0</verstretch>
                 </sizepolicy>
                </property>
+               <property name="toolTip">
+                <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Analog Gain is used to increase the brightness of an image. The available range depends on the camera connected. If you increase the analog gain, all pixel values of the image will be increased, i.e. the whole image becomes brighter.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+               </property>
                <property name="minimum">
                 <number>1</number>
                </property>
                <property name="maximum">
-                <number>4</number>
+                <number>3</number>
                </property>
               </widget>
              </item>
@@ -238,9 +276,22 @@
                 </sizepolicy>
                </property>
                <property name="text">
-                <string>(1-4x)</string>
+                <string>(1-3x)</string>
                </property>
               </widget>
+             </item>
+             <item>
+              <spacer name="horizontalSpacer_4">
+               <property name="orientation">
+                <enum>Qt::Orientation::Horizontal</enum>
+               </property>
+               <property name="sizeHint" stdset="0">
+                <size>
+                 <width>40</width>
+                 <height>20</height>
+                </size>
+               </property>
+              </spacer>
              </item>
             </layout>
            </item>
@@ -263,33 +314,86 @@
               </widget>
              </item>
              <item>
-              <widget class="QSpinBox" name="sb_black_level">
-               <property name="buttonSymbols">
-                <enum>QAbstractSpinBox::ButtonSymbols::NoButtons</enum>
+              <layout class="QVBoxLayout" name="verticalLayout_3">
+               <property name="sizeConstraint">
+                <enum>QLayout::SizeConstraint::SetMaximumSize</enum>
                </property>
-               <property name="minimum">
-                <number>1</number>
+               <property name="leftMargin">
+                <number>0</number>
                </property>
-               <property name="maximum">
-                <number>255</number>
-               </property>
-               <property name="value">
-                <number>255</number>
-               </property>
-              </widget>
+               <item>
+                <widget class="QLabel" name="lbl_black_level_current">
+                 <property name="text">
+                  <string>125</string>
+                 </property>
+                 <property name="alignment">
+                  <set>Qt::AlignmentFlag::AlignBottom|Qt::AlignmentFlag::AlignHCenter</set>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <layout class="QHBoxLayout" name="horizontalLayout_5">
+                 <property name="topMargin">
+                  <number>0</number>
+                 </property>
+                 <item>
+                  <widget class="QLabel" name="lbl_black_level_min">
+                   <property name="text">
+                    <string>0</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QSlider" name="hsli_black_level">
+                   <property name="toolTip">
+                    <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Black level defines the brightness in the darkest part of the image. Possible black level settings are values between 0 and 255. If the setting is correct, the sensor will deliver the pixel value 0 for a completely black image. If it is too high, the sensor will deliver a pixel value greater than 0 for black which means a shade of gray. If the value is too small, the sensor will deliver a pixel value of 0 for gray shades.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+                   </property>
+                   <property name="maximum">
+                    <number>255</number>
+                   </property>
+                   <property name="sliderPosition">
+                    <number>125</number>
+                   </property>
+                   <property name="orientation">
+                    <enum>Qt::Orientation::Horizontal</enum>
+                   </property>
+                   <property name="invertedAppearance">
+                    <bool>false</bool>
+                   </property>
+                   <property name="invertedControls">
+                    <bool>false</bool>
+                   </property>
+                   <property name="tickPosition">
+                    <enum>QSlider::TickPosition::NoTicks</enum>
+                   </property>
+                   <property name="tickInterval">
+                    <number>20</number>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QLabel" name="lbl_black_level_max">
+                   <property name="text">
+                    <string>255</string>
+                   </property>
+                  </widget>
+                 </item>
+                </layout>
+               </item>
+              </layout>
              </item>
              <item>
-              <widget class="QLabel" name="lbl_black_level_minmax">
-               <property name="sizePolicy">
-                <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
-                 <horstretch>0</horstretch>
-                 <verstretch>0</verstretch>
-                </sizepolicy>
+              <spacer name="horizontalSpacer_5">
+               <property name="orientation">
+                <enum>Qt::Orientation::Horizontal</enum>
                </property>
-               <property name="text">
-                <string>(1-255)</string>
+               <property name="sizeHint" stdset="0">
+                <size>
+                 <width>40</width>
+                 <height>20</height>
+                </size>
                </property>
-              </widget>
+              </spacer>
              </item>
             </layout>
            </item>
@@ -406,7 +510,7 @@
      <x>0</x>
      <y>0</y>
      <width>1158</width>
-     <height>21</height>
+     <height>20</height>
     </rect>
    </property>
    <widget class="QMenu" name="menuFile">
