@@ -5,7 +5,7 @@ import cv2
 
 
 def save_frames_to_h5(
-        frames: np.ndarray, filename: str, complevel: int = 4, metadata = {}
+        frames: np.ndarray, filename: str, complevel: int = 4, metadata = {}, progressbar = None
 ) -> None:
     """Save frames to an h5 file.
 
@@ -15,6 +15,11 @@ def save_frames_to_h5(
         complevel (int): The compression level to use (4 is default, 0 is no compression)
         metadata (dict): The metadata to save with the frames
     """
+    if progressbar is not None:
+            progressbar.setFormat("Saving...")
+            progressbar.setMaximum(0)
+            progressbar.setValue(0)
+            progressbar.setTextVisible(True)
     with h5py.File(filename, "w") as f:
         dset = f.create_dataset(
             "frames",
@@ -33,20 +38,32 @@ def save_frames_to_h5(
                 dset.attrs.create(k, v)
             except Exception as e:
                 pass
+    if progressbar is not None:
+        progressbar.setMaximum(1)
+        progressbar.setValue(1)
+        progressbar.setFormat("%p%")
 
 
-def save_frames_to_png(frames: np.ndarray, filename: str) -> None:
+def save_frames_to_png(frames: np.ndarray, filename: str, progressbar = None) -> None:
     """Save frames to a png file.
 
     Args:
         frames (np.ndarray): The frames to save
         filename (str): The name of the file to save the frames to
     """
+    # Save a single frame as a single image:
+    if frames.ndim == 2:
+        cv2.imwrite(f"{filename}.png", frames.T)
+        return
+    if progressbar is not None:
+        progressbar.setMaximum(len(frames))
     for i, frame in enumerate(frames):
+        if progressbar is not None:
+            progressbar.setValue(i)
         cv2.imwrite(f"{filename}_{i}.png", frame.T)
 
 
-def load_frames_from_h5(filename) -> np.ndarray:
+def load_frames_from_h5(filename: str, progressbar = None) -> tuple[np.ndarray, dict]:
     """Load frames from an h5 file.
 
     Args:
@@ -55,6 +72,21 @@ def load_frames_from_h5(filename) -> np.ndarray:
     Returns:
         frames: The loaded frames
     """
+    metadata = {}
+    if progressbar is not None:
+       progressbar.setFormat("Loading...")
+       progressbar.setMaximum(0)
+       progressbar.setValue(0)
     with h5py.File(filename, "r") as f:
         frames = f["frames"][:].transpose([0, 2, 1])
-    return frames
+        for k, v in f["frames"].attrs.items():
+            metadata[k] = v
+        if "timestamps" in f:
+            metadata["timestamps"] = f["timestamps"][:]
+        if "frame_counters" in f:
+            metadata["frame_counters"] = f["frame_counters"][:]
+    if progressbar is not None:
+        progressbar.setMaximum(1)
+        progressbar.setValue(1)
+        progressbar.setFormat("%p%")
+    return frames, metadata

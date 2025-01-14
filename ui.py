@@ -42,13 +42,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.setupUi(self)
 
         # Setup and add the ImageItem for displaying the video feed
-        self.ui.ImageView.getHistogramWidget().setHidden(True)
-        self.ui.ImageView.ui.menuBtn.setHidden(True)
-        self.ui.ImageView.ui.roiBtn.setHidden(True)
-        self.ui.ImageView.getView().setAspectLocked(True)
         self.Image = self.ui.ImageView
+        self.Image.ui.menuBtn.setHidden(True)
+        self.Image.ui.roiBtn.setHidden(True)
+        self.Image.getView().setAspectLocked(True)
         # Disable menu
-        self.ui.ImageView.getView().setMenuEnabled(False)
+        self.Image.getView().setMenuEnabled(False)
+        self.Image.discreteTimeLine = True
 
         # Initialize variables
         self.videothread: None | VideoThread = None
@@ -56,6 +56,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source: str = "random"
         self.recording: np.ndarray = np.array([])
         self.ctis: list[str] = []
+        self.filename = "."
 
         self.setup_ui_components()
 
@@ -74,6 +75,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.actionOpen.triggered.connect(self.open_file)
         self.ui.actionSelect_GenTLProducer.triggered.connect(self.find_cti_dialog)
         self.ui.pb_settings.clicked.connect(self.print_frame_counter)
+        self.ui.pb_save_frame.clicked.connect(self.save_current_frame)
 
         # Disable certain elements initially
         self.ui.pb_live.setDisabled(True)
@@ -82,9 +84,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.settings.setHidden(True)
         self.ui.sb_fps.editingFinished.connect(self.on_fps_changed)
         self.ui.sb_exposure.editingFinished.connect(self.on_exposure_changed)
-        self.ui.sb_analog_gain.editingFinished.connect(self.on_analog_gain_changed)
+        self.ui.sb_analog_gain.valueChanged.connect(self.on_analog_gain_changed)
         self.ui.hsli_black_level.valueChanged.connect(self.on_blacklevel_changed)
         self.ui.cb_histogram.checkStateChanged.connect(self.on_histogram_checked)
+
+        # Set tooltips for the labels
+        self.ui.lbl_fps_minmax.setToolTip(self.ui.sb_fps.toolTip())
+        self.ui.lbl_fps.setToolTip(self.ui.sb_fps.toolTip())
+
+        self.ui.lbl_exposure.setToolTip(self.ui.sb_exposure.toolTip())
+        self.ui.lbl_exposure_minmax.setToolTip(self.ui.sb_exposure.toolTip())
+
+        self.ui.lbl_analog_gain_minmax_2.setToolTip(self.ui.sb_analog_gain.toolTip())
+        self.ui.lbl_analog_gain.setToolTip(self.ui.sb_analog_gain.toolTip())
+
+        self.ui.lbl_black_level.setToolTip(self.ui.hsli_black_level.toolTip())
+        self.ui.lbl_black_level_current.setToolTip(self.ui.hsli_black_level.toolTip())
+        self.ui.lbl_black_level_min.setToolTip(self.ui.hsli_black_level.toolTip())
+        self.ui.lbl_black_level_max.setToolTip(self.ui.hsli_black_level.toolTip())
 
         self.populate_video_sources()
 
@@ -119,6 +136,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.pb_connect.clicked.connect(self.disconnect_video)
             self.ui.cb_source.setDisabled(True)
             self.on_source_connected()
+            self.ui.lbl_status.setStyleSheet("color: orange;")
 
     def disconnect_video(self) -> None:
         """Stop the video thread and reset the UI"""
@@ -162,15 +180,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_image(self, frame: np.ndarray) -> None:
         if self.ui.cb_autolevel.isChecked():
-            levels = (frame.T[1::4,::4].min(), frame.T[1::4,::4].max())
+            levels = (frame.T[1::4, ::4].min(), frame.T[1::4, ::4].max())
         else:
             levels = (0, 255)
         self.Image.setImage(
             frame, autoRange=False, autoHistogramRange=False, levels=levels
         )
         self.ui.lbl_img_minmax.setText(
-            f"Min: {frame.T[1::4,::4].min()} - Max: {frame.T[1::4,::4].max()}"
+            f"Pixelvalue Min: {frame.T[1::4,::4].min()} - Max: {frame.T[1::4,::4].max()}"
         )
+        if not self.ui.pb_save_frame.isEnabled():
+            self.ui.pb_save_frame.setDisabled(False)
 
     def on_btn_acquire_clicked(self) -> None:
         self.ui.pb_save.setDisabled(True)
@@ -201,16 +221,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.videothread.cap, n_frames, progressbar
             )
         self.recording = imgs
-        self.timestamps = [cam.extract_timestamp(img)/25_000_000 for img in imgs]
+        self.timestamps = [cam.extract_timestamp(img) / 25_000_000 for img in imgs]
         self.frame_counters = [cam.extract_frame_counter(img) for img in imgs]
+        self.filename = "."
 
     def save(self) -> None:
         """Save the recorded frames to a hdf5 file."""
         # Get filename with a file dialog
         filename, filter = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save File", "", "HDF5 Files (*.h5);;Images (*.png);;All Files (*)"
+            self,
+            "Save File",
+            self.filename,
+            "HDF5 Files (*.h5);;Images (*.png);;All Files (*)",
         )
         metadata: dict = {"timestamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")}
+        # TODO: Better handling, especially if the video was loaded from a file
         if type(self.videothread.cap) is cam.VideoCapture:
             metadata["fps"] = cam.get_webcam_fps(self.videothread.cap)
         elif self.source == "random":
@@ -221,21 +246,16 @@ class MainWindow(QtWidgets.QMainWindow):
             metadata["fps"] = self.ui.sb_fps.value()
             metadata["timestamps"] = self.timestamps
             metadata["frame_counters"] = self.frame_counters
-        self.ui.progressBar.setMaximum(0)
-        self.ui.progressBar.setValue(0)
-        self.ui.progressBar.setFormat("Saving...")
         if filter == "HDF5 Files (*.h5)":
             if ".h5" not in filename:
                 filename += ".h5"
-            importexport.save_frames_to_h5(self.recording, filename, metadata=metadata)
+            importexport.save_frames_to_h5(self.recording, filename, metadata=metadata, progressbar=self.ui.progressBar)
         elif filter == "Images (*.png)":
             if ".png" not in filename:
                 filename += ".png"
-            importexport.save_frames_to_png(self.recording, filename)
-        self.ui.progressBar.setMaximum(1)
-        self.ui.progressBar.setValue(1)
-        self.ui.progressBar.setFormat("%p%")
+            importexport.save_frames_to_png(self.recording, filename, progressbar=self.ui.progressBar)
         logging.info(f"Saved recording to {filename}")
+        self.filename = filename
 
     def on_frames_changed(self) -> None:
         """Update the progress bar maximum value."""
@@ -282,8 +302,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_analog_gain_changed(self) -> None:
         """Update the gain based on the settings."""
-        self.videothread.cap.remote_device.node_map.Gain.value = self.ui.sb_analog_gain.value()
-
+        self.videothread.cap.remote_device.node_map.Gain.value = (
+            self.ui.sb_analog_gain.value()
+        )
 
     def on_blacklevel_changed(self) -> None:
         """Update the blacklevel based on the settings."""
@@ -299,6 +320,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.lbl_fps_minmax.setText(
             f"(1 - {node_map.AcquisitionFrameRateMax.value})"
         )
+        self.on_fps_changed()
 
     def open_file(self) -> None:
         """Open a file dialog to load a video file."""
@@ -306,8 +328,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Open File", "", "HDF5 Files (*.h5);;All Files (*)"
         )
         if filter == "HDF5 Files (*.h5)":
-            self.recording = importexport.load_frames_from_h5(filename)
+            self.recording, self.metadata = importexport.load_frames_from_h5(filename, progressbar=self.ui.progressBar)
+        if self.videothread:
+            self.pause_video()
         self.update_image(self.recording)
+        self.filename = filename
+        self.ui.pb_save.setDisabled(False)
 
     def find_cti_dialog(self) -> None:
         """Open a dialog to find the GenTL Producer file."""
@@ -319,12 +345,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.populate_video_sources()
 
     def print_frame_counter(self) -> None:
-        print("frame_counter", cam.extract_frame_counter(self.Image.getImageItem().image))
-        print("timestamp", cam.extract_timestamp(self.Image.getImageItem().image) / 25_000_000)
+        print(
+            "frame_counter", cam.extract_frame_counter(self.Image.getImageItem().image)
+        )
+        print(
+            "timestamp",
+            cam.extract_timestamp(self.Image.getImageItem().image) / 25_000_000,
+        )
 
     def on_histogram_checked(self) -> None:
         state = self.ui.cb_histogram.isChecked()
         self.ui.ImageView.getHistogramWidget().setHidden(not state)
+
+    def save_current_frame(self) -> None:
+        filename, filter = QtWidgets.QFileDialog.getSaveFileName(self, "Save Image", "", "Image (*.png)")
+        if filename != "" and self.Image.image is not None:
+            img = self.Image.getImageItem().save(filename)
+
+
 
 
 def main() -> None:

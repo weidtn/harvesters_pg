@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 from harvesters.core import Harvester, ImageAcquirer
 from PyQt6 import QtCore
+import logging
 
 import cam
 
@@ -53,7 +54,7 @@ class VideoThread(QtCore.QThread):
         if type(self.cap) is cv2.VideoCapture:
             self.cap.release()
         elif type(self.cap) is None:
-            pass
+            logging.debug("Cap was none")
         else:
             if self.harvester is not None:
                 self.harvester.reset()
