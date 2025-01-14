@@ -2,10 +2,11 @@
 import numpy as np
 import h5py
 import cv2
+from PyQt6.QtWidgets import QProgressBar
 
 
 def save_frames_to_h5(
-        frames: np.ndarray, filename: str, complevel: int = 4, metadata = {}, progressbar = None
+        frames: np.ndarray, filename: str, complevel: int = 4, metadata = {}, progressbar: QProgressBar | None = None
 ) -> None:
     """Save frames to an h5 file.
 
@@ -14,6 +15,7 @@ def save_frames_to_h5(
         filename (str): The name of the file to save the frames to
         complevel (int): The compression level to use (4 is default, 0 is no compression)
         metadata (dict): The metadata to save with the frames
+        progressbar (QProgressBar): The progress bar to update
     """
     if progressbar is not None:
             progressbar.setFormat("Saving...")
@@ -44,12 +46,13 @@ def save_frames_to_h5(
         progressbar.setFormat("%p%")
 
 
-def save_frames_to_png(frames: np.ndarray, filename: str, progressbar = None) -> None:
+def save_frames_to_png(frames: np.ndarray, filename: str, progressbar: QProgressBar | None = None) -> None:
     """Save frames to a png file.
 
     Args:
         frames (np.ndarray): The frames to save
         filename (str): The name of the file to save the frames to
+        progressbar (QProgressBar): The progress bar to update
     """
     # Save a single frame as a single image:
     if frames.ndim == 2:
@@ -63,14 +66,16 @@ def save_frames_to_png(frames: np.ndarray, filename: str, progressbar = None) ->
         cv2.imwrite(f"{filename}_{i}.png", frame.T)
 
 
-def load_frames_from_h5(filename: str, progressbar = None) -> tuple[np.ndarray, dict]:
+def load_frames_from_h5(filename: str, progressbar: QProgressBar | None = None) -> tuple[np.ndarray, dict]:
     """Load frames from an h5 file.
 
     Args:
         filename (str): The name of the file to load the frames from
+        progressbar (QProgressBar): The progress bar to update
+
 
     Returns:
-        frames: The loaded frames
+        tuple[np.ndarray, dict]: The frames and the metadata
     """
     metadata = {}
     if progressbar is not None:
