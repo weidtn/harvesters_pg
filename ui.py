@@ -84,6 +84,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.sb_exposure.editingFinished.connect(self.on_exposure_changed)
         self.ui.sb_analog_gain.editingFinished.connect(self.on_analog_gain_changed)
         self.ui.hsli_black_level.valueChanged.connect(self.on_blacklevel_changed)
+        self.ui.cb_histogram.checkStateChanged.connect(self.on_histogram_checked)
 
         self.populate_video_sources()
 
@@ -320,6 +321,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def print_frame_counter(self) -> None:
         print("frame_counter", cam.extract_frame_counter(self.Image.getImageItem().image))
         print("timestamp", cam.extract_timestamp(self.Image.getImageItem().image) / 25_000_000)
+
+    def on_histogram_checked(self) -> None:
+        state = self.ui.cb_histogram.isChecked()
+        self.ui.ImageView.getHistogramWidget().setHidden(not state)
 
 
 def main() -> None:

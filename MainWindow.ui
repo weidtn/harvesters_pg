@@ -39,6 +39,13 @@
           </property>
          </widget>
         </item>
+        <item>
+         <widget class="QCheckBox" name="cb_histogram">
+          <property name="text">
+           <string>Histogram</string>
+          </property>
+         </widget>
+        </item>
        </layout>
       </item>
       <item>
