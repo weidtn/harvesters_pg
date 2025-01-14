@@ -212,7 +212,6 @@ def record_webcam_frames(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frames = np.zeros((n_frames, width, height), dtype=np.uint8)
-    warmup_cam(cap, frames=30)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_webcam_image(cap)
         if progress is not None:
