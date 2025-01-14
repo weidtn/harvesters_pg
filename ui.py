@@ -159,14 +159,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_image(self, frame: np.ndarray) -> None:
         if self.ui.cb_autolevel.isChecked():
-            levels = (frame.T.flatten()[8:].min(), frame.T[8:].max())
+            levels = (frame.T[1::4,::4].min(), frame.T[1::4,::4].max())
         else:
             levels = (0, 255)
         self.Image.setImage(
             frame, autoRange=False, autoHistogramRange=False, levels=levels
         )
         self.ui.lbl_img_minmax.setText(
-            f"Min: {frame.T.flatten()[8:].min()} - Max: {frame.T.flatten()[8:].max()}"
+            f"Min: {frame.T[1::4,::4].min()} - Max: {frame.T[1::4,::4].max()}"
         )
 
     def on_btn_acquire_clicked(self) -> None:
