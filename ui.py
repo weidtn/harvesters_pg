@@ -15,6 +15,7 @@ import cam
 from MainWindow import Ui_MainWindow
 from VideoThread import VideoThread
 import importexport
+import logging
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -94,20 +95,21 @@ class MainWindow(QtWidgets.QMainWindow):
         [self.ui.cb_source.addItem(f"Webcam {i}") for i in cam_indices]
 
         # Add Harvester cameras
-        self.ctis.extend(cam.find_common_cti_files())
+        self.ctis.extend(cam.load_cti_envvar())
         harvester_cams: list[dict] = cam.return_harvester_cameras(self.ctis)
         [
             self.ui.cb_source.addItem(f"{cam['display_name']}")
             for cam in harvester_cams
             if cam["model"] != "Unknown Model"
         ]
-        self.ui.cb_source.addItem("random")
+        if self.ui.cb_source.findText("random") == -1:
+            self.ui.cb_source.addItem("random")
 
     def connect_video(self) -> None:
         """Read the video source and start the video thread"""
         if not self.videothread:
             self.source = self.ui.cb_source.currentText()
-            self.videothread = VideoThread(self.source)
+            self.videothread = VideoThread(self.source, self.ctis)
             self.videothread.change_pixmap_signal.connect(self.update_image)
             self.ui.pb_live.setDisabled(False)
             self.ui.pb_acquire.setDisabled(False)
@@ -232,7 +234,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.progressBar.setMaximum(1)
         self.ui.progressBar.setValue(1)
         self.ui.progressBar.setFormat("%p%")
-        print(f"Saved recording to {filename}")
+        logging.info(f"Saved recording to {filename}")
 
     def on_frames_changed(self) -> None:
         """Update the progress bar maximum value."""
@@ -313,7 +315,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if filename:
             self.ctis.append(filename)
-            self.populate_video_sources()
+        self.populate_video_sources()
 
     def print_frame_counter(self) -> None:
         print("frame_counter", cam.extract_frame_counter(self.Image.getImageItem().image))

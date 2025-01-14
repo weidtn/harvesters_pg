@@ -13,7 +13,7 @@ from tqdm import trange
 import time
 
 
-def find_common_cti_files() -> list[str]:
+def load_cti_envvar() -> list[str]:
     """Find the common *.cti files for the camera.
 
     Returns:
@@ -24,20 +24,12 @@ def find_common_cti_files() -> list[str]:
     env_var = os.getenv("GENICAM_GENTL64_PATH")
     if env_var:
         ctis.extend(glob.glob(f"{env_var}/*.cti"))
-    cti = (
-        r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti"
-    )
-    if Path(cti).exists():
-        ctis.append(cti)
-    cti = "/usr/local/activesilicon/lib64/TLActiveSilicon.cti"
-    if Path(cti).exists():
-        ctis.append(cti)
     logging.info(f"Found *.cti files: {ctis}")
     return ctis
 
 
 def setup_cam(
-    cti: str = r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti",
+    cti: str,
     height: int = 1080,
     width: int = 1920,
     fps: int = 30,
@@ -127,9 +119,7 @@ def get_webcam_fps(cap):
 
 
 def return_harvester_cameras(
-    ctis: list[str] = [
-        r"C:\Program Files\Active Silicon\FireBird CXP\GenTL\win64\TLActiveSilicon.cti"
-    ],
+    ctis: list[str]
 ) -> list[dict]:
     """Return the cameras detected by the Harvester API.
 

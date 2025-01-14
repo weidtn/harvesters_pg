@@ -28,7 +28,7 @@ class VideoThread(QtCore.QThread):
     change_pixmap_signal = QtCore.pyqtSignal(np.ndarray)
     acquisition_finished_signal = QtCore.pyqtSignal()
 
-    def __init__(self, source) -> None:
+    def __init__(self, source, ctis) -> None:
         super().__init__()
         self.source: str = source
         self.image_functions = {
@@ -39,17 +39,15 @@ class VideoThread(QtCore.QThread):
         self.image_func: Callable = self.image_functions[self.source.split(" ")[0]]
         self.cap: cv2.VideoCapture | ImageAcquirer | None = None
         self.harvester: Harvester | None = None
-        self.set_cap()
+        self.set_cap(ctis)
 
-    def set_cap(self) -> None:
+    def set_cap(self, ctis) -> None:
         if self.source == "random":
             self.cap = None
         elif "Webcam" in self.source:
             self.cap = cam.setup_webcam(int(self.source.split(" ")[1]))
         else:
-            # TODO: Manage the cti files better
-            cti = cam.find_common_cti_files()[0]
-            self.harvester, self.cap = cam.setup_cam(cti=cti)
+            self.harvester, self.cap = cam.setup_cam(cti=ctis[0])
 
     def __del__(self) -> None:
         if type(self.cap) is cv2.VideoCapture:
