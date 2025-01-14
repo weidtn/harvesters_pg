@@ -218,7 +218,7 @@ def get_random_image(_: None) -> np.ndarray:
     Returns:
         np.ndarray: A random image.
     """
-    return np.random.randint(0, 255, (1920, 1080), dtype=np.uint8)
+    return np.random.randint(0, 256, (1920, 1080), dtype=np.uint8)
 
 
 def record_random_frames(n_frames: int, progress: None | QProgressBar) -> np.ndarray:
