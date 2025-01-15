@@ -13,6 +13,13 @@ class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
         MainWindow.resize(1158, 778)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        sizePolicy.setHorizontalStretch(0)
+        sizePolicy.setVerticalStretch(0)
+        sizePolicy.setHeightForWidth(MainWindow.sizePolicy().hasHeightForWidth())
+        MainWindow.setSizePolicy(sizePolicy)
         self.centralwidget = QtWidgets.QWidget(parent=MainWindow)
         self.centralwidget.setObjectName("centralwidget")
         self.gridLayout = QtWidgets.QGridLayout(self.centralwidget)
@@ -40,6 +47,44 @@ class Ui_MainWindow(object):
         self.ImageView = ImageView(parent=self.centralwidget)
         self.ImageView.setObjectName("ImageView")
         self.verticalLayout_2.addWidget(self.ImageView)
+        self.recording = QtWidgets.QWidget(parent=self.centralwidget)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
+        sizePolicy.setHorizontalStretch(0)
+        sizePolicy.setVerticalStretch(0)
+        sizePolicy.setHeightForWidth(self.recording.sizePolicy().hasHeightForWidth())
+        self.recording.setSizePolicy(sizePolicy)
+        self.recording.setObjectName("recording")
+        self.horizontalLayout_7 = QtWidgets.QHBoxLayout(self.recording)
+        self.horizontalLayout_7.setObjectName("horizontalLayout_7")
+        self.pb_play = QtWidgets.QPushButton(parent=self.recording)
+        self.pb_play.setObjectName("pb_play")
+        self.horizontalLayout_7.addWidget(self.pb_play)
+        self.lbl_current_frame = QtWidgets.QLabel(parent=self.recording)
+        self.lbl_current_frame.setObjectName("lbl_current_frame")
+        self.horizontalLayout_7.addWidget(self.lbl_current_frame)
+        spacerItem = QtWidgets.QSpacerItem(
+            40,
+            20,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
+        self.horizontalLayout_7.addItem(spacerItem)
+        self.lbl_goto_frame = QtWidgets.QLabel(parent=self.recording)
+        self.lbl_goto_frame.setObjectName("lbl_goto_frame")
+        self.horizontalLayout_7.addWidget(self.lbl_goto_frame)
+        self.sb_goto_frame = QtWidgets.QSpinBox(parent=self.recording)
+        self.sb_goto_frame.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
+        )
+        self.sb_goto_frame.setObjectName("sb_goto_frame")
+        self.horizontalLayout_7.addWidget(self.sb_goto_frame)
+        self.lbl_goto_frame_max = QtWidgets.QLabel(parent=self.recording)
+        self.lbl_goto_frame_max.setObjectName("lbl_goto_frame_max")
+        self.horizontalLayout_7.addWidget(self.lbl_goto_frame_max)
+        self.verticalLayout_2.addWidget(self.recording)
         self.line = QtWidgets.QFrame(parent=self.centralwidget)
         self.line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
         self.line.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
@@ -68,10 +113,20 @@ class Ui_MainWindow(object):
         self.lbl_status.setScaledContents(False)
         self.lbl_status.setObjectName("lbl_status")
         self.horizontalLayout.addWidget(self.lbl_status)
-        spacerItem = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
-        self.horizontalLayout.addItem(spacerItem)
-        spacerItem1 = QtWidgets.QSpacerItem(20, 150, QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Fixed)
+        spacerItem1 = QtWidgets.QSpacerItem(
+            40,
+            20,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
         self.horizontalLayout.addItem(spacerItem1)
+        spacerItem2 = QtWidgets.QSpacerItem(
+            20,
+            150,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.horizontalLayout.addItem(spacerItem2)
         self.settings = QtWidgets.QWidget(parent=self.centralwidget)
         self.settings.setEnabled(True)
         self.settings.setObjectName("settings")
@@ -80,7 +135,10 @@ class Ui_MainWindow(object):
         self.hLay_FPS = QtWidgets.QHBoxLayout()
         self.hLay_FPS.setObjectName("hLay_FPS")
         self.lbl_fps = QtWidgets.QLabel(parent=self.settings)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
         sizePolicy.setHeightForWidth(self.lbl_fps.sizePolicy().hasHeightForWidth())
@@ -97,20 +155,33 @@ class Ui_MainWindow(object):
         self.sb_fps.setObjectName("sb_fps")
         self.hLay_FPS.addWidget(self.sb_fps)
         self.lbl_fps_minmax = QtWidgets.QLabel(parent=self.settings)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
-        sizePolicy.setHeightForWidth(self.lbl_fps_minmax.sizePolicy().hasHeightForWidth())
+        sizePolicy.setHeightForWidth(
+            self.lbl_fps_minmax.sizePolicy().hasHeightForWidth()
+        )
         self.lbl_fps_minmax.setSizePolicy(sizePolicy)
         self.lbl_fps_minmax.setObjectName("lbl_fps_minmax")
         self.hLay_FPS.addWidget(self.lbl_fps_minmax)
-        spacerItem2 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
-        self.hLay_FPS.addItem(spacerItem2)
+        spacerItem3 = QtWidgets.QSpacerItem(
+            40,
+            20,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
+        self.hLay_FPS.addItem(spacerItem3)
         self.vLay_settings.addLayout(self.hLay_FPS)
         self.hLay_exposure = QtWidgets.QHBoxLayout()
         self.hLay_exposure.setObjectName("hLay_exposure")
         self.lbl_exposure = QtWidgets.QLabel(parent=self.settings)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
         sizePolicy.setHeightForWidth(self.lbl_exposure.sizePolicy().hasHeightForWidth())
@@ -119,72 +190,112 @@ class Ui_MainWindow(object):
         self.lbl_exposure.setObjectName("lbl_exposure")
         self.hLay_exposure.addWidget(self.lbl_exposure)
         self.sb_exposure = QtWidgets.QSpinBox(parent=self.settings)
-        self.sb_exposure.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.sb_exposure.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
+        )
         self.sb_exposure.setMinimum(2)
         self.sb_exposure.setMaximum(100000)
         self.sb_exposure.setProperty("value", 1000)
         self.sb_exposure.setObjectName("sb_exposure")
         self.hLay_exposure.addWidget(self.sb_exposure)
         self.lbl_exposure_minmax = QtWidgets.QLabel(parent=self.settings)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
-        sizePolicy.setHeightForWidth(self.lbl_exposure_minmax.sizePolicy().hasHeightForWidth())
+        sizePolicy.setHeightForWidth(
+            self.lbl_exposure_minmax.sizePolicy().hasHeightForWidth()
+        )
         self.lbl_exposure_minmax.setSizePolicy(sizePolicy)
         self.lbl_exposure_minmax.setObjectName("lbl_exposure_minmax")
         self.hLay_exposure.addWidget(self.lbl_exposure_minmax)
-        spacerItem3 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
-        self.hLay_exposure.addItem(spacerItem3)
+        spacerItem4 = QtWidgets.QSpacerItem(
+            40,
+            20,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
+        self.hLay_exposure.addItem(spacerItem4)
         self.vLay_settings.addLayout(self.hLay_exposure)
         self.hLay_analog_gain = QtWidgets.QHBoxLayout()
         self.hLay_analog_gain.setObjectName("hLay_analog_gain")
         self.lbl_analog_gain = QtWidgets.QLabel(parent=self.settings)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
-        sizePolicy.setHeightForWidth(self.lbl_analog_gain.sizePolicy().hasHeightForWidth())
+        sizePolicy.setHeightForWidth(
+            self.lbl_analog_gain.sizePolicy().hasHeightForWidth()
+        )
         self.lbl_analog_gain.setSizePolicy(sizePolicy)
         self.lbl_analog_gain.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.lbl_analog_gain.setObjectName("lbl_analog_gain")
         self.hLay_analog_gain.addWidget(self.lbl_analog_gain)
         self.sb_analog_gain = QtWidgets.QSpinBox(parent=self.settings)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
-        sizePolicy.setHeightForWidth(self.sb_analog_gain.sizePolicy().hasHeightForWidth())
+        sizePolicy.setHeightForWidth(
+            self.sb_analog_gain.sizePolicy().hasHeightForWidth()
+        )
         self.sb_analog_gain.setSizePolicy(sizePolicy)
         self.sb_analog_gain.setMinimum(1)
         self.sb_analog_gain.setMaximum(3)
         self.sb_analog_gain.setObjectName("sb_analog_gain")
         self.hLay_analog_gain.addWidget(self.sb_analog_gain)
         self.lbl_analog_gain_minmax_2 = QtWidgets.QLabel(parent=self.settings)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
-        sizePolicy.setHeightForWidth(self.lbl_analog_gain_minmax_2.sizePolicy().hasHeightForWidth())
+        sizePolicy.setHeightForWidth(
+            self.lbl_analog_gain_minmax_2.sizePolicy().hasHeightForWidth()
+        )
         self.lbl_analog_gain_minmax_2.setSizePolicy(sizePolicy)
         self.lbl_analog_gain_minmax_2.setObjectName("lbl_analog_gain_minmax_2")
         self.hLay_analog_gain.addWidget(self.lbl_analog_gain_minmax_2)
-        spacerItem4 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
-        self.hLay_analog_gain.addItem(spacerItem4)
+        spacerItem5 = QtWidgets.QSpacerItem(
+            40,
+            20,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
+        self.hLay_analog_gain.addItem(spacerItem5)
         self.vLay_settings.addLayout(self.hLay_analog_gain)
         self.hLay_black_level = QtWidgets.QHBoxLayout()
         self.hLay_black_level.setObjectName("hLay_black_level")
         self.lbl_black_level = QtWidgets.QLabel(parent=self.settings)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
-        sizePolicy.setHeightForWidth(self.lbl_black_level.sizePolicy().hasHeightForWidth())
+        sizePolicy.setHeightForWidth(
+            self.lbl_black_level.sizePolicy().hasHeightForWidth()
+        )
         self.lbl_black_level.setSizePolicy(sizePolicy)
         self.lbl_black_level.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.lbl_black_level.setObjectName("lbl_black_level")
         self.hLay_black_level.addWidget(self.lbl_black_level)
         self.verticalLayout_3 = QtWidgets.QVBoxLayout()
-        self.verticalLayout_3.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMaximumSize)
+        self.verticalLayout_3.setSizeConstraint(
+            QtWidgets.QLayout.SizeConstraint.SetMaximumSize
+        )
         self.verticalLayout_3.setContentsMargins(0, -1, -1, -1)
         self.verticalLayout_3.setObjectName("verticalLayout_3")
         self.lbl_black_level_current = QtWidgets.QLabel(parent=self.settings)
-        self.lbl_black_level_current.setAlignment(QtCore.Qt.AlignmentFlag.AlignBottom|QtCore.Qt.AlignmentFlag.AlignHCenter)
+        self.lbl_black_level_current.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignBottom | QtCore.Qt.AlignmentFlag.AlignHCenter
+        )
         self.lbl_black_level_current.setObjectName("lbl_black_level_current")
         self.verticalLayout_3.addWidget(self.lbl_black_level_current)
         self.horizontalLayout_5 = QtWidgets.QHBoxLayout()
@@ -208,8 +319,13 @@ class Ui_MainWindow(object):
         self.horizontalLayout_5.addWidget(self.lbl_black_level_max)
         self.verticalLayout_3.addLayout(self.horizontalLayout_5)
         self.hLay_black_level.addLayout(self.verticalLayout_3)
-        spacerItem5 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
-        self.hLay_black_level.addItem(spacerItem5)
+        spacerItem6 = QtWidgets.QSpacerItem(
+            40,
+            20,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
+        self.hLay_black_level.addItem(spacerItem6)
         self.vLay_settings.addLayout(self.hLay_black_level)
         self.horizontalLayout.addWidget(self.settings)
         self.verticalLayout_2.addLayout(self.horizontalLayout)
@@ -220,12 +336,16 @@ class Ui_MainWindow(object):
         self.horizontalLayout_2 = QtWidgets.QHBoxLayout()
         self.horizontalLayout_2.setObjectName("horizontalLayout_2")
         self.sb_frames = QtWidgets.QSpinBox(parent=self.centralwidget)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
         sizePolicy.setHeightForWidth(self.sb_frames.sizePolicy().hasHeightForWidth())
         self.sb_frames.setSizePolicy(sizePolicy)
-        self.sb_frames.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.sb_frames.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
+        )
         self.sb_frames.setMinimum(1)
         self.sb_frames.setMaximum(100000)
         self.sb_frames.setProperty("value", 1000)
@@ -238,12 +358,16 @@ class Ui_MainWindow(object):
         self.horizontalLayout_3 = QtWidgets.QHBoxLayout()
         self.horizontalLayout_3.setObjectName("horizontalLayout_3")
         self.sb_seconds = QtWidgets.QDoubleSpinBox(parent=self.centralwidget)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
+        sizePolicy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+        )
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
         sizePolicy.setHeightForWidth(self.sb_seconds.sizePolicy().hasHeightForWidth())
         self.sb_seconds.setSizePolicy(sizePolicy)
-        self.sb_seconds.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.sb_seconds.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
+        )
         self.sb_seconds.setDecimals(3)
         self.sb_seconds.setProperty("value", 1.0)
         self.sb_seconds.setObjectName("sb_seconds")
@@ -298,29 +422,64 @@ class Ui_MainWindow(object):
     def retranslateUi(self, MainWindow):
         _translate = QtCore.QCoreApplication.translate
         MainWindow.setWindowTitle(_translate("MainWindow", "MainWindow"))
-        self.cb_autolevel.setToolTip(_translate("MainWindow", "<html><head/><body><p>Whether the displayed Image shouldhave the intensity automatically scaled or not. This is just for displaying!</p></body></html>"))
+        self.cb_autolevel.setToolTip(
+            _translate(
+                "MainWindow",
+                "<html><head/><body><p>Whether the displayed Image shouldhave the intensity automatically scaled or not. This is just for displaying!</p></body></html>",
+            )
+        )
         self.cb_autolevel.setText(_translate("MainWindow", "Auto Intensity Scaling"))
-        self.lbl_img_minmax.setText(_translate("MainWindow", "Pixelvalue Min: 0 Max: 255"))
+        self.lbl_img_minmax.setText(
+            _translate("MainWindow", "Pixelvalue Min: 0 Max: 255")
+        )
         self.cb_histogram.setText(_translate("MainWindow", "Histogram"))
-        self.pb_save_frame.setToolTip(_translate("MainWindow", "<html><head/><body><p>Saves the currently shown Image. This includes the applied intensity scaling and is not the raw image data.</p></body></html>"))
+        self.pb_save_frame.setToolTip(
+            _translate(
+                "MainWindow",
+                "<html><head/><body><p>Saves the currently shown Image. This includes the applied intensity scaling and is not the raw image data.</p></body></html>",
+            )
+        )
         self.pb_save_frame.setText(_translate("MainWindow", "Save current Image"))
+        self.pb_play.setText(_translate("MainWindow", "Play"))
+        self.lbl_current_frame.setText(_translate("MainWindow", "Current frame:"))
+        self.lbl_goto_frame.setText(_translate("MainWindow", "Go to frame:"))
+        self.lbl_goto_frame_max.setText(_translate("MainWindow", "/ 1"))
         self.pb_settings.setText(_translate("MainWindow", "Settings"))
         self.pb_connect.setText(_translate("MainWindow", "Connect"))
         self.pb_live.setText(_translate("MainWindow", "Start Live View"))
         self.lbl_status.setText(_translate("MainWindow", "●"))
         self.lbl_fps.setText(_translate("MainWindow", "FPS [Hz]"))
-        self.sb_fps.setToolTip(_translate("MainWindow", "<html><head/><body><p>This feature defines the acquisition rate in [Hz].</p></body></html>"))
+        self.sb_fps.setToolTip(
+            _translate(
+                "MainWindow",
+                "<html><head/><body><p>This feature defines the acquisition rate in [Hz].</p></body></html>",
+            )
+        )
         self.lbl_fps_minmax.setText(_translate("MainWindow", "(1-2123)"))
         self.lbl_exposure.setText(_translate("MainWindow", "Exposure [μs]"))
-        self.sb_exposure.setToolTip(_translate("MainWindow", "This feature defines the duration of exposure [μs]."))
+        self.sb_exposure.setToolTip(
+            _translate(
+                "MainWindow", "This feature defines the duration of exposure [μs]."
+            )
+        )
         self.lbl_exposure_minmax.setText(_translate("MainWindow", "(1-1000)"))
         self.lbl_analog_gain.setText(_translate("MainWindow", "Analog Gain"))
-        self.sb_analog_gain.setToolTip(_translate("MainWindow", "<html><head/><body><p>Analog Gain is used to increase the brightness of an image. The available range depends on the camera connected. If you increase the analog gain, all pixel values of the image will be increased, i.e. the whole image becomes brighter.</p></body></html>"))
+        self.sb_analog_gain.setToolTip(
+            _translate(
+                "MainWindow",
+                "<html><head/><body><p>Analog Gain is used to increase the brightness of an image. The available range depends on the camera connected. If you increase the analog gain, all pixel values of the image will be increased, i.e. the whole image becomes brighter.</p></body></html>",
+            )
+        )
         self.lbl_analog_gain_minmax_2.setText(_translate("MainWindow", "(1-3x)"))
         self.lbl_black_level.setText(_translate("MainWindow", "Black Level"))
         self.lbl_black_level_current.setText(_translate("MainWindow", "125"))
         self.lbl_black_level_min.setText(_translate("MainWindow", "0"))
-        self.hsli_black_level.setToolTip(_translate("MainWindow", "<html><head/><body><p>Black level defines the brightness in the darkest part of the image. Possible black level settings are values between 0 and 255. If the setting is correct, the sensor will deliver the pixel value 0 for a completely black image. If it is too high, the sensor will deliver a pixel value greater than 0 for black which means a shade of gray. If the value is too small, the sensor will deliver a pixel value of 0 for gray shades.</p></body></html>"))
+        self.hsli_black_level.setToolTip(
+            _translate(
+                "MainWindow",
+                "<html><head/><body><p>Black level defines the brightness in the darkest part of the image. Possible black level settings are values between 0 and 255. If the setting is correct, the sensor will deliver the pixel value 0 for a completely black image. If it is too high, the sensor will deliver a pixel value greater than 0 for black which means a shade of gray. If the value is too small, the sensor will deliver a pixel value of 0 for gray shades.</p></body></html>",
+            )
+        )
         self.lbl_black_level_max.setText(_translate("MainWindow", "255"))
         self.lbl_n_frames.setText(_translate("MainWindow", "Frames"))
         self.lbl_seconds.setText(_translate("MainWindow", "Seconds"))
@@ -330,5 +489,9 @@ class Ui_MainWindow(object):
         self.menuSettings.setTitle(_translate("MainWindow", "Settings"))
         self.actionExit.setText(_translate("MainWindow", "Exit"))
         self.actionOpen.setText(_translate("MainWindow", "Open"))
-        self.actionSelect_GenTLProducer.setText(_translate("MainWindow", "Select GenTL Producer"))
+        self.actionSelect_GenTLProducer.setText(
+            _translate("MainWindow", "Select GenTL Producer")
+        )
+
+
 from pyqtgraph import ImageView

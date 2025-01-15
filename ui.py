@@ -80,6 +80,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Disable certain elements initially
         self.ui.pb_live.setDisabled(True)
         self.ui.lbl_status.setStyleSheet("color: red;")
+        self.ui.recording.setHidden(True)
 
         self.ui.settings.setHidden(True)
         self.ui.sb_fps.editingFinished.connect(self.on_fps_changed)
@@ -87,6 +88,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.sb_analog_gain.valueChanged.connect(self.on_analog_gain_changed)
         self.ui.hsli_black_level.valueChanged.connect(self.on_blacklevel_changed)
         self.ui.cb_histogram.checkStateChanged.connect(self.on_histogram_checked)
+        self.ui.ImageView.timeLine.setPen(
+            width=10
+        )  # Make the cursor in timeline bigger
+        self.ui.pb_play.clicked.connect(self.on_play_clicked)
+        self.ui.sb_goto_frame.editingFinished.connect(
+            lambda: self.Image.setCurrentIndex(self.ui.sb_goto_frame.value())
+        )
+        self.ui.ImageView.getImageItem().sigImageChanged.connect(
+            lambda: self.ui.lbl_current_frame.setText(
+                f"Current frame: {self.ui.ImageView.currentIndex}"
+            )
+        )
 
         # Set tooltips for the labels
         self.ui.lbl_fps_minmax.setToolTip(self.ui.sb_fps.toolTip())
@@ -191,12 +204,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not self.ui.pb_save_frame.isEnabled():
             self.ui.pb_save_frame.setDisabled(False)
+        if frame.ndim == 3:
+            self.ui.recording.setHidden(False)
+            self.ui.sb_goto_frame.setMaximum(frame.shape[0] - 1)
+            self.ui.lbl_goto_frame_max.setText(f"/ {frame.shape[0] - 1}")
+        else:
+            self.ui.recording.setHidden(True)
 
     def on_btn_acquire_clicked(self) -> None:
+        self.pause_video()
+        self.Image.clear()
         self.ui.pb_save.setDisabled(True)
         self.recording = np.array([])
         n_frames = int(self.ui.sb_frames.text())
-        self.pause_video()
         self.acquire(n_frames, self.ui.progressBar)
         self.ui.pb_save.setDisabled(False)
         self.update_image(self.recording)
@@ -249,11 +269,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if filter == "HDF5 Files (*.h5)":
             if ".h5" not in filename:
                 filename += ".h5"
-            importexport.save_frames_to_h5(self.recording, filename, metadata=metadata, progressbar=self.ui.progressBar)
+            importexport.save_frames_to_h5(
+                self.recording,
+                filename,
+                metadata=metadata,
+                progressbar=self.ui.progressBar,
+            )
         elif filter == "Images (*.png)":
             if ".png" not in filename:
                 filename += ".png"
-            importexport.save_frames_to_png(self.recording, filename, progressbar=self.ui.progressBar)
+            importexport.save_frames_to_png(
+                self.recording, filename, progressbar=self.ui.progressBar
+            )
         logging.info(f"Saved recording to {filename}")
         self.filename = filename
 
@@ -324,20 +351,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_file(self) -> None:
         """Open a file dialog to load a video file."""
+        if self.videothread:
+            self.pause_video()
+            self.Image.clear()
         filename, filter = QtWidgets.QFileDialog.getOpenFileName(
             self, "Open File", "", "HDF5 Files (*.h5);;All Files (*)"
         )
         if filter == "HDF5 Files (*.h5)":
-            self.recording, self.metadata = importexport.load_frames_from_h5(filename, progressbar=self.ui.progressBar)
-        if self.videothread:
-            self.pause_video()
+            self.recording, self.metadata = importexport.load_frames_from_h5(
+                filename, progressbar=self.ui.progressBar
+            )
         self.update_image(self.recording)
         self.filename = filename
         self.ui.pb_save.setDisabled(False)
 
     def find_cti_dialog(self) -> None:
         """Open a dialog to find the GenTL Producer file."""
-        filename, filter = QtWidgets.QFileDialog.getOpenFileName(
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select GenTL Producer", "", "GenTL Producer (*.cti)"
         )
         if filename:
@@ -358,11 +388,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.ImageView.getHistogramWidget().setHidden(not state)
 
     def save_current_frame(self) -> None:
-        filename, filter = QtWidgets.QFileDialog.getSaveFileName(self, "Save Image", "", "Image (*.png)")
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Image", "", "Image (*.png)"
+        )
         if filename != "" and self.Image.image is not None:
-            img = self.Image.getImageItem().save(filename)
+            if ".png" not in filename:
+                filename += ".png"
+            self.Image.getImageItem().save(filename)
 
-
+    def on_play_clicked(self) -> None:
+        self.Image.togglePause()
+        pb = self.ui.pb_play
+        if pb.text() == "Play":
+            pb.setText("Pause")
+        else:
+            pb.setText("Play")
 
 
 def main() -> None:

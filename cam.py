@@ -302,7 +302,7 @@ def record_harvester_frames(
         np.ndarray: The recorded frames as a numpy array.
     """
     if progress is not None:
-        progress.setMaximum(n_frames - 1)
+        progress.setMaximum(n_frames -1 )
     width = ia.remote_device.node_map.Width.value
     height = ia.remote_device.node_map.Height.value
     frames = np.zeros((n_frames, width, height), dtype=np.uint8)
@@ -312,6 +312,9 @@ def record_harvester_frames(
         if progress is not None:
             progress.setValue(i)
     ia.stop()
+    if progress is not None and n_frames == 1:
+        progress.setMaximum(1)
+        progress.setValue(1)
     return np.array(frames)
 
 
