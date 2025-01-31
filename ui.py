@@ -252,7 +252,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Save File",
             self.filename,
-            "HDF5 Files (*.h5);;Images (*.png);;All Files (*)",
+            "HDF5 Files (*.h5);;Images (*.png);;Images (*.jpg)",
         )
         metadata: dict = {"timestamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")}
         # TODO: Better handling, especially if the video was loaded from a file
@@ -279,6 +279,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if ".png" not in filename:
                 filename += ".png"
             importexport.save_frames_to_png(
+                self.recording, filename, progressbar=self.ui.progressBar
+            )
+        elif filter == "Images (*.jpg)":
+            if ".jpg" not in filename:
+                filename += ".jpg"
+            importexport.save_frames_to_jpg(
                 self.recording, filename, progressbar=self.ui.progressBar
             )
         logging.info(f"Saved recording to {filename}")
@@ -389,11 +395,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def save_current_frame(self) -> None:
         filename, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Image", "", "Image (*.png)"
+            self, "Save Image", "", "Image (*.png);;Image (*.jpg)"
         )
         if filename != "" and self.Image.image is not None:
             if ".png" not in filename:
                 filename += ".png"
+            if ".jpg" not in filename:
+                filename += ".jpg"
             self.Image.getImageItem().save(filename)
 
     def on_play_clicked(self) -> None:

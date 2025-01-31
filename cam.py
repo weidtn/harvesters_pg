@@ -198,14 +198,20 @@ def record_webcam_frames(
         np.ndarray: The recorded frames as a numpy array.
     """
     if progress is not None:
-        progress.setMaximum(n_frames - 1)
+        if n_frames == 1:
+            progress.setMaximum(1)
+        else:
+            progress.setMaximum(n_frames - 1)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frames = np.zeros((n_frames, width, height), dtype=np.uint8)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_webcam_image(cap)
         if progress is not None:
-            progress.setValue(i)
+            if n_frames == 1:
+                progress.setValue(1)
+            else:
+                progress.setValue(i)
     return frames
 
 
@@ -231,12 +237,18 @@ def record_random_frames(n_frames: int, progress: None | QProgressBar) -> np.nda
         np.ndarray: The recorded frames as a numpy array.
     """
     if progress is not None:
-        progress.setMaximum(n_frames - 1)
+        if n_frames == 1:
+            progress.setMaximum(1)
+        else:
+            progress.setMaximum(n_frames - 1)
     frames = np.zeros((n_frames, 1920, 1080), dtype=np.uint8)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_random_image(None)
         if progress is not None:
-            progress.setValue(i)
+            if n_frames == 1:
+                progress.setValue(1)
+            else:
+                progress.setValue(i)
     return frames
 
 
@@ -302,7 +314,10 @@ def record_harvester_frames(
         np.ndarray: The recorded frames as a numpy array.
     """
     if progress is not None:
-        progress.setMaximum(n_frames -1 )
+        if n_frames == 1:
+            progress.setMaximum(1)
+        else:
+            progress.setMaximum(n_frames -1)
     width = ia.remote_device.node_map.Width.value
     height = ia.remote_device.node_map.Height.value
     frames = np.zeros((n_frames, width, height), dtype=np.uint8)
@@ -310,11 +325,11 @@ def record_harvester_frames(
     for i in trange(n_frames):
         frames[i] = get_harvester_image(ia)
         if progress is not None:
-            progress.setValue(i)
+            if n_frames == 1:
+                progress.setValue(1)
+            else:
+                progress.setValue(i)
     ia.stop()
-    if progress is not None and n_frames == 1:
-        progress.setMaximum(1)
-        progress.setValue(1)
     return np.array(frames)
 
 

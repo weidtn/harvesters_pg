@@ -3,6 +3,8 @@ import numpy as np
 import h5py
 import cv2
 from PyQt6.QtWidgets import QProgressBar
+import os
+import pathlib
 
 
 def save_frames_to_h5(
@@ -60,6 +62,20 @@ def save_frames_to_h5(
         progressbar.setFormat("%p%")
 
 
+def create_path(filename: str) -> None:
+    """Create a path for the given filename. The file ending is removed.
+
+    Args:
+        path (str): The path to create
+    """
+    # Get the path without the file ending
+
+    path = pathlib.Path(filename)
+    new_path = f"{path.parent}/{path.name.split('.')[0]}"
+    pathlib.Path(new_path).mkdir(parents=True, exist_ok=True)
+    return new_path
+
+
 def save_frames_to_png(
     frames: np.ndarray, filename: str, progressbar: QProgressBar | None = None
 ) -> None:
@@ -73,15 +89,55 @@ def save_frames_to_png(
     # Save a single frame as a single image:
     if ".png" not in filename:
         filename += ".png"
+    path = create_path(filename)
+    new_filename = f"{path}/{filename.split('/')[-1]}"
     if frames.ndim == 2:
-        cv2.imwrite(f"{filename}", frames.T)
+        cv2.imwrite(f"{new_filename}", frames.T)
         return
     if progressbar is not None:
-        progressbar.setMaximum(len(frames) - 1)
+        if len(frames) == 1:
+            progressbar.setMaximum(2)
+        else:
+            progressbar.setMaximum(len(frames))
     for i, frame in enumerate(frames):
-        cv2.imwrite(f"{filename.split('.png')[0]}_{i}.png", frame.T)
+        cv2.imwrite(f"{new_filename.split('.png')[0]}_{i}.png", frame.T)
         if progressbar is not None:
-            progressbar.setValue(i)
+            if len(frames) == 1:
+                progressbar.setValue(2)
+            else:
+                progressbar.setValue(i)
+
+
+def save_frames_to_jpg(
+    frames: np.ndarray, filename: str, progressbar: QProgressBar | None = None
+) -> None:
+    """Save frames to a png file.
+
+    Args:
+        frames (np.ndarray): The frames to save
+        filename (str): The name of the file to save the frames to
+        progressbar (QProgressBar): The progress bar to update
+    """
+    # Save a single frame as a single image:
+    if ".jpg" not in filename:
+        filename += ".jpg"
+    path = create_path(filename)
+    new_filename = f"{path}/{filename.split('/')[-1]}"
+    if frames.ndim == 2:
+        cv2.imwrite(f"{new_filename}", frames.T)
+        return
+    if progressbar is not None:
+        if len(frames) == 1:
+            progressbar.setMaximum(2)
+        else:
+            progressbar.setMaximum(len(frames))
+    for i, frame in enumerate(frames):
+        cv2.imwrite(f"{new_filename.split('.jpg')[0]}_{i}.jpg", frame.T)
+        if progressbar is not None:
+            if len(frames) == 1:
+                progressbar.setValue(2)
+            else:
+                progressbar.setValue(i)
 
 
 def load_frames_from_h5(
