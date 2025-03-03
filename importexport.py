@@ -53,7 +53,7 @@ def save_frames_to_h5(
             metadata.pop("frame_counters")
         for k, v in metadata.items():
             try:
-                dset.attrs.create(k, v)
+                f.attrs.create(k, v)
             except Exception as e:
                 pass
     if progressbar is not None:
