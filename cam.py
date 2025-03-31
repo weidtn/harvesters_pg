@@ -75,6 +75,7 @@ def setup_cam(
 
     nodes.Height.value = height
     nodes.Width.value = width
+    nodes.TriggerMode.value = "Off"
 
     nodes.InfoFieldFrameCounterEnable.value = True
     nodes.InfoFieldTimeStampEnable.value = True
@@ -118,9 +119,7 @@ def get_webcam_fps(cap):
     return cap.get(cv2.CAP_PROP_FPS)
 
 
-def return_harvester_cameras(
-    ctis: list[str]
-) -> list[dict]:
+def return_harvester_cameras(ctis: list[str]) -> list[dict]:
     """Return the cameras detected by the Harvester API.
 
     Args:
@@ -317,7 +316,7 @@ def record_harvester_frames(
         if n_frames == 1:
             progress.setMaximum(1)
         else:
-            progress.setMaximum(n_frames -1)
+            progress.setMaximum(n_frames - 1)
     width = ia.remote_device.node_map.Width.value
     height = ia.remote_device.node_map.Height.value
     frames = np.zeros((n_frames, width, height), dtype=np.uint8)
@@ -331,10 +330,6 @@ def record_harvester_frames(
                 progress.setValue(i)
     ia.stop()
     return np.array(frames)
-
-
-def set_exposure(ia, exposure):
-    ia.remote_device.node_map.ExposureTime.value = exposure
 
 
 def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:
@@ -352,8 +347,12 @@ def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:
         try:
             dict[node] = getattr(ia.remote_device.node_map, node).value
         except Exception as e:
-            pass
+            logging.debug(f"Error while getting node {node}'s value: {e}")
     return dict
+
+
+def get_harvester_nodemap(ia: ImageAcquirer):
+    return ia.remote_device.node_map
 
 
 def get_max_exposure(fps: int) -> int:
@@ -429,3 +428,23 @@ def extract_timestamp(img: np.ndarray) -> int:
     timestamp = msb | mid_high | mid_low | lsb
 
     return timestamp
+
+
+def set_attribute(ia, attribute, value):
+    """Set an attribute of the camera.
+
+    Args:
+        ia (ImageAcquirer): The ImageAcquirer object.
+        attribute (str): The attribute to set.
+        value (int): The value to set the attribute to.
+
+    Returns:
+        None
+    """
+    nodemap = ia.remote_device.node_map
+    try:
+        attribute = getattr(nodemap, attribute)
+        attribute.value = value
+        logging.debug(f"Set attribute {attribute} to {value}")
+    except Exception as e:
+        logging.warning(f"Error while setting attribute {attribute} to {value}: {e}")
