@@ -10,6 +10,8 @@ from PyQt6 import QtWidgets
 import numpy as np
 import datetime
 
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
+
 import cam
 from MainWindow import Ui_MainWindow
 from settings import Ui_SettingsWindow
@@ -26,8 +28,6 @@ from genicam.genapi import (
     AccessException,
     ICommand,
 )
-
-os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
 
 class SettingsWindow(QtWidgets.QMainWindow):
@@ -108,11 +108,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
                     self.settings[node]["widget"] = widget
                 elif type(getattr(nodemap, node)) is ICommand:
                     widget = QtWidgets.QPushButton(text="Execute")
-                    widget.pressed.connect(
-                        lambda nodemap=nodemap, node=node: getattr(
-                            nodemap, node
-                        ).execute()
-                    )
+                    widget.pressed.connect(lambda node=node: self.execute_command(node))
                     self.settings[node]["widget"] = widget
                 else:
                     logging.debug(
@@ -132,6 +128,16 @@ class SettingsWindow(QtWidgets.QMainWindow):
                 self.settings[field]["label"],
                 self.settings[field]["widget"],
             )
+        self.update_fields()
+
+    def execute_command(self, node):
+        """Execute a command on the camera.
+
+        Args:
+            node (str): The command to execute
+        """
+        nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
+        getattr(nodemap, node).execute()
         self.update_fields()
 
     def update_fields(self):
@@ -192,6 +198,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
             self.mainwindow.ui.hsli_black_level.setValue(value)
             self.mainwindow.on_blacklevel_changed()
         cam.set_attribute(self.mainwindow.videothread.cap, node, value)
+        self.update_fields()
 
 
 class MainWindow(QtWidgets.QMainWindow):
