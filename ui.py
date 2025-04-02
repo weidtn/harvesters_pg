@@ -361,7 +361,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running = True
         self.ui.pb_live.setText("Pause")
         self.ui.lbl_status.setStyleSheet("color: green;")
-        self.ui.settings_window.update_fields()
+        if type(self.videothread.cap) is cam.ImageAcquirer:
+            self.ui.settings_window.update_fields()
 
     def pause_video(self) -> None:
         if not self.videothread:
@@ -370,7 +371,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running = False
         self.ui.pb_live.setText("Start")
         self.ui.lbl_status.setStyleSheet("color: orange;")
-        self.ui.settings_window.update_fields()
+        if type(self.videothread.cap) is cam.ImageAcquirer:
+            self.ui.settings_window.update_fields()
 
     def toggle_video(self) -> None:
         if not self.is_running:
