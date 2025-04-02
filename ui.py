@@ -494,11 +494,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_source_connected(self) -> None:
         """Update the source based on the combobox."""
         self.source = self.ui.cb_source.currentText()
-        if "random" in self.source:
+        if "random" in self.source or "Webcam" in self.source:
             self.ui.settings.setHidden(True)
-        if "Webcam" in self.source:
-            self.ui.settings.setHidden(True)
-        if "SVS-Vistek" in self.source:
+        else: # Harvester camera
             self.setup_settings()  # get minmax values for settings
             self.ui.pb_settings.setDisabled(False)
             self.ui.settings.setHidden(False)
