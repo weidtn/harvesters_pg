@@ -5,7 +5,6 @@ All user interaction with the ui is handled in here and communicated to the modl
 
 import os
 
-os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 import sys
 from PyQt6 import QtWidgets
 import numpy as np
@@ -24,103 +23,161 @@ from genicam.genapi import (
     IBoolean,
     IFloat,
     IString,
-    INodeMap,
     AccessException,
+    ICommand,
 )
+
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
 
 class SettingsWindow(QtWidgets.QMainWindow):
+    """Settings window to change camera settings.
+
+    The settings window is created in Qt Designer and converted using pyuic6.
+    The settings window is populated with the camera settings
+    so the user can change the settings.
+
+    Attributes:
+        ui (Ui_SettingsWindow): The UI object created using Qt Designer
+        mainwindow (MainWindow): The main window object
+        settings (dict): A dictionary containing the camera settings
+    """
+
     def __init__(self, mainwindow) -> None:
+        """Initialize the settings window.
+
+        Args:
+            mainwindow (MainWindow): The main window object
+        """
         super(SettingsWindow, self).__init__()
         self.ui = Ui_SettingsWindow()
         self.ui.setupUi(self)
         self.mainwindow = mainwindow
-        self.fields = {}
+        self.settings = {}
 
     def fill_settings(self):
+        """Fill the settings window' with the camera settings."""
         nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
         for node in dir(nodemap):
-            self.fields[node] = {
+            self.settings[node] = {
                 "label": QtWidgets.QLabel(text=node),
                 "widget": None,
                 "button": QtWidgets.QPushButton(text="Apply"),
             }
-            # Access_modes possible: NA (1), ?, RO (3), RW (4)
             try:
                 if type(getattr(nodemap, node)) is IInteger:
                     widget = QtWidgets.QSpinBox(readOnly=True)
                     try:
                         widget.setMinimum(getattr(nodemap, node).min)
                         widget.setMaximum(getattr(nodemap, node).max)
-                        widget.setValue(getattr(nodemap, node).value)
-                        self.fields[node]["widget"] = widget
+                        self.settings[node]["widget"] = widget
                         widget.valueChanged.connect(
                             lambda v, node=node: self.update_node(node, v)
                         )
-                        access_mode = getattr(nodemap, node).get_access_mode()
-                        if access_mode == 4:
-                            widget.setReadOnly(False)
                     except OverflowError:
                         widget = QtWidgets.QLineEdit(readOnly=True)
                         widget.setText(str(getattr(nodemap, node).value))
                     except AttributeError:
                         logging.debug(f"AttributeError for {node}")
                     widget.wheelEvent = lambda e: None
-                    self.fields[node]["widget"] = widget
+                    self.settings[node]["widget"] = widget
                 elif type(getattr(nodemap, node)) is IFloat:
                     widget = QtWidgets.QDoubleSpinBox()
-                    widget.setValue(getattr(nodemap, node).value)
                     widget.valueChanged.connect(
                         lambda v, node=node: self.update_node(node, v)
                     )
-                    try:
-                        access_mode = getattr(nodemap, node).get_access_mode()
-                        if access_mode == 4:
-                            widget.setReadOnly(False)
-                    except AttributeError:
-                        logging.debug(f"AttributeError for {node}")
-                    self.fields[node]["widget"] = widget
+                    self.settings[node]["widget"] = widget
                 elif type(getattr(nodemap, node)) is IEnumeration:
                     widget = QtWidgets.QComboBox(enabled=False)
                     widget.addItems(getattr(nodemap, node)._get_symbolics())
-                    widget.setCurrentText(getattr(nodemap, node).value)
                     widget.currentTextChanged.connect(
                         lambda value, node=node: self.update_node(node, value)
                     )
-                    try:
-                        access_mode = getattr(nodemap, node).get_access_mode()
-                        if access_mode == 4:
-                            widget.setEnabled(True)
-                    except AttributeError:
-                        logging.debug(f"AttributeError for {node}")
-                    self.fields[node]["widget"] = widget
+                    self.settings[node]["widget"] = widget
                 elif type(getattr(nodemap, node)) is IBoolean:
                     widget = QtWidgets.QCheckBox(enabled=False)
-                    widget.setChecked(getattr(nodemap, node).value)
                     widget.stateChanged.connect(
                         lambda value, node=node: self.update_node(node, bool(value))
                     )
-                    self.fields[node]["widget"] = widget
-                    try:
-                        access_mode = getattr(nodemap, node).get_access_mode()
-                        if access_mode == 4:
-                            widget.setEnabled(True)
-                    except AttributeError:
-                        logging.debug(f"AttributeError for {node}")
+                    self.settings[node]["widget"] = widget
+                elif type(getattr(nodemap, node)) is IString:
+                    widget = QtWidgets.QLineEdit()
+                    widget.editingFinished.connect(
+                        lambda: self.update_node(node, widget.text())
+                    )
+                    self.settings[node]["widget"] = widget
+                elif type(getattr(nodemap, node)) is ICommand:
+                    widget = QtWidgets.QPushButton(text="Execute")
+                    widget.pressed.connect(
+                        lambda nodemap=nodemap, node=node: getattr(
+                            nodemap, node
+                        ).execute()
+                    )
+                    self.settings[node]["widget"] = widget
                 else:
                     logging.debug(
                         f"Type {type(getattr(nodemap, node))} not supported for {node}"
                     )
-                    self.fields.pop(node)
+                    self.settings.pop(node)
                     continue
             except AccessException:
-                self.fields.pop(node)
+                self.settings.pop(node)
                 continue
+            except Exception as e:
+                logging.debug(f"Exception {e} for {node}")
+                self.settings.pop(node)
+                continue
+        for field in self.settings:
             self.ui.formLayout.addRow(
-                self.fields[node]["label"], self.fields[node]["widget"]
+                self.settings[field]["label"],
+                self.settings[field]["widget"],
             )
+        self.update_fields()
+
+    def update_fields(self):
+        """Update the fields with the current values from the camera.
+
+        This function is called when the settings window is opened
+        or when the settings are changed in the main window.
+        """
+        nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
+        for node in self.settings:
+            # Access_modes possible: NA (1), ?, RO (3), RW (4)
+            widget = self.settings[node]["widget"]
+            widget.blockSignals(True)
+            try:
+                access_mode = getattr(nodemap, node).get_access_mode()
+                if type(widget) is QtWidgets.QSpinBox:
+                    widget.setValue(getattr(nodemap, node).value)
+                    widget.setReadOnly(
+                        False
+                    ) if access_mode == 4 else widget.setReadOnly(True)
+                elif type(widget) is QtWidgets.QDoubleSpinBox:
+                    widget.setValue(getattr(nodemap, node).value)
+                    widget.setReadOnly(
+                        False
+                    ) if access_mode == 4 else widget.setReadOnly(True)
+                elif type(widget) is QtWidgets.QComboBox:
+                    widget.setCurrentText(str(getattr(nodemap, node).value))
+                    widget.setEnabled(True) if access_mode == 4 else widget.setEnabled(
+                        False
+                    )
+                elif type(widget) is QtWidgets.QCheckBox:
+                    widget.setChecked(getattr(nodemap, node).value)
+                    widget.setEnabled(True) if access_mode == 4 else widget.setEnabled(
+                        False
+                    )
+                elif type(widget) is QtWidgets.QLineEdit:
+                    widget.setText(str(getattr(nodemap, node).value))
+                    widget.setReadOnly(
+                        False
+                    ) if access_mode == 4 else widget.setReadOnly(True)
+            except AccessException:
+                continue
+            widget.blockSignals(False)
 
     def update_node(self, node, value):
+        """Update the camera settings based on the settings window."""
         logging.debug(f"Setting {node} to {value}")
         if node == "AcquisitionFrameRate":
             self.mainwindow.ui.sb_fps.setValue(value)
@@ -181,7 +238,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setup_ui_components()
 
     def setup_ui_components(self) -> None:
-        """Setup UI components and connect signals."""
+        """Set up UI components and connect signals."""
         # Connect the buttons to their respective functions
         self.ui.pb_connect.clicked.connect(self.connect_video)
         self.ui.pb_live.clicked.connect(self.toggle_video)
@@ -240,7 +297,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def populate_video_sources(self) -> None:
         """Populate combobox with available video sources."""
-
         # Add OpenCV camera indices
         cam_indices: list[int] = cam.get_camera_indices()
         [self.ui.cb_source.addItem(f"Webcam {i}") for i in cam_indices]
@@ -257,7 +313,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.cb_source.addItem("random")
 
     def connect_video(self) -> None:
-        """Read the video source and start the video thread"""
+        """Read the video source and start the video thread."""
         if not self.videothread:
             self.source = self.ui.cb_source.currentText()
             self.videothread = VideoThread(self.source, self.ctis)
@@ -273,7 +329,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pause_video()
 
     def disconnect_video(self) -> None:
-        """Stop the video thread and reset the UI"""
+        """Stop the video thread and reset the UI."""
         if self.videothread:
             self.videothread.stop()
             self.videothread = None
@@ -287,7 +343,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.pb_live.setText("Start")
             self.ui.lbl_status.setStyleSheet("color: red;")
             self.ui.settings.setHidden(True)
-            self.ui.settings_window.close()
             self.ui.pb_settings.setDisabled(True)
 
     def start_video(self) -> None:
@@ -299,6 +354,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running = True
         self.ui.pb_live.setText("Pause")
         self.ui.lbl_status.setStyleSheet("color: green;")
+        self.ui.settings_window.update_fields()
 
     def pause_video(self) -> None:
         if not self.videothread:
@@ -307,6 +363,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running = False
         self.ui.pb_live.setText("Start")
         self.ui.lbl_status.setStyleSheet("color: orange;")
+        self.ui.settings_window.update_fields()
 
     def toggle_video(self) -> None:
         if not self.is_running:
@@ -436,6 +493,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.setup_settings()  # get minmax values for settings
             self.ui.pb_settings.setDisabled(False)
             self.ui.settings.setHidden(False)
+            self.ui.settings_window.fill_settings()
 
     def on_fps_changed(self) -> None:
         """Update the fps based on the settings."""
@@ -448,6 +506,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.on_exposure_changed()
         self.ui.sb_exposure.setMaximum(cam.get_max_exposure(self.ui.sb_fps.value()))
         self.on_frames_changed()
+        self.ui.settings_window.update_fields()
 
     def on_exposure_changed(self) -> None:
         """Update the exposure based on the settings."""
@@ -457,11 +516,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.ui.sb_exposure.setValue(exposure)
         cam.set_attribute(self.videothread.cap, "ExposureTime", exposure)
+        self.ui.settings_window.update_fields()
 
     def on_analog_gain_changed(self) -> None:
         """Update the gain based on the settings."""
         logging.debug(f"Setting analog gain to {self.ui.sb_analog_gain.value()}")
         cam.set_attribute(self.videothread.cap, "Gain", self.ui.sb_analog_gain.value())
+        self.ui.settings_window.update_fields()
 
     def on_blacklevel_changed(self) -> None:
         """Update the blacklevel based on the settings."""
@@ -470,6 +531,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cam.set_attribute(
             self.videothread.cap, "BlackLevel", self.ui.hsli_black_level.value()
         )
+        self.ui.settings_window.update_fields()
 
     def setup_settings(self) -> None:
         ia = self.videothread.cap
@@ -482,7 +544,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_settings_pressed(self) -> None:
         logging.debug("Settings pressed")
-        self.ui.settings_window.fill_settings()
         self.ui.settings_window.show()
 
     def open_file(self) -> None:
