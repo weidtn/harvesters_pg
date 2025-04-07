@@ -6,7 +6,7 @@ All user interaction with the ui is handled in here and communicated to the modl
 import os
 
 import sys
-from PyQt6 import QtWidgets
+from PyQt6 import QtWidgets, QtCore
 import numpy as np
 import datetime
 
@@ -54,6 +54,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.ui.setupUi(self)
         self.mainwindow = mainwindow
         self.settings = {}
+        self.timer = QtCore.QTimer(self)
 
     def fill_settings(self):
         """Fill the settings window' with the camera settings."""
@@ -128,7 +129,10 @@ class SettingsWindow(QtWidgets.QMainWindow):
                 self.settings[field]["label"],
                 self.settings[field]["widget"],
             )
-        self.update_fields()
+        #timer should update fields every 500 ms
+        self.timer.timeout.connect(self.update_fields)
+        self.timer.setInterval(500)
+        self.timer.start()
 
     def execute_command(self, node):
         """Execute a command on the camera.
@@ -136,6 +140,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         Args:
             node (str): The command to execute
         """
+        logging.debug(f"Executing command {node}")
         nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
         getattr(nodemap, node).execute()
         self.update_fields()
@@ -146,7 +151,11 @@ class SettingsWindow(QtWidgets.QMainWindow):
         This function is called when the settings window is opened
         or when the settings are changed in the main window.
         """
-        nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
+        try:
+            nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
+        except AttributeError:
+            logging.debug("AttributeError: nodemap not found, camera not connected")
+            return
         for node in self.settings:
             # Access_modes possible: NA (1), ?, RO (3), RW (4)
             widget = self.settings[node]["widget"]
@@ -351,6 +360,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.lbl_status.setStyleSheet("color: red;")
             self.ui.settings.setHidden(True)
             self.ui.pb_settings.setDisabled(True)
+            self.ui.settings_window.timer.stop()
 
     def start_video(self) -> None:
         if not self.videothread:
@@ -361,8 +371,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running = True
         self.ui.pb_live.setText("Pause")
         self.ui.lbl_status.setStyleSheet("color: green;")
-        if type(self.videothread.cap) is cam.ImageAcquirer:
-            self.ui.settings_window.update_fields()
 
     def pause_video(self) -> None:
         if not self.videothread:
@@ -371,8 +379,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running = False
         self.ui.pb_live.setText("Start")
         self.ui.lbl_status.setStyleSheet("color: orange;")
-        if type(self.videothread.cap) is cam.ImageAcquirer:
-            self.ui.settings_window.update_fields()
 
     def toggle_video(self) -> None:
         if not self.is_running:
@@ -513,7 +519,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.on_exposure_changed()
         self.ui.sb_exposure.setMaximum(cam.get_max_exposure(self.ui.sb_fps.value()))
         self.on_frames_changed()
-        self.ui.settings_window.update_fields()
 
     def on_exposure_changed(self) -> None:
         """Update the exposure based on the settings."""
@@ -523,13 +528,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.ui.sb_exposure.setValue(exposure)
         cam.set_attribute(self.videothread.cap, "ExposureTime", exposure)
-        self.ui.settings_window.update_fields()
 
     def on_analog_gain_changed(self) -> None:
         """Update the gain based on the settings."""
         logging.debug(f"Setting analog gain to {self.ui.sb_analog_gain.value()}")
         cam.set_attribute(self.videothread.cap, "Gain", self.ui.sb_analog_gain.value())
-        self.ui.settings_window.update_fields()
 
     def on_blacklevel_changed(self) -> None:
         """Update the blacklevel based on the settings."""
@@ -538,7 +541,6 @@ class MainWindow(QtWidgets.QMainWindow):
         cam.set_attribute(
             self.videothread.cap, "BlackLevel", self.ui.hsli_black_level.value()
         )
-        self.ui.settings_window.update_fields()
 
     def setup_settings(self) -> None:
         ia = self.videothread.cap
