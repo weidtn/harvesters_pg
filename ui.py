@@ -446,7 +446,7 @@ class MainWindow(QtWidgets.QMainWindow):
         filename, filter = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save File",
-            self.filename,
+            "",
             "HDF5 Files (*.h5);;Images (*.png);;Images (*.jpg)",
         )
         metadata: dict = {"timestamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")}
