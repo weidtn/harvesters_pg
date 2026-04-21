@@ -71,7 +71,10 @@ def setup_cam(
     nodes.AcquisitionFrameRate.value = fps
 
     exposure = cap_at_max_exposure(exposure, fps)
-    nodes.ExposureTime.set_value(exposure)
+    try:
+        nodes.ExposureTime.set_value(exposure)
+    except Exception as e:
+        print(e)
 
     nodes.Height.value = height
     nodes.Width.value = width
@@ -268,8 +271,8 @@ def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
                 np.frombuffer(component.data, dtype=np.uint8)
                 .reshape(component.height, component.width)
                 .T
-            )
-            img = img.copy()
+            ).astype(np.uint8)
+            # img = img.copy() # This slowed down acquisition
         else:  # If no buffer is available, return a black image
             img = np.zeros(
                 (
@@ -319,10 +322,10 @@ def record_harvester_frames(
             progress.setMaximum(n_frames - 1)
     width = ia.remote_device.node_map.Width.value
     height = ia.remote_device.node_map.Height.value
-    frames = np.zeros((n_frames, width, height), dtype=np.uint8)
+    frames = [] # Using a list and converting to a numpy array at the end is faster than preallocating a numpy array and filling it, because the latter involves copying the data for each frame.
     ia.start()
     for i in trange(n_frames):
-        frames[i] = get_harvester_image(ia)
+        frames.append(get_harvester_image(ia))
         if progress is not None:
             if n_frames == 1:
                 progress.setValue(1)
