@@ -17,7 +17,9 @@ for i in tqdm.tqdm(range(10), desc="warmup"):
     buffer = ia.fetch()
     buffer.queue()
 
-frames = np.zeros([FRAMES, 1080, 1920], dtype=np.uint8)
+width = ia.remote_device.node_map.Width.value
+height = ia.remote_device.node_map.Height.value
+frames = np.zeros([FRAMES, height, width], dtype=np.uint8)
 try:
     for i in tqdm.tqdm(range(FRAMES), desc="Measuring"):
         with ia.fetch() as buffer:

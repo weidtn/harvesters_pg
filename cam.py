@@ -1,4 +1,6 @@
-"""The model to handle interaction with the camera."""
+"""
+The model to handle interaction with the camera.
+"""
 
 from PyQt6.QtWidgets import QProgressBar
 from harvesters.core import Harvester, ImageAcquirer
@@ -30,8 +32,8 @@ def load_cti_envvar() -> list[str]:
 
 def setup_cam(
     cti: str,
-    height: int = 1080,
-    width: int = 1920,
+    height: int | None = None,
+    width: int | None = None,
     fps: int = 30,
     blacklevel: int = 125,
     exposure: int = 999,
@@ -76,8 +78,16 @@ def setup_cam(
     except Exception as e:
         print(e)
 
-    nodes.Height.value = height
-    nodes.Width.value = width
+    if height is not None:
+        nodes.Height.value = height
+    else:
+        nodes.Height.value = nodes.HeightMax.value
+
+    if width is not None:
+        nodes.Width.value = width
+    else:
+        nodes.Width.value = nodes.WidthMax.value
+
     nodes.TriggerMode.value = "Off"
 
     nodes.InfoFieldFrameCounterEnable.value = True
@@ -104,7 +114,6 @@ def warmup_cam(ia, frames: int = 10) -> None:
         buffer = ia.fetch()
         buffer.queue()
 
-
 def setup_webcam(idx: int) -> VideoCapture:
     """Set the webcam up using OpenCV.
 
@@ -117,10 +126,8 @@ def setup_webcam(idx: int) -> VideoCapture:
     cap = VideoCapture(idx)
     return cap
 
-
 def get_webcam_fps(cap):
     return cap.get(cv2.CAP_PROP_FPS)
-
 
 def return_harvester_cameras(ctis: list[str]) -> list[dict]:
     """Return the cameras detected by the Harvester API.
@@ -139,7 +146,6 @@ def return_harvester_cameras(ctis: list[str]) -> list[dict]:
     h.reset()
     return devices
 
-
 def get_camera_indices() -> list[int]:
     """Get the indices of the first 10 cameras that are detectable by OpenCV.
 
@@ -157,7 +163,6 @@ def get_camera_indices() -> list[int]:
             cap.release()
     return arr
 
-
 def disconnect_cam(h: Harvester, ia: ImageAcquirer) -> None:
     """Disconnect the camera.
 
@@ -172,7 +177,6 @@ def disconnect_cam(h: Harvester, ia: ImageAcquirer) -> None:
     ia.destroy()
     h.reset()
 
-
 def get_webcam_image(cap: VideoCapture) -> np.ndarray:
     """Get an image from the webcam.
 
@@ -185,7 +189,6 @@ def get_webcam_image(cap: VideoCapture) -> np.ndarray:
     _, frame = cap.read()
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).T
     return gray
-
 
 def record_webcam_frames(
     cap: VideoCapture, n_frames: int, progress: None | QProgressBar
@@ -216,7 +219,6 @@ def record_webcam_frames(
                 progress.setValue(i)
     return frames
 
-
 def get_random_image(_: None) -> np.ndarray:
     """Get a random image.
 
@@ -227,7 +229,6 @@ def get_random_image(_: None) -> np.ndarray:
         np.ndarray: A random image.
     """
     return np.random.randint(0, 256, (1920, 1080), dtype=np.uint8)
-
 
 def record_random_frames(n_frames: int, progress: None | QProgressBar) -> np.ndarray:
     """Record n_frames of random images.
@@ -252,7 +253,6 @@ def record_random_frames(n_frames: int, progress: None | QProgressBar) -> np.nda
             else:
                 progress.setValue(i)
     return frames
-
 
 def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
     """
@@ -283,7 +283,6 @@ def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
             )
     return img
 
-
 def get_remote_nodes(ia: ImageAcquirer) -> dict:
     """Get all nodes and their values from the camera.
 
@@ -301,7 +300,6 @@ def get_remote_nodes(ia: ImageAcquirer) -> dict:
         except Exception as e:
             logging.warning(f"Error while getting node {node}'s value: {e}")
     return dict
-
 
 def record_harvester_frames(
     ia: ImageAcquirer, n_frames: int, progress: None | QProgressBar
@@ -334,7 +332,6 @@ def record_harvester_frames(
     ia.stop()
     return np.array(frames)
 
-
 def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:
     """Get all attributes of the camera.
 
@@ -353,14 +350,12 @@ def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:
             logging.debug(f"Error while getting node {node}'s value: {e}")
     return dict
 
-
 def get_harvester_nodemap(ia: ImageAcquirer):
     return ia.remote_device.node_map
 
 
 def get_max_exposure(fps: int) -> int:
     return int((1.0 / fps) * 1e6 - 1)
-
 
 def cap_at_max_exposure(exposure: int, fps: int) -> int:
     max_exposure = get_max_exposure(fps)
@@ -371,10 +366,8 @@ def cap_at_max_exposure(exposure: int, fps: int) -> int:
         )
     return exposure
 
-
 def get_max_fps_harvesters(ia: ImageAcquirer) -> int:
     return ia.remote_device.node_map.AcquisitionFrameRateMax.value
-
 
 def extract_frame_counter(img: np.ndarray) -> dict:
     """Extract the superimposed frame counter from the image.
@@ -404,7 +397,6 @@ def extract_frame_counter(img: np.ndarray) -> dict:
 
     return frame_counter
 
-
 def extract_timestamp(img: np.ndarray) -> int:
     """Extract the superimposed timestamp from the image.
 
@@ -431,7 +423,6 @@ def extract_timestamp(img: np.ndarray) -> int:
     timestamp = msb | mid_high | mid_low | lsb
 
     return timestamp
-
 
 def set_attribute(ia, attribute, value):
     """Set an attribute of the camera.

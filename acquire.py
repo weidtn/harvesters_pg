@@ -16,7 +16,9 @@ h, ia = cam.setup_cam(cti=ctis[0], fps=FPS)
 
 # Start the acquisition engine:
 
-frames = np.zeros([T*FPS, 1080, 1920], dtype=np.uint8)
+width = ia.remote_device.node_map.Width.value
+height = ia.remote_device.node_map.Height.value
+frames = np.zeros([T*FPS, height, width], dtype=np.uint8)
 
 # warmup
 for i in tqdm.tqdm(range(10), desc="warmup"):
