@@ -36,6 +36,7 @@ class VideoThread(QtCore.QThread):
             "Webcam": cam.get_webcam_image,
             "random": cam.get_random_image,
             "SVS-Vistek": cam.get_harvester_image,
+            "Mikrotron": cam.get_harvester_image,
         }
         self.image_func: Callable = self.image_functions[self.source.split(" ")[0]]
         self.cap: cv2.VideoCapture | ImageAcquirer | None = None
