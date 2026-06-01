@@ -15,7 +15,7 @@ class VideoThread(QtCore.QThread):
     """Worker thread for capturing video frames.
 
     Args:
-        source (str): The source of the video feed. It can be either "Webcam {index}" or "random"
+        source (str): The source of the video feed. It can be either "Webcam {index}", "random", or any Harvester camera.
 
     Attributes:
         change_pixmap_signal (QtCore.pyqtSignal): Signal to emit the frame to the main thread
@@ -35,10 +35,11 @@ class VideoThread(QtCore.QThread):
         self.image_functions = {
             "Webcam": cam.get_webcam_image,
             "random": cam.get_random_image,
-            "SVS-Vistek": cam.get_harvester_image,
-            "Mikrotron": cam.get_harvester_image,
         }
-        self.image_func: Callable = self.image_functions[self.source.split(" ")[0]]
+        try:
+            self.image_func = self.image_functions[self.source.split(" ")[0]]
+        except KeyError:
+            self.image_func = cam.get_harvester_image
         self.cap: cv2.VideoCapture | ImageAcquirer | None = None
         self.harvester: Harvester | None = None
         self.set_cap(ctis)
