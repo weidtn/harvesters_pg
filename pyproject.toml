@@ -1,7 +1,7 @@
 [project]
 name = "harvesters_pg"
 version = "0.1.0"
-description = "Add your description here"
+description = "Harvesters camera acquisition GUI"
 readme = "README.md"
 requires-python = "~=3.11"
 dependencies = [
