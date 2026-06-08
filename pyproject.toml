@@ -1,5 +1,5 @@
 [project]
-name = "hrvstrs"
+name = "harvesters_pg"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -13,5 +13,13 @@ dependencies = [
     "pyqtgraph>=0.13.7",
     "tqdm>=4.67.1",
 ]
+
+[build.system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["ui", "MainWindow", "cam", "acquire", "VideoThread", "liveview", "settings", "importexport", "frametime", "saving", "reset", "get_attributes", "attributes", "harvester_test"]
+
 [project.scripts]
-harvesters_pg = "harvesters_pg.ui:main"
+harvesters_pg = "ui:main"
