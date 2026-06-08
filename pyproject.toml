@@ -13,3 +13,5 @@ dependencies = [
     "pyqtgraph>=0.13.7",
     "tqdm>=4.67.1",
 ]
+[project.scripts]
+harvesters_pg = "harvesters_pg.ui:main"
