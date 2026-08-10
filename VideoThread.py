@@ -53,6 +53,9 @@ class VideoThread(QtCore.QThread):
             self.harvester, self.cap = cam.setup_cam(cti=ctis[0])
 
     def __del__(self) -> None:
+        if self.isRunning():
+            self._run_flag = False
+            self.wait(2000)
         if type(self.cap) is cv2.VideoCapture:
             self.cap.release()
         elif type(self.cap) is None:
@@ -78,17 +81,14 @@ class VideoThread(QtCore.QThread):
 
 
     def stop(self) -> None:
+        self._run_flag = False
+        self.wait(2000)
         if type(self.cap) is ImageAcquirer:
             self.cap.stop()
-        self._run_flag = False
 
     def resume(self) -> None:
-        if type(self.cap) is ImageAcquirer:
-            self.cap.start()
         self._run_flag = True
 
     def _start(self) -> None:
         super().start()
         self._run_flag = True
-        if type(self.cap) is ImageAcquirer:
-            self.cap.start()
