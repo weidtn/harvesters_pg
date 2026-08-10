@@ -32,6 +32,7 @@ class VideoThread(QtCore.QThread):
     def __init__(self, source, ctis) -> None:
         super().__init__()
         self.source: str = source
+        self._run_flag: bool = False
         self.image_functions = {
             "Webcam": cam.get_webcam_image,
             "random": cam.get_random_image,
@@ -61,12 +62,13 @@ class VideoThread(QtCore.QThread):
         elif type(self.cap) is None:
             logging.debug("Cap was none")
         else:
-            if self.harvester is not None:
-                self.harvester.reset()
-                self.harvester = None
+            # Stop acquisition and destroy ImageAcquirer before resetting Harvester
             if self.cap is not None:
                 self.cap.stop()
                 self.cap.destroy()
+            if self.harvester is not None:
+                self.harvester.reset()
+                self.harvester = None
 
     def run(self) -> None:
         """Capture video frames and emit the frame to the main thread."""
@@ -74,7 +76,8 @@ class VideoThread(QtCore.QThread):
         while self._run_flag:
             try:
                 frame = self.image_func(self.cap)
-                self.change_pixmap_signal.emit(frame)
+                if frame is not None:
+                    self.change_pixmap_signal.emit(frame)
                 time.sleep(1/30) # 30 fps
             except Exception as e:
                 print(e)
@@ -87,8 +90,12 @@ class VideoThread(QtCore.QThread):
             self.cap.stop()
 
     def resume(self) -> None:
+        if type(self.cap) is ImageAcquirer:
+            self.cap.start()
         self._run_flag = True
 
     def _start(self) -> None:
         super().start()
+        if type(self.cap) is ImageAcquirer:
+            self.cap.start()
         self._run_flag = True
