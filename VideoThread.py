@@ -90,12 +90,10 @@ class VideoThread(QtCore.QThread):
             self.cap.stop()
 
     def resume(self) -> None:
-        if type(self.cap) is ImageAcquirer:
-            self.cap.start()
         self._run_flag = True
 
     def _start(self) -> None:
-        super().start()
+        self._run_flag = True
         if type(self.cap) is ImageAcquirer:
             self.cap.start()
-        self._run_flag = True
+        super().start()
