@@ -328,6 +328,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.ui.cb_source.findText("random") == -1:
             self.ui.cb_source.addItem("random")
 
+    def closeEvent(self, event) -> None:
+        """Orderly stop the camera before the window closes.
+
+        Stops acquisition and joins the worker before Python teardown, so the
+        GenTL producer is never destroyed while still streaming (a whole-system
+        freeze cause).
+        """
+        if self.videothread:
+            self.disconnect_video()
+        event.accept()
+
     def connect_video(self) -> None:
         """Read the video source and start the video thread."""
         if not self.videothread:
@@ -366,8 +377,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.videothread:
             raise ValueError("Video thread not started")
         self.ui.pb_save.setDisabled(True)
-        self.videothread._start()
-        self.videothread.resume()
+        self.videothread._start()  # starts camera acquisition and the worker thread once
         self.is_running = True
         self.ui.pb_live.setText("Pause")
         self.ui.lbl_status.setStyleSheet("color: green;")

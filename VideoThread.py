@@ -53,17 +53,38 @@ class VideoThread(QtCore.QThread):
         else:
             self.harvester, self.cap = cam.setup_cam(cti=ctis[0])
 
-    def __del__(self) -> None:
+    def _stop_and_join(self) -> None:
+        """Signal the run loop to exit and wait for the worker thread to finish.
+
+        Unblocks a fetch() waiting on the camera first, then joins. Only after
+        the worker has actually exited is it safe to stop/destroy the camera,
+        otherwise teardown races the driver's DMA buffers and can hang the machine.
+        """
+        self._run_flag = False
+        if not self.isRunning():
+            return
+        # Unblock a fetch() that is waiting for a frame, then join.
+        if type(self.cap) is ImageAcquirer:
+            try:
+                self.cap.stop()
+            except Exception as e:
+                logging.debug(f"Error stopping camera while joining thread: {e}")
+        deadline = time.monotonic() + 10.0
+        while self.isRunning() and time.monotonic() < deadline:
+            self.wait(100)
         if self.isRunning():
-            self._run_flag = False
-            self.wait(2000)
+            logging.warning("VideoThread worker did not stop within 10s")
+
+    def __del__(self) -> None:
+        self._stop_and_join()
         if type(self.cap) is cv2.VideoCapture:
             self.cap.release()
         elif type(self.cap) is None:
             logging.debug("Cap was none")
         else:
-            # Stop acquisition and destroy ImageAcquirer before resetting Harvester
-            if self.cap is not None:
+            # Only teardown the camera once the worker has actually exited, so we
+            # never destroy DMA buffers while the producer is still streaming.
+            if self.cap is not None and not self.isRunning():
                 self.cap.stop()
                 self.cap.destroy()
             if self.harvester is not None:
@@ -84,13 +105,7 @@ class VideoThread(QtCore.QThread):
 
 
     def stop(self) -> None:
-        self._run_flag = False
-        self.wait(2000)
-        if type(self.cap) is ImageAcquirer:
-            self.cap.stop()
-
-    def resume(self) -> None:
-        self._run_flag = True
+        self._stop_and_join()
 
     def _start(self) -> None:
         self._run_flag = True

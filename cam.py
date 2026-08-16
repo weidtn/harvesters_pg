@@ -323,7 +323,10 @@ def record_harvester_frames(
     frames = [] # Using a list and converting to a numpy array at the end is faster than preallocating a numpy array and filling it, because the latter involves copying the data for each frame.
     ia.start()
     for i in trange(n_frames):
-        frames.append(get_harvester_image(ia))
+        # Copy: get_harvester_image returns a view into the driver's DMA ring
+        # buffer, which the producer reuses for later frames. Storing it directly
+        # would tear/overwrite earlier recordings once ia.stop() destroys the pool.
+        frames.append(get_harvester_image(ia).copy())
         if progress is not None:
             if n_frames == 1:
                 progress.setValue(1)
