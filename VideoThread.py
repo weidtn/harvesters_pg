@@ -96,7 +96,11 @@ class VideoThread(QtCore.QThread):
 
         while self._run_flag:
             try:
-                frame = self.image_func(self.cap)
+                # Acquire the shared device lock so node-map writes from the GUI
+                # thread never race this fetch (GenICam producers aren't
+                # thread-safe; concurrent access can corrupt/hang the driver).
+                with cam.IA_LOCK:
+                    frame = self.image_func(self.cap)
                 if frame is not None:
                     self.change_pixmap_signal.emit(frame)
                 time.sleep(1/30) # 30 fps

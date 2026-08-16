@@ -13,6 +13,13 @@ import glob
 import logging
 from tqdm import trange
 import time
+import threading
+
+# Serializes all access to the GenICam device (fetch + node_map reads/writes).
+# The worker thread fetches frames while the GUI thread polls/writes node values;
+# GenICam producers are not thread-safe, so concurrent device access from two
+# threads can corrupt the producer's state and hang the machine.
+IA_LOCK = threading.RLock()
 
 
 def load_cti_envvar() -> list[str]:
@@ -264,23 +271,24 @@ def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
     Returns:
         np.ndarray: The image as a numpy array.
     """
-    with ia.fetch() as buffer:
-        if buffer:
-            component = buffer.payload.components[0]
-            img = (
-                np.frombuffer(component.data, dtype=np.uint8)
-                .reshape(component.height, component.width)
-                .T
-            ).astype(np.uint8)
-            # img = img.copy() # This slowed down acquisition
-        else:  # If no buffer is available, return a black image
-            img = np.zeros(
-                (
-                    ia.remote_device.node_map.Width.value,
-                    ia.remote_device.node_map.Height.value,
-                ),
-                dtype=np.uint8,
-            )
+    with IA_LOCK:
+        with ia.fetch() as buffer:
+            if buffer:
+                component = buffer.payload.components[0]
+                img = (
+                    np.frombuffer(component.data, dtype=np.uint8)
+                    .reshape(component.height, component.width)
+                    .T
+                ).astype(np.uint8)
+                # img = img.copy() # This slowed down acquisition
+            else:  # If no buffer is available, return a black image
+                img = np.zeros(
+                    (
+                        ia.remote_device.node_map.Width.value,
+                        ia.remote_device.node_map.Height.value,
+                    ),
+                    dtype=np.uint8,
+                )
     return img
 
 def get_remote_nodes(ia: ImageAcquirer) -> dict:
@@ -438,10 +446,11 @@ def set_attribute(ia, attribute, value):
     Returns:
         None
     """
-    nodemap = ia.remote_device.node_map
-    try:
-        attribute = getattr(nodemap, attribute)
-        attribute.value = value
-        logging.debug(f"Set attribute {attribute} to {value}")
-    except Exception as e:
-        logging.warning(f"Error while setting attribute {attribute} to {value}: {e}")
+    with IA_LOCK:
+        nodemap = ia.remote_device.node_map
+        try:
+            attribute = getattr(nodemap, attribute)
+            attribute.value = value
+            logging.debug(f"Set attribute {attribute} to {value}")
+        except Exception as e:
+            logging.warning(f"Error while setting attribute {attribute} to {value}: {e}")

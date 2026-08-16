@@ -142,7 +142,8 @@ class SettingsWindow(QtWidgets.QMainWindow):
         """
         logging.debug(f"Executing command {node}")
         nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
-        getattr(nodemap, node).execute()
+        with cam.IA_LOCK:
+            getattr(nodemap, node).execute()
         self.update_fields()
 
     def update_fields(self):
@@ -156,40 +157,43 @@ class SettingsWindow(QtWidgets.QMainWindow):
         except AttributeError:
             logging.debug("AttributeError: nodemap not found, camera not connected")
             return
-        for node in self.settings:
-            # Access_modes possible: NA (1), ?, RO (3), RW (4)
-            widget = self.settings[node]["widget"]
-            widget.blockSignals(True)
-            try:
-                access_mode = getattr(nodemap, node).get_access_mode()
-                if type(widget) is QtWidgets.QSpinBox:
-                    widget.setValue(getattr(nodemap, node).value)
-                    widget.setReadOnly(
-                        False
-                    ) if access_mode == 4 else widget.setReadOnly(True)
-                elif type(widget) is QtWidgets.QDoubleSpinBox:
-                    widget.setValue(getattr(nodemap, node).value)
-                    widget.setReadOnly(
-                        False
-                    ) if access_mode == 4 else widget.setReadOnly(True)
-                elif type(widget) is QtWidgets.QComboBox:
-                    widget.setCurrentText(str(getattr(nodemap, node).value))
-                    widget.setEnabled(True) if access_mode == 4 else widget.setEnabled(
-                        False
-                    )
-                elif type(widget) is QtWidgets.QCheckBox:
-                    widget.setChecked(getattr(nodemap, node).value)
-                    widget.setEnabled(True) if access_mode == 4 else widget.setEnabled(
-                        False
-                    )
-                elif type(widget) is QtWidgets.QLineEdit:
-                    widget.setText(str(getattr(nodemap, node).value))
-                    widget.setReadOnly(
-                        False
-                    ) if access_mode == 4 else widget.setReadOnly(True)
-            except AccessException:
-                continue
-            widget.blockSignals(False)
+        # Serialize node_map reads against the worker's fetch() so the poll never
+        # accesses the producer concurrently with a live fetch (not thread-safe).
+        with cam.IA_LOCK:
+            for node in self.settings:
+                # Access_modes possible: NA (1), ?, RO (3), RW (4)
+                widget = self.settings[node]["widget"]
+                widget.blockSignals(True)
+                try:
+                    access_mode = getattr(nodemap, node).get_access_mode()
+                    if type(widget) is QtWidgets.QSpinBox:
+                        widget.setValue(getattr(nodemap, node).value)
+                        widget.setReadOnly(
+                            False
+                        ) if access_mode == 4 else widget.setReadOnly(True)
+                    elif type(widget) is QtWidgets.QDoubleSpinBox:
+                        widget.setValue(getattr(nodemap, node).value)
+                        widget.setReadOnly(
+                            False
+                        ) if access_mode == 4 else widget.setReadOnly(True)
+                    elif type(widget) is QtWidgets.QComboBox:
+                        widget.setCurrentText(str(getattr(nodemap, node).value))
+                        widget.setEnabled(True) if access_mode == 4 else widget.setEnabled(
+                            False
+                        )
+                    elif type(widget) is QtWidgets.QCheckBox:
+                        widget.setChecked(getattr(nodemap, node).value)
+                        widget.setEnabled(True) if access_mode == 4 else widget.setEnabled(
+                            False
+                        )
+                    elif type(widget) is QtWidgets.QLineEdit:
+                        widget.setText(str(getattr(nodemap, node).value))
+                        widget.setReadOnly(
+                            False
+                        ) if access_mode == 4 else widget.setReadOnly(True)
+                except AccessException:
+                    continue
+                widget.blockSignals(False)
 
     def update_node(self, node, value):
         """Update the camera settings based on the settings window."""
@@ -520,8 +524,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_fps_changed(self) -> None:
         """Update the fps based on the settings."""
-        self.videothread.cap.remote_device.node_map.AcquisitionFrameRate.value = (
-            self.ui.sb_fps.value()
+        cam.set_attribute(
+            self.videothread.cap, "AcquisitionFrameRate", self.ui.sb_fps.value()
         )
         self.ui.lbl_exposure_minmax.setText(
             f"(2 - {cam.get_max_exposure(self.ui.sb_fps.value())})"
