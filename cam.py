@@ -14,6 +14,7 @@ import logging
 from tqdm import trange
 import time
 import threading
+from typing import Callable
 
 # Serializes all access to the GenICam device (fetch + node_map reads/writes).
 # The worker thread fetches frames while the GUI thread polls/writes node values;
@@ -198,13 +199,18 @@ def get_webcam_image(cap: VideoCapture) -> np.ndarray:
     return gray
 
 def record_webcam_frames(
-    cap: VideoCapture, n_frames: int, progress: None | QProgressBar
+    cap: VideoCapture,
+    n_frames: int,
+    progress: None | QProgressBar,
+    preview: Callable[[np.ndarray], None] | None = None,
 ) -> np.ndarray:
     """Record n_frames from the webcam.
 
     Args:
         cap (VideoCapture): The video capture object.
         n_frames (int): The number of frames to record.
+        preview (Callable[[np.ndarray], None] | None): Optional callback
+            invoked with each recorded frame, e.g. to show it live in the UI.
 
     Returns:
         np.ndarray: The recorded frames as a numpy array.
@@ -219,6 +225,8 @@ def record_webcam_frames(
     frames = np.zeros((n_frames, width, height), dtype=np.uint8)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_webcam_image(cap)
+        if preview is not None:
+            preview(frames[i])
         if progress is not None:
             if n_frames == 1:
                 progress.setValue(1)
@@ -237,11 +245,17 @@ def get_random_image(_: None) -> np.ndarray:
     """
     return np.random.randint(0, 256, (1920, 1080), dtype=np.uint8)
 
-def record_random_frames(n_frames: int, progress: None | QProgressBar) -> np.ndarray:
+def record_random_frames(
+    n_frames: int,
+    progress: None | QProgressBar,
+    preview: Callable[[np.ndarray], None] | None = None,
+) -> np.ndarray:
     """Record n_frames of random images.
 
     Args:
         n_frames (int): The number of frames to record.
+        preview (Callable[[np.ndarray], None] | None): Optional callback
+            invoked with each recorded frame, e.g. to show it live in the UI.
 
     Returns:
         np.ndarray: The recorded frames as a numpy array.
@@ -254,6 +268,8 @@ def record_random_frames(n_frames: int, progress: None | QProgressBar) -> np.nda
     frames = np.zeros((n_frames, 1920, 1080), dtype=np.uint8)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_random_image(None)
+        if preview is not None:
+            preview(frames[i])
         if progress is not None:
             if n_frames == 1:
                 progress.setValue(1)
@@ -310,13 +326,18 @@ def get_remote_nodes(ia: ImageAcquirer) -> dict:
     return dict
 
 def record_harvester_frames(
-    ia: ImageAcquirer, n_frames: int, progress: None | QProgressBar
+    ia: ImageAcquirer,
+    n_frames: int,
+    progress: None | QProgressBar,
+    preview: Callable[[np.ndarray], None] | None = None,
 ) -> np.ndarray:
     """Record n_frames from the camera.
 
     Args:
         ia (ImageAcquirer): The ImageAcquirer object.
         n_frames (int): The number of frames to record.
+        preview (Callable[[np.ndarray], None] | None): Optional callback
+            invoked with each recorded frame, e.g. to show it live in the UI.
 
     Returns:
         np.ndarray: The recorded frames as a numpy array.
@@ -334,7 +355,10 @@ def record_harvester_frames(
         # Copy: get_harvester_image returns a view into the driver's DMA ring
         # buffer, which the producer reuses for later frames. Storing it directly
         # would tear/overwrite earlier recordings once ia.stop() destroys the pool.
-        frames.append(get_harvester_image(ia).copy())
+        img = get_harvester_image(ia).copy()
+        frames.append(img)
+        if preview is not None:
+            preview(img)
         if progress is not None:
             if n_frames == 1:
                 progress.setValue(1)

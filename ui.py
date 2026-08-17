@@ -424,9 +424,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_video()
         self.Image.clear()
         self.ui.pb_save.setDisabled(True)
+        # Disable actions that touch the camera / re-enter the event loop while
+        # recording: the loop below pumps events (so preview frames repaint), and
+        # a re-entered connect/start/acquire would race fetch() on the device.
+        self.ui.pb_acquire.setDisabled(True)
+        self.ui.pb_connect.setDisabled(True)
+        self.ui.pb_live.setDisabled(True)
         self.recording = np.array([])
         n_frames = int(self.ui.sb_frames.text())
-        self.acquire(n_frames, self.ui.progressBar)
+        try:
+            self.acquire(n_frames, self.ui.progressBar)
+        finally:
+            self.ui.pb_acquire.setDisabled(False)
+            self.ui.pb_connect.setDisabled(False)
+            self.ui.pb_live.setDisabled(False)
         self.ui.pb_save.setDisabled(False)
         self.update_image(self.recording)
 
@@ -441,13 +452,26 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         if not self.videothread:
             raise ValueError("Video thread not started")
+
+        def preview(frame: np.ndarray) -> None:
+            """Show the frame being recorded and let the UI repaint.
+
+            Recording runs on the GUI thread, so repainting needs an explicit
+            event-loop pump after each frame, otherwise nothing renders until
+            the loop finishes.
+            """
+            self.update_image(frame)
+            QtWidgets.QApplication.processEvents()
+
         if self.source == "random":
-            imgs = cam.record_random_frames(n_frames, progressbar)
+            imgs = cam.record_random_frames(n_frames, progressbar, preview=preview)
         elif "Webcam" in self.source:
-            imgs = cam.record_webcam_frames(self.videothread.cap, n_frames, progressbar)
+            imgs = cam.record_webcam_frames(
+                self.videothread.cap, n_frames, progressbar, preview=preview
+            )
         else:
             imgs = cam.record_harvester_frames(
-                self.videothread.cap, n_frames, progressbar
+                self.videothread.cap, n_frames, progressbar, preview=preview
             )
         self.recording = imgs
         self.timestamps = [cam.extract_timestamp(img) / 25_000_000 for img in imgs]
