@@ -31,7 +31,7 @@ def save_frames_to_h5(
     with h5py.File(filename, "w") as f:
         dset = f.create_dataset(
             "frames",
-            data=frames.transpose([0, 2, 1]),
+            data=frames,
             compression="gzip",
             compression_opts=complevel,
         )
@@ -92,7 +92,7 @@ def save_frames_to_png(
     path = create_path(filename)
     new_filename = f"{path}/{filename.split('/')[-1]}"
     if frames.ndim == 2:
-        cv2.imwrite(f"{new_filename}", frames.T)
+        cv2.imwrite(f"{new_filename}", frames)
         return
     if progressbar is not None:
         if len(frames) == 1:
@@ -100,7 +100,7 @@ def save_frames_to_png(
         else:
             progressbar.setMaximum(len(frames))
     for i, frame in enumerate(frames):
-        cv2.imwrite(f"{new_filename.split('.png')[0]}_{i}.png", frame.T)
+        cv2.imwrite(f"{new_filename.split('.png')[0]}_{i}.png", frame)
         if progressbar is not None:
             if len(frames) == 1:
                 progressbar.setValue(2)
@@ -124,7 +124,7 @@ def save_frames_to_jpg(
     path = create_path(filename)
     new_filename = f"{path}/{filename.split('/')[-1]}"
     if frames.ndim == 2:
-        cv2.imwrite(f"{new_filename}", frames.T)
+        cv2.imwrite(f"{new_filename}", frames)
         return
     if progressbar is not None:
         if len(frames) == 1:
@@ -132,7 +132,7 @@ def save_frames_to_jpg(
         else:
             progressbar.setMaximum(len(frames))
     for i, frame in enumerate(frames):
-        cv2.imwrite(f"{new_filename.split('.jpg')[0]}_{i}.jpg", frame.T)
+        cv2.imwrite(f"{new_filename.split('.jpg')[0]}_{i}.jpg", frame)
         if progressbar is not None:
             if len(frames) == 1:
                 progressbar.setValue(2)
@@ -159,7 +159,7 @@ def load_frames_from_h5(
         progressbar.setMaximum(0)
         progressbar.setValue(0)
     with h5py.File(filename, "r") as f:
-        frames = f["frames"][:].transpose([0, 2, 1])
+        frames = f["frames"][:]
         for k, v in f["frames"].attrs.items():
             metadata[k] = v
         if "timestamps" in f:

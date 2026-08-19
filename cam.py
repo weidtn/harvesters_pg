@@ -72,13 +72,21 @@ def setup_cam(
 
     nodes = ia.remote_device.node_map
     # Check if the FPS are okay:
-    max_fps = nodes.AcquisitionFrameRateMax.value
-    if fps > max_fps:
+    try:
+        max_fps = nodes.AcquisitionFrameRateMax.value
+    except Exception as e:
+        # e.g. TLSimu or cameras without such a node
+        logging.warning(f"AcquisitionFrameRateMax not available, skipping clamp: {e}")
+        max_fps = None
+    if max_fps is not None and fps > max_fps:
         fps = max_fps
         logging.warning(
             f"FPS is too high for the camera. Setting it to the maximum possible: {fps}"
         )
-    nodes.AcquisitionFrameRate.value = fps
+    try:
+        nodes.AcquisitionFrameRate.value = fps
+    except Exception as e:
+        logging.warning(f"Could not set AcquisitionFrameRate to {fps}: {e}")
 
     exposure = cap_at_max_exposure(exposure, fps)
     try:
@@ -87,22 +95,46 @@ def setup_cam(
         print(e)
 
     if height is not None:
-        nodes.Height.value = height
+        try:
+            nodes.Height.value = height
+        except Exception as e:
+            logging.warning(f"Could not set Height to {height}: {e}")
     else:
-        nodes.Height.value = nodes.HeightMax.value
+        try:
+            nodes.Height.value = nodes.HeightMax.value
+        except Exception as e:
+            logging.debug(f"HeightMax not available, keeping camera Height: {e}")
 
     if width is not None:
-        nodes.Width.value = width
+        try:
+            nodes.Width.value = width
+        except Exception as e:
+            logging.warning(f"Could not set Width to {width}: {e}")
     else:
-        nodes.Width.value = nodes.WidthMax.value
+        try:
+            nodes.Width.value = nodes.WidthMax.value
+        except Exception as e:
+            logging.debug(f"WidthMax not available, keeping camera Width: {e}")
 
-    nodes.TriggerMode.value = "Off"
+    try:
+        nodes.TriggerMode.value = "Off"
+    except Exception as e:
+        logging.warning(f"Could not disable TriggerMode: {e}")
 
-    nodes.InfoFieldFrameCounterEnable.value = True
-    nodes.InfoFieldTimeStampEnable.value = True
+    for node_name, node_value in (
+        ("InfoFieldFrameCounterEnable", True),
+        ("InfoFieldTimeStampEnable", True),
+    ):
+        try:
+            getattr(nodes, node_name).value = node_value
+        except Exception as e:
+            logging.warning(f"Could not set {node_name} = {node_value}: {e}")
 
     ia.start()
-    nodes.BlackLevel.value = blacklevel
+    try:
+        nodes.BlackLevel.value = blacklevel
+    except Exception as e:
+        logging.warning(f"Could not set BlackLevel to {blacklevel}: {e}")
     warmup_cam(ia)
     return h, ia
 
@@ -195,7 +227,7 @@ def get_webcam_image(cap: VideoCapture) -> np.ndarray:
         np.ndarray: The image as a numpy array.
     """
     _, frame = cap.read()
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).T
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return gray
 
 def record_webcam_frames(
@@ -222,7 +254,7 @@ def record_webcam_frames(
             progress.setMaximum(n_frames - 1)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frames = np.zeros((n_frames, width, height), dtype=np.uint8)
+    frames = np.zeros((n_frames, height, width), dtype=np.uint8)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_webcam_image(cap)
         if preview is not None:
@@ -243,7 +275,7 @@ def get_random_image(_: None) -> np.ndarray:
     Returns:
         np.ndarray: A random image.
     """
-    return np.random.randint(0, 256, (1920, 1080), dtype=np.uint8)
+    return np.random.randint(0, 256, (1080, 1920), dtype=np.uint8)
 
 def record_random_frames(
     n_frames: int,
@@ -265,7 +297,7 @@ def record_random_frames(
             progress.setMaximum(1)
         else:
             progress.setMaximum(n_frames - 1)
-    frames = np.zeros((n_frames, 1920, 1080), dtype=np.uint8)
+    frames = np.zeros((n_frames, 1080, 1920), dtype=np.uint8)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_random_image(None)
         if preview is not None:
@@ -291,21 +323,47 @@ def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
         with ia.fetch() as buffer:
             if buffer:
                 component = buffer.payload.components[0]
-                img = (
-                    np.frombuffer(component.data, dtype=np.uint8)
-                    .reshape(component.height, component.width)
-                    .T
-                ).astype(np.uint8)
-                # img = img.copy() # This slowed down acquisition
+                # Copy: component.data is a read-only view of the producer's DMA
+                # buffer, which is reused for later frames. Copying it (row-major,
+                # linear memcpy) snapshots the frame so the buffer can be reused,
+                # and yields an owned (height, width) C-contiguous array.
+                img = np.frombuffer(
+                    component.data, dtype=np.uint8
+                ).reshape(component.height, component.width).copy()
             else:  # If no buffer is available, return a black image
                 img = np.zeros(
                     (
-                        ia.remote_device.node_map.Width.value,
                         ia.remote_device.node_map.Height.value,
+                        ia.remote_device.node_map.Width.value,
                     ),
                     dtype=np.uint8,
                 )
     return img
+
+
+def _harvester_frame_into(ia: ImageAcquirer, out: np.ndarray) -> None:
+    """Fetch one frame from the camera directly into a preallocated buffer.
+
+    Writes the (height, width) C-contiguous frame into ``out`` with a single
+    linear copy instead of allocating a new array per frame, which is what the
+    hot recording path needs to sustain high frame rates.
+
+    Args:
+        ia (ImageAcquirer): The ImageAcquirer object.
+        out (np.ndarray): The output buffer of shape (height, width).
+    """
+    with IA_LOCK:
+        with ia.fetch() as buffer:
+            if buffer:
+                component = buffer.payload.components[0]
+                np.copyto(
+                    out,
+                    np.frombuffer(component.data, dtype=np.uint8).reshape(
+                        component.height, component.width
+                    ),
+                )
+            else:  # If no buffer is available, record a black frame
+                out.fill(0)
 
 def get_remote_nodes(ia: ImageAcquirer) -> dict:
     """Get all nodes and their values from the camera.
@@ -349,23 +407,24 @@ def record_harvester_frames(
             progress.setMaximum(n_frames - 1)
     width = ia.remote_device.node_map.Width.value
     height = ia.remote_device.node_map.Height.value
-    frames = [] # Using a list and converting to a numpy array at the end is faster than preallocating a numpy array and filling it, because the latter involves copying the data for each frame.
+    # Preallocate the full recording once as (n_frames, height, width) and
+    # copy each frame in place. Every per-frame step is a linear memcpy; the
+    # old append-a-list-then-stack path re-ran the slow strided transpose per
+    # frame (~10 ms at 2048x2048), which capped recording well below the
+    # camera's nominal frame rate.
+    frames = np.empty((n_frames, height, width), dtype=np.uint8)
     ia.start()
     for i in trange(n_frames):
-        # Copy: get_harvester_image returns a view into the driver's DMA ring
-        # buffer, which the producer reuses for later frames. Storing it directly
-        # would tear/overwrite earlier recordings once ia.stop() destroys the pool.
-        img = get_harvester_image(ia).copy()
-        frames.append(img)
+        _harvester_frame_into(ia, frames[i])
         if preview is not None:
-            preview(img)
+            preview(frames[i])
         if progress is not None:
             if n_frames == 1:
                 progress.setValue(1)
             else:
                 progress.setValue(i)
     ia.stop()
-    return np.array(frames)
+    return frames
 
 def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:
     """Get all attributes of the camera.
@@ -418,7 +477,7 @@ def extract_frame_counter(img: np.ndarray) -> dict:
     Returns:
         int: The frame counter.
     """
-    pixels = img.T.flatten()[:4].astype(np.uint32)
+    pixels = img.flatten()[:4].astype(np.uint32)
 
     # Extract frame counter parts
     lsb = pixels[0]
@@ -446,7 +505,7 @@ def extract_timestamp(img: np.ndarray) -> int:
     Returns:
         int: The timestamp in 40 ns.
     """
-    pixels = img.T.flatten()[4:8].astype(np.uint32)
+    pixels = img.flatten()[4:8].astype(np.uint32)
 
     # Extract timestamp parts
     lsb = pixels[0]  # Pixel 4: bits 0-7

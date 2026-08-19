@@ -9,6 +9,7 @@ import sys
 from PyQt6 import QtWidgets, QtCore
 import numpy as np
 import datetime
+import time
 
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
@@ -401,15 +402,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pause_video()
 
     def update_image(self, frame: np.ndarray) -> None:
+        # Frames are stored/exported in the camera's natural (h, w) orientation
+        # (that is what makes the fast recording path linear), but the app has
+        # always shown them transposed on screen. Transpose at display time only,
+        # so the on-screen picture is unchanged while the hot path stays fast.
+        disp = frame.T if frame.ndim == 2 else frame.swapaxes(1, 2)
         if self.ui.cb_autolevel.isChecked():
-            levels = (frame.T[1::4, ::4].min(), frame.T[1::4, ::4].max())
+            levels = (disp.T[1::4, ::4].min(), disp.T[1::4, ::4].max())
         else:
             levels = (0, 255)
         self.Image.setImage(
-            frame, autoRange=False, autoHistogramRange=False, levels=levels
+            disp, autoRange=False, autoHistogramRange=False, levels=levels
         )
         self.ui.lbl_img_minmax.setText(
-            f"Pixelvalue Min: {frame.T[1::4,::4].min()} - Max: {frame.T[1::4,::4].max()}"
+            f"Pixelvalue Min: {disp.T[1::4,::4].min()} - Max: {disp.T[1::4,::4].max()}"
         )
         if not self.ui.pb_save_frame.isEnabled():
             self.ui.pb_save_frame.setDisabled(False)
@@ -453,14 +459,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.videothread:
             raise ValueError("Video thread not started")
 
+        # Mutable holder for the throttle timestamp, so the first frame is
+        # always shown immediately (nonlocal: closure writes through it).
+        preview_state = [0.0]
+
         def preview(frame: np.ndarray) -> None:
             """Show the frame being recorded and let the UI repaint.
 
             Recording runs on the GUI thread, so repainting needs an explicit
             event-loop pump after each frame, otherwise nothing renders until
-            the loop finishes.
+            the loop finishes. setImage on a full-res frame takes ~1.5 ms, which
+            alone would cap recording at ~600 fps, so image updates are throttled
+            to ~30 fps while the event pump still runs every frame.
             """
-            self.update_image(frame)
+            now = time.monotonic()
+            if preview_state[0] == 0.0 or now - preview_state[0] >= 0.033:
+                preview_state[0] = now
+                self.update_image(frame)
             QtWidgets.QApplication.processEvents()
 
         if self.source == "random":
@@ -583,10 +598,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def setup_settings(self) -> None:
         ia = self.videothread.cap
         node_map = ia.remote_device.node_map
-        self.ui.sb_fps.setMaximum(node_map.AcquisitionFrameRateMax.value)
-        self.ui.lbl_fps_minmax.setText(
-            f"(1 - {node_map.AcquisitionFrameRateMax.value})"
-        )
+        # Some cameras (e.g. TLSimu) have no AcquisitionFrameRateMax node; keep
+        # the UI's default cap in that case instead of crashing on connect.
+        try:
+            max_fps = int(node_map.AcquisitionFrameRateMax.value)
+        except Exception as e:
+            logging.warning(f"AcquisitionFrameRateMax not available, keeping UI default: {e}")
+            max_fps = self.ui.sb_fps.maximum()
+        self.ui.sb_fps.setMaximum(max_fps)
+        self.ui.lbl_fps_minmax.setText(f"(1 - {max_fps})")
         self.on_fps_changed()
 
     def on_settings_pressed(self) -> None:
