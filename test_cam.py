@@ -65,6 +65,34 @@ class FrameOrientationTests(unittest.TestCase):
         self.assertEqual(back.shape, (40, 30))  # not transposed
         self.assertEqual(back[7, 13], 255)
 
+    def test_snap_to_increment(self):
+        class FakeNode:
+            min = 8
+            max = 4096
+            inc = 4
+
+        node = FakeNode()
+        self.assertEqual(cam._snap_to_increment(node, 160), 160)  # already on grid
+        self.assertEqual(cam._snap_to_increment(node, 98), 96)  # snap down
+        self.assertEqual(cam._snap_to_increment(node, 102), 100)
+        self.assertEqual(cam._snap_to_increment(node, 2), 8)  # clamp to min
+        self.assertEqual(cam._snap_to_increment(node, 99999), 4096)  # clamp to max
+
+    def test_resolution_config_roundtrip(self):
+        original = cam.RESOLUTION_CONFIG_PATH
+        cam.RESOLUTION_CONFIG_PATH = Path(__file__).parent / "test_res_config.json"
+        try:
+            cam.save_resolution_config(
+                {"width": 160, "height": 120, "offset_x": None, "offset_y": 4}
+            )
+            self.assertEqual(
+                cam.load_resolution_config(),
+                {"width": 160, "height": 120, "offset_y": 4},
+            )
+        finally:
+            cam.RESOLUTION_CONFIG_PATH.unlink(missing_ok=True)
+            cam.RESOLUTION_CONFIG_PATH = original
+
 
 # All TLSimu hardware interactions live in ONE test to avoid the producer's
 # flaky in-process re-enumeration.
@@ -89,14 +117,27 @@ class TlSimuTests(unittest.TestCase):
             self.assertEqual(live.shape, (ia.remote_device.node_map.Height.value,
                                           ia.remote_device.node_map.Width.value))
             self.assertTrue(live.flags["OWNDATA"])
-            frames = cam.record_harvester_frames(ia, 3, None)
-            self.assertEqual(frames.ndim, 3)
-            self.assertEqual(frames.shape[1:], (ia.remote_device.node_map.Height.value,
-                                                ia.remote_device.node_map.Width.value))
-            # fast path: owned, C-contiguous (n, h, w) stack
+            # AOI change WHILE acquiring: Width/Height are not writable during
+            # acquisition on TLSimu, so set_resolution must stop -> write ->
+            # start; the live path then delivers the new size.
+            w0 = int(ia.remote_device.node_map.Width.value)
+            h0 = int(ia.remote_device.node_map.Height.value)
+            aw, ah, _, _ = cam.set_resolution(ia, width=64, height=48)
+            self.assertEqual((aw, ah), (64, 48))  # 64/48 are on the inc=4 grid
+            live2 = cam.get_harvester_image(ia)
+            self.assertEqual(live2.shape, (ah, aw))
+            # record at the new size: owned, C-contiguous (n, h, w) stack.
+            frames = cam.record_harvester_frames(ia, 2, None)
+            self.assertEqual(frames.shape, (2, 48, 64))
             self.assertTrue(frames.flags["C_CONTIGUOUS"])
             self.assertTrue(frames.flags["OWNDATA"])
             self.assertFalse(np.isfortran(frames[0]))
+            # After record the camera is stopped; an off-grid request still
+            # snaps onto the increment grid and restores cleanly (no fetch).
+            cam.set_resolution(ia, width=66, height=46)
+            self.assertEqual(int(ia.remote_device.node_map.Width.value), 64)
+            self.assertEqual(int(ia.remote_device.node_map.Height.value), 44)
+            cam.set_resolution(ia, width=w0, height=h0)
         finally:
             cam.disconnect_cam(h, ia)
 

@@ -314,6 +314,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.lbl_black_level_min.setToolTip(self.ui.hsli_black_level.toolTip())
         self.ui.lbl_black_level_max.setToolTip(self.ui.hsli_black_level.toolTip())
 
+        # Resolution (AOI) row in the settings panel. Width/Height are only
+        # writable while acquisition is stopped on many producers, so the Apply
+        # button restarts the camera through cam.set_resolution and persists
+        # the chosen size for the next connect.
+        self.ui.lbl_resolution = QtWidgets.QLabel(text="Image Size [px]")
+        self.ui.sb_res_width = QtWidgets.QSpinBox()
+        self.ui.sb_res_width.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
+        )
+        self.ui.lbl_res_x = QtWidgets.QLabel(text="×")
+        self.ui.sb_res_height = QtWidgets.QSpinBox()
+        self.ui.sb_res_height.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
+        )
+        self.ui.pb_res_apply = QtWidgets.QPushButton(text="Apply")
+        self.ui.pb_res_apply.setDisabled(True)  # until a Harvester camera connects
+        self.ui.hLay_resolution = QtWidgets.QHBoxLayout()
+        for widget in (
+            self.ui.lbl_resolution,
+            self.ui.sb_res_width,
+            self.ui.lbl_res_x,
+            self.ui.sb_res_height,
+            self.ui.pb_res_apply,
+        ):
+            self.ui.hLay_resolution.addWidget(widget)
+        self.ui.vLay_settings.addLayout(self.ui.hLay_resolution)
+        self.ui.pb_res_apply.clicked.connect(self.on_resolution_apply)
+
         self.populate_video_sources()
 
     def populate_video_sources(self) -> None:
@@ -436,6 +464,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.pb_acquire.setDisabled(True)
         self.ui.pb_connect.setDisabled(True)
         self.ui.pb_live.setDisabled(True)
+        # A mid-recording AOI change would violate the preallocated (n, h, w)
+        # buffer; hold the Apply button (and the camera keep-alive) until done.
+        self.ui.pb_res_apply.setDisabled(True)
         self.recording = np.array([])
         n_frames = int(self.ui.sb_frames.text())
         try:
@@ -444,6 +475,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.pb_acquire.setDisabled(False)
             self.ui.pb_connect.setDisabled(False)
             self.ui.pb_live.setDisabled(False)
+            self.ui.pb_res_apply.setDisabled(False)
         self.ui.pb_save.setDisabled(False)
         self.update_image(self.recording)
 
@@ -557,6 +589,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.settings.setHidden(True)
         else: # Harvester camera
             self.setup_settings()  # get minmax values for settings
+            self.setup_resolution_settings()  # populate + re-apply saved image size
             self.ui.pb_settings.setDisabled(False)
             self.ui.settings.setHidden(False)
             self.ui.settings_window.fill_settings()
@@ -608,6 +641,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.sb_fps.setMaximum(max_fps)
         self.ui.lbl_fps_minmax.setText(f"(1 - {max_fps})")
         self.on_fps_changed()
+
+    def setup_resolution_settings(self) -> None:
+        """Populate the resolution row and re-apply a saved image size.
+
+        Runs after connecting a Harvester camera. Reads the Width/Height node
+        ranges, applies any resolution persisted by an earlier session, and
+        syncs the spinboxes to what the camera actually reports.
+        """
+        ia = self.videothread.cap
+        node_map = ia.remote_device.node_map
+        for sb, node_name in (
+            (self.ui.sb_res_width, "Width"),
+            (self.ui.sb_res_height, "Height"),
+        ):
+            try:
+                node = getattr(node_map, node_name)
+                sb.setMinimum(int(node.min))
+                sb.setMaximum(int(node.max))
+                sb.setDisabled(False)
+            except Exception as e:
+                logging.warning(f"Resolution {node_name} not available: {e}")
+                sb.setDisabled(True)
+        cfg = cam.load_resolution_config()
+        if isinstance(cfg.get("width"), int) and isinstance(cfg.get("height"), int):
+            w, h, ox, oy = cam.set_resolution(
+                ia,
+                width=cfg["width"],
+                height=cfg["height"],
+                offset_x=cfg.get("offset_x"),
+                offset_y=cfg.get("offset_y"),
+            )
+            self.ui.sb_res_width.setValue(w)
+            self.ui.sb_res_height.setValue(h)
+            logging.info(f"Reapplied saved resolution {w}x{h}")
+        else:
+            try:
+                self.ui.sb_res_width.setValue(int(node_map.Width.value))
+                self.ui.sb_res_height.setValue(int(node_map.Height.value))
+            except Exception as e:
+                logging.warning(f"Could not read resolution: {e}")
+        self.ui.pb_res_apply.setDisabled(False)
+
+    def on_resolution_apply(self) -> None:
+        """Apply the Width x Height from the settings panel to the camera.
+
+        The camera is stopped for the AOI writes and restarted if it was
+        acquiring; the result is persisted so the chosen image size survives
+        reconnect/restart. Live view, recordings, and saved files all follow
+        the applied size.
+        """
+        if not self.videothread or type(self.videothread.cap) is not cam.ImageAcquirer:
+            logging.debug("Resolution apply requires a Harvester camera")
+            return
+        width = self.ui.sb_res_width.value()
+        height = self.ui.sb_res_height.value()
+        w, h, ox, oy = cam.set_resolution(
+            self.videothread.cap, width=width, height=height
+        )
+        self.ui.sb_res_width.setValue(w)
+        self.ui.sb_res_height.setValue(h)
+        cam.save_resolution_config(
+            {"width": w, "height": h, "offset_x": ox, "offset_y": oy}
+        )
+        logging.info(f"Resolution set to {w}x{h}")
 
     def on_settings_pressed(self) -> None:
         logging.debug("Settings pressed")

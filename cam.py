@@ -10,6 +10,7 @@ import numpy as np
 import os
 from pathlib import Path
 import glob
+import json
 import logging
 from tqdm import trange
 import time
@@ -96,7 +97,7 @@ def setup_cam(
 
     if height is not None:
         try:
-            nodes.Height.value = height
+            nodes.Height.value = _snap_to_increment(nodes.Height, height)
         except Exception as e:
             logging.warning(f"Could not set Height to {height}: {e}")
     else:
@@ -107,7 +108,7 @@ def setup_cam(
 
     if width is not None:
         try:
-            nodes.Width.value = width
+            nodes.Width.value = _snap_to_increment(nodes.Width, width)
         except Exception as e:
             logging.warning(f"Could not set Width to {width}: {e}")
     else:
@@ -537,3 +538,113 @@ def set_attribute(ia, attribute, value):
             logging.debug(f"Set attribute {attribute} to {value}")
         except Exception as e:
             logging.warning(f"Error while setting attribute {attribute} to {value}: {e}")
+
+
+def _snap_to_increment(node, value: int) -> int:
+    """Snap *value* to ``node``'s increment and clamp to [min, max].
+
+    AOI nodes on real cameras usually accept only a subset of values (e.g.
+    width must be a multiple of 4). Snapping before writing avoids silent
+    producer-side validation errors and gives the user a predictable result.
+
+    Args:
+        node: A GenICam IInteger node exposing min/max/inc.
+        value (int): The requested value.
+
+    Returns:
+        int: The snapped value within [node.min, node.max].
+    """
+    lo = int(node.min)
+    hi = int(node.max)
+    try:
+        inc = int(node.inc)
+    except (AttributeError, TypeError):
+        inc = 1
+    if inc < 1:
+        inc = 1
+    value = max(min(int(value), hi), lo)
+    snapped = lo + ((value - lo) // inc) * inc
+    return max(min(snapped, hi), lo)
+
+
+def set_resolution(
+    ia: ImageAcquirer,
+    width: int | None = None,
+    height: int | None = None,
+    offset_x: int | None = None,
+    offset_y: int | None = None,
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """Set the camera AOI (Width/Height and sensor offsets) safely.
+
+    Many GenICam producers refuse to write Width/Height (and offsets) while
+    acquisition is running - TLSimu raises an AccessException - so the camera
+    is stopped for the writes and restarted only if it was acquiring. Values
+    are snapped to each node's increment and clamped to [min, max]; nodes the
+    camera does not expose (e.g. offsets on TLSimu) are skipped.
+
+    Args:
+        ia (ImageAcquirer): The ImageAcquirer object.
+        width (int | None): New Width, or None to leave unchanged.
+        height (int | None): New Height, or None to leave unchanged.
+        offset_x (int | None): New OffsetX, or None to leave unchanged.
+        offset_y (int | None): New OffsetY, or None to leave unchanged.
+
+    Returns:
+        tuple[int | None, ...]: The applied (width, height, offset_x, offset_y).
+    """
+    with IA_LOCK:
+        nodes = ia.remote_device.node_map
+        was_running = bool(ia.is_acquiring())
+        if was_running:
+            ia.stop()
+        try:
+            for node_name, value in (
+                ("OffsetX", offset_x),
+                ("OffsetY", offset_y),
+                ("Width", width),
+                ("Height", height),
+            ):
+                if value is None:
+                    continue
+                try:
+                    node = getattr(nodes, node_name)
+                    node.value = _snap_to_increment(node, value)
+                except Exception as e:
+                    logging.warning(f"Could not set {node_name} to {value}: {e}")
+            applied: list[int | None] = [None, None, None, None]
+            for i, node_name in enumerate(("Width", "Height", "OffsetX", "OffsetY")):
+                try:
+                    applied[i] = int(getattr(nodes, node_name).value)
+                except Exception:
+                    pass
+        finally:
+            if was_running:
+                ia.start()
+    return tuple(applied)
+
+
+RESOLUTION_CONFIG_PATH = Path(__file__).resolve().parent / "camera_resolution.json"
+
+
+def load_resolution_config() -> dict:
+    """Load the persisted camera resolution, if any.
+
+    Returns:
+        dict: Mapping with optional keys width, height, offset_x, offset_y.
+    """
+    try:
+        data = json.loads(RESOLUTION_CONFIG_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_resolution_config(resolution: dict) -> None:
+    """Persist the camera resolution so it can be reapplied on the next connect.
+
+    Args:
+        resolution (dict): Mapping containing width/height (and optionally the
+            sensor offsets). Non-integer entries are dropped.
+    """
+    data = {k: v for k, v in resolution.items() if isinstance(v, int)}
+    RESOLUTION_CONFIG_PATH.write_text(json.dumps(data, indent=2) + "\n")
