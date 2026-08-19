@@ -94,6 +94,153 @@ class FrameOrientationTests(unittest.TestCase):
             cam.RESOLUTION_CONFIG_PATH = original
 
 
+class _FakeComponent:
+    """Minimal stand-in for harvesters' Component2DImage (read-only attrs)."""
+
+    def __init__(self, fmt, data, width, height):
+        self.data_format = fmt
+        self.data = data
+        self.width = width
+        self.height = height
+
+
+class PixelFormatTests(unittest.TestCase):
+    """Every delivered pixel format must become an owned uint8 (h, w).
+
+    harvesters expands packed formats (Mono12Packed, Bayer*10Packed, ...) to
+    natural uint8/uint16 arrays before we see them, so these tests feed the
+    same already-expanded payloads a real delivery would provide.
+    """
+
+    def test_mono8_is_owned_identity(self):
+        data = np.arange(12, dtype=np.uint8)
+        img = cam.grayscale8_from_bytes("Mono8", data, 4, 3)
+        self.assertEqual(img.shape, (3, 4))
+        self.assertEqual(img.dtype, np.uint8)
+        np.testing.assert_array_equal(img, data.reshape(3, 4))
+        self.assertFalse(np.shares_memory(img, data))  # owned copy
+        self.assertTrue(img.flags["C_CONTIGUOUS"])
+
+    def test_mono_bitshift(self):
+        for fmt, bits, values in (
+            ("Mono10", 10, np.array([0, 1023, 512, 1], np.uint16)),
+            ("Mono12", 12, np.array([4095, 2048, 17], np.uint16)),
+            ("Mono14", 14, np.array([16383, 8192], np.uint16)),
+            ("Mono16", 16, np.array([0xFFFF, 0x8000, 0x1234], np.uint16)),
+        ):
+            self.assertEqual(
+                cam.grayscale8_from_bytes(fmt, values, len(values), 1).reshape(-1).tolist(),
+                (values >> (bits - 8)).tolist(),
+                fmt,
+            )
+
+    def test_packed_mono_bitshift(self):
+        # Delivered payloads are pre-expanded to uint16, one value per pixel.
+        for fmt in ("Mono10Packed", "Mono10p"):
+            values = np.array([1023, 512, 0], np.uint16)
+            self.assertEqual(
+                cam.grayscale8_from_bytes(fmt, values, 3, 1).reshape(-1).tolist(),
+                (values >> 2).tolist(),
+            )
+        for fmt in ("Mono12Packed", "Mono12p"):
+            values = np.array([4095, 2048, 1], np.uint16)
+            self.assertEqual(
+                cam.grayscale8_from_bytes(fmt, values, 3, 1).reshape(-1).tolist(),
+                (values >> 4).tolist(),
+            )
+
+    def test_bayer8_demosaic_matches_cv2(self):
+        mosaic = (np.arange(8 * 8) * 7) % 256
+        mosaic = mosaic.reshape(8, 8).astype(np.uint8)
+        for pattern, code in (
+            ("BayerGR8", "GR"),
+            ("BayerRG8", "RG"),
+            ("BayerGB8", "GB"),
+            ("BayerBG8", "BG"),
+        ):
+            import cv2
+
+            expected = cv2.cvtColor(mosaic, getattr(cv2, f"COLOR_Bayer{code}2GRAY"))
+            self.assertEqual(
+                cam.grayscale8_from_bytes(pattern, mosaic, 8, 8).tolist(),
+                expected.tolist(),
+                pattern,
+            )
+
+    def test_bayer10_16bit_demosaic(self):
+        import cv2
+
+        mosaic16 = (np.arange(8 * 8).reshape(8, 8) * 512).astype(np.uint16)
+        mosaic8 = (mosaic16 >> 2).astype(np.uint8)
+        self.assertEqual(
+            cam.grayscale8_from_bytes("BayerRG10", mosaic16, 8, 8).tolist(),
+            cv2.cvtColor(mosaic8, cv2.COLOR_BayerRG2GRAY).tolist(),
+        )
+        mosaic16b = (np.arange(8 * 8).reshape(8, 8) * 32).astype(np.uint16)
+        self.assertEqual(
+            cam.grayscale8_from_bytes("BayerBG12Packed", mosaic16b, 8, 8).tolist(),
+            cv2.cvtColor((mosaic16b >> 4).astype(np.uint8), cv2.COLOR_BayerBG2GRAY).tolist(),
+        )
+
+    def test_rgb_and_rgba_match_cv2(self):
+        import cv2
+
+        rgb = np.arange(3 * 4 * 2, dtype=np.uint8)
+        self.assertEqual(
+            cam.grayscale8_from_bytes("RGB8", rgb, 4, 2).tolist(),
+            cv2.cvtColor(rgb.reshape(2, 4, 3), cv2.COLOR_RGB2GRAY).tolist(),
+        )
+        bgr = np.arange(3 * 4 * 2, dtype=np.uint8)
+        self.assertEqual(
+            cam.grayscale8_from_bytes("BGR8", bgr, 4, 2).tolist(),
+            cv2.cvtColor(bgr.reshape(2, 4, 3), cv2.COLOR_BGR2GRAY).tolist(),
+        )
+        rgba = np.arange(4 * 4 * 2, dtype=np.uint8)
+        self.assertEqual(
+            cam.grayscale8_from_bytes("RGBA8", rgba, 4, 2).tolist(),
+            cv2.cvtColor(rgba.reshape(2, 4, 4), cv2.COLOR_RGBA2GRAY).tolist(),
+        )
+
+    def test_yuv_luma_extraction(self):
+        # UYVY rows: U,Y0,V,Y1 per pixel pair -> luma at odd bytes.
+        row = np.array([0, 10, 1, 20, 2, 30, 3, 40], np.uint8)
+        self.assertEqual(
+            cam.grayscale8_from_bytes("YUV422Packed", row, 4, 1).tolist(),
+            [[10, 20, 30, 40]],
+        )
+        # Y,U,V per pixel -> luma is the first byte.
+        yuv444 = np.array([1, 9, 9, 2, 9, 9, 3, 9, 9], np.uint8)
+        self.assertEqual(
+            cam.grayscale8_from_bytes("YUV444Packed", yuv444, 3, 1).tolist(),
+            [[1, 2, 3]],
+        )
+        # U,Y0,Y1,V,Y2,Y3 per 4-pixel group -> luma at bytes 1,2,4,5.
+        yuv411 = np.tile([5, 10, 20, 30, 40, 50], 6).astype(np.uint8)
+        self.assertEqual(
+            cam.grayscale8_from_bytes("YUV411Packed", yuv411, 12, 2).tolist(),
+            (np.tile([10, 20, 40, 50], 6)).reshape(2, 12).tolist(),
+        )
+
+    def test_unsupported_format_mismatch_raises(self):
+        # A 3-element payload can never be a 2x1 frame; must raise, not guess.
+        with self.assertRaises(ValueError):
+            cam.grayscale8_from_bytes("Bogus24", np.arange(3, dtype=np.uint8), 2, 1)
+        with self.assertRaises(ValueError):
+            cam.grayscale8_from_bytes("Coord3D_A32f", np.arange(4, dtype=np.float32), 2, 2)
+
+    def test_component_wrapper_black_fallback_and_valid_path(self):
+        cam._warned_formats.clear()
+        bad = _FakeComponent("Killer32", np.arange(5, dtype=np.uint8), 4, 3)
+        img = cam.component_to_grayscale8(bad)
+        self.assertEqual(img.shape, (3, 4))
+        self.assertEqual(img.tolist(), np.zeros((3, 4), np.uint8).tolist())
+        self.assertIn("Killer32", cam._warned_formats)
+        good = _FakeComponent("Mono8", np.arange(12, dtype=np.uint8) % 4, 4, 3)
+        np.testing.assert_array_equal(
+            cam.component_to_grayscale8(good), (np.arange(12) % 4).reshape(3, 4)
+        )
+
+
 # All TLSimu hardware interactions live in ONE test to avoid the producer's
 # flaky in-process re-enumeration.
 class TlSimuTests(unittest.TestCase):

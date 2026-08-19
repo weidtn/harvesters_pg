@@ -12,6 +12,7 @@ from pathlib import Path
 import glob
 import json
 import logging
+import re
 from tqdm import trange
 import time
 import threading
@@ -132,6 +133,10 @@ def setup_cam(
             logging.warning(f"Could not set {node_name} = {node_value}: {e}")
 
     ia.start()
+    try:
+        logging.info(f"Camera pixel format: {nodes.PixelFormat.value}")
+    except Exception as e:
+        logging.debug(f"PixelFormat node not available: {e}")
     try:
         nodes.BlackLevel.value = blacklevel
     except Exception as e:
@@ -310,6 +315,152 @@ def record_random_frames(
                 progress.setValue(i)
     return frames
 
+# Pixel format support -------------------------------------------------------
+#
+# harvesters already expands every delivered format through its bundled PFNC
+# dictionary (Component2DImage._data = proxy.expand(...)): packed formats such
+# as Mono12Packed, Bayer*10Packed or RGB10p arrive as natural uint8/uint16
+# arrays of one value per pixel component. What remains for us is to turn
+# whatever "one value per component" payload we get into an owned uint8
+# (height, width) grayscale frame: demosaic Bayer mosaics, extract luma from
+# YUV, drop the high byte of >8-bit formats, and keep Mono8 as a plain copy.
+
+_BAYER_DEMOSAIC = {
+    "GR": cv2.COLOR_BayerGR2GRAY,
+    "RG": cv2.COLOR_BayerRG2GRAY,
+    "GB": cv2.COLOR_BayerGB2GRAY,
+    "BG": cv2.COLOR_BayerBG2GRAY,
+}
+
+_BITS_FROM_FMT = re.compile(r"(1[0-6])")
+
+
+def _bits_from_fmt(fmt: str) -> int | None:
+    """Bit depth implied by a format name (Mono12Packed -> 12), if any."""
+    m = _BITS_FROM_FMT.search(fmt)
+    return int(m.group(1)) if m else None
+
+
+def grayscale8_from_bytes(
+    fmt: str, data, width: int, height: int
+) -> np.ndarray:
+    """Convert one frame's payload to an owned uint8 (height, width) array.
+
+    Args:
+        fmt: GenICam/PFNC pixel format name (Mono8, BayerRG10Packed, ...).
+        data: the payload as expanded by harvesters' PFNC dictionary (a flat
+            uint8/uint16 numpy array).
+        width, height: logical pixel dimensions of the frame.
+
+    Returns:
+        A new uint8 (height, width) grayscale array.
+
+    Raises:
+        ValueError: for formats that cannot be interpreted (floating point,
+            addressing/padding layouts we do not reconstruct). The caller is
+            expected to degrade to a black frame rather than crash.
+    """
+    h, w = int(height), int(width)
+    fmt = str(fmt)
+    data = np.asarray(data)
+    if data.ndim != 1:
+        data = data.reshape(-1)
+    if data.dtype == np.float32:
+        raise ValueError("floating-point pixel data is not displayable")
+    if data.dtype not in (np.uint8, np.uint16, np.int8):
+        # Defensive: uint32/float64 payloads would silently misbehave below.
+        raise ValueError(f"unsupported payload dtype {data.dtype}")
+
+    def shift8(arr: np.ndarray) -> np.ndarray:
+        """Map an integral per-component array to an owned uint8 (bitshift)."""
+        bits = _bits_from_fmt(fmt) or max(8, 8 * arr.dtype.itemsize)
+        shift = bits - 8
+        if shift <= 0:
+            # Always copy: the input may be a read-only view of the producer's
+            # DMA buffer, which gets reused for later frames.
+            return np.array(arr, dtype=np.uint8, copy=True)
+        return (arr >> shift).astype(np.uint8)
+
+    up = fmt.upper()
+
+    # 1) Bayer mosaics (single component; needs demosaic).
+    bayer = re.match(r"Bayer(GR|RG|GB|BG)", fmt)
+    if bayer:
+        if data.size != h * w:
+            raise ValueError(f"{fmt}: expected {h * w} pixels, got {data.size}")
+        return cv2.cvtColor(
+            shift8(data).reshape(h, w), _BAYER_DEMOSAIC[bayer.group(1)]
+        )
+
+    # 2) YUV 4:2:2 / 4:1:1 / 4:4:4: luma extraction from the packed byte order.
+    if up == "YUV422PACKED":  # UYVY: luma at the odd byte of each pair
+        if data.size != 2 * h * w:
+            raise ValueError(f"{fmt}: expected {2 * h * w} bytes, got {data.size}")
+        return data.reshape(h, 2 * w)[:, 1::2].copy()
+    if up == "YUV444PACKED":  # Y,U,V per pixel; luma is the first byte
+        if data.size != 3 * h * w:
+            raise ValueError(f"{fmt}: expected {3 * h * w} bytes, got {data.size}")
+        return data.reshape(h, w, 3)[..., 0].copy()
+    if up == "YUV411PACKED":  # U,Y0,Y1,V,Y2,Y3 per 4 pixels
+        if (h * w) % 4 or data.size != (h * w // 4) * 6:
+            raise ValueError(
+                f"{fmt}: expected {(h * w // 4) * 6} bytes for {w}x{h}, got {data.size}"
+            )
+        return data.reshape(h * w // 4, 6)[:, [1, 2, 4, 5]].reshape(h, w).copy()
+
+    # 3) 3- and 4-component color (RGB/BGR or RGBA/BGRA; channel order does not
+    #    matter for luminance).
+    if data.size == 4 * h * w:
+        return cv2.cvtColor(
+            shift8(data).reshape(h, w, 4),
+            cv2.COLOR_RGBA2GRAY if "RGBA" in up else cv2.COLOR_BGRA2GRAY,
+        )
+    if data.size == 3 * h * w:
+        return cv2.cvtColor(shift8(data).reshape(h, w, 3), cv2.COLOR_RGB2GRAY)
+
+    # 4) Single-component monochrome (Mono8, Mono10/12/14/16, packed mono,
+    #    Confidence*, R/G/B-planes).
+    if data.size == h * w:
+        bits = _bits_from_fmt(fmt) or max(8, 8 * data.dtype.itemsize)
+        shift = bits - 8
+        if shift > 0:
+            flat = (data >> shift).astype(np.uint8)
+        elif data.dtype == np.uint8:
+            flat = data  # no copy yet; the final .copy() below is the only one
+        else:  # e.g. Mono8Signed (int8) payloads
+            flat = data.astype(np.uint8)
+        # reshape() would return a view of (possibly producer-owned) memory;
+        # .copy() guarantees an owned (h, w) frame. For Mono8 this is exactly
+        # one linear memcpy — matching the historic fast path.
+        return np.ascontiguousarray(flat).reshape(h, w).copy()
+
+    raise ValueError(f"unsupported pixel format {fmt!r} for {w}x{h} ({data.size} values)")
+
+
+def component_to_grayscale8(component) -> np.ndarray:
+    """Return an owned uint8 (height, width) grayscale frame for a payload.
+
+    Unknown/unhandled formats log a warning (once per format) and yield a
+    black frame so a camera with an exotic pixel format degrades to a visible
+    "no image" instead of killing the video thread.
+    """
+    width, height = int(component.width), int(component.height)
+    try:
+        return grayscale8_from_bytes(
+            component.data_format, component.data, width, height
+        )
+    except (ValueError, cv2.error) as e:
+        fmt = str(getattr(component, "data_format", "unknown"))
+        if fmt not in _warned_formats:
+            logging.warning(
+                f"Unsupported pixel format {fmt!r} ({e}); showing a black frame"
+            )
+            _warned_formats.add(fmt)
+        return np.zeros((height, width), dtype=np.uint8)
+
+
+_warned_formats = set()
+
 def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
     """
     Get the image from the camera using the Harvester API.
@@ -324,13 +475,11 @@ def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
         with ia.fetch() as buffer:
             if buffer:
                 component = buffer.payload.components[0]
-                # Copy: component.data is a read-only view of the producer's DMA
-                # buffer, which is reused for later frames. Copying it (row-major,
-                # linear memcpy) snapshots the frame so the buffer can be reused,
-                # and yields an owned (height, width) C-contiguous array.
-                img = np.frombuffer(
-                    component.data, dtype=np.uint8
-                ).reshape(component.height, component.width).copy()
+                # See component_to_grayscale8: Mono8 stays a plain copy, while
+                # 10/12/16-bit, Bayer and color formats are converted to a
+                # grayscale uint8 frame here so the whole app (display,
+                # recording, export) only ever deals with natural (h, w).
+                img = component_to_grayscale8(component)
             else:  # If no buffer is available, return a black image
                 img = np.zeros(
                     (
@@ -357,12 +506,16 @@ def _harvester_frame_into(ia: ImageAcquirer, out: np.ndarray) -> None:
         with ia.fetch() as buffer:
             if buffer:
                 component = buffer.payload.components[0]
-                np.copyto(
-                    out,
-                    np.frombuffer(component.data, dtype=np.uint8).reshape(
-                        component.height, component.width
-                    ),
-                )
+                if component.data_format in ("Mono8", "Mono8Signed"):
+                    # Fast path: a single linear copy, no intermediate array.
+                    np.copyto(
+                        out,
+                        np.frombuffer(component.data, dtype=np.uint8).reshape(
+                            component.height, component.width
+                        ),
+                    )
+                else:
+                    np.copyto(out, component_to_grayscale8(component))
             else:  # If no buffer is available, record a black frame
                 out.fill(0)
 
