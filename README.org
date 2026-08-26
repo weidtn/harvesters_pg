@@ -10,6 +10,8 @@ uv run ui.py
 * Configuration
 Available cameras should be automatically detected on startup. GenTL Producers (*.cti files) will be detected in every path listed in the environment variable ~GENICAM_GENTL64_PATH~ (colon-separated, analogous to [[https://github.com/AravisProject/aravis][aravis]]). As a fallback, the well-known Allied Vision install locations (Vimba X under ~\/opt\/alliedvision~, classic Vimba under ~\/opt/Vimba*~) are scanned as well. If no GenTL Producer could be found, you can manually select the file via the menu bar settings. When several producers are installed, connecting picks the one that actually enumerates the selected camera.
 
+Because feature node names differ between camera families (SFNC ~ExposureTime~ vs. classic Allied Vision ~ExposureTimeAbs~, etc.), the UI resolves them through small per-camera profiles in [[file:camera_profiles.py][camera_profiles.py]]. The matching profile is auto-detected from the node map on connect; to support a new camera family, add one ~CameraProfile~ entry there. Cameras exposing ~ExposureAuto~ / ~GainAuto~ get an ~Auto~ checkbox on the right of the exposure/gain rows. The FPS spinbox cap follows the connected camera's reported maximum frame rate.
+
 * Recording
 It is possible to record video. The frames can be inspected in the main window and saved as image sequence or in a h5 file.
 

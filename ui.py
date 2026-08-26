@@ -14,11 +14,12 @@ import time
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
 import cam
+import camera_profiles
+import importexport
+import logging
 from MainWindow import Ui_MainWindow
 from settings import Ui_SettingsWindow
 from VideoThread import VideoThread
-import importexport
-import logging
 import argparse
 from genicam.genapi import (
     IInteger,
@@ -199,13 +200,14 @@ class SettingsWindow(QtWidgets.QMainWindow):
     def update_node(self, node, value):
         """Update the camera settings based on the settings window."""
         logging.debug(f"Setting {node} to {value}")
-        if node == "AcquisitionFrameRate":
+        profile = self.mainwindow.profile
+        if node == profile.frame_rate_node:
             self.mainwindow.ui.sb_fps.setValue(value)
             self.mainwindow.on_fps_changed()
-        elif node == "ExposureTime":
+        elif node == profile.exposure_node:
             self.mainwindow.ui.sb_exposure.setValue(value)
             self.mainwindow.on_exposure_changed()
-        elif node == "Gain":
+        elif node == profile.gain_node:
             self.mainwindow.ui.sb_analog_gain.setValue(int(value))
             self.mainwindow.on_analog_gain_changed()
         elif node == "BlackLevel":
@@ -237,6 +239,11 @@ class MainWindow(QtWidgets.QMainWindow):
         super(MainWindow, self).__init__(*args, **kwargs)
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        # Quirks of the connected camera family (node names); replaced with
+        # the detected profile in setup_settings() once a Harvester camera
+        # connects. The settings window reads it from here as well.
+        self.profile = camera_profiles.SFNC_DEFAULT
+
         self.ui.settings_window = SettingsWindow(self)
 
         # Setup and add the ImageItem for displaying the video feed
@@ -285,6 +292,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.sb_exposure.editingFinished.connect(self.on_exposure_changed)
         self.ui.sb_analog_gain.valueChanged.connect(self.on_analog_gain_changed)
         self.ui.hsli_black_level.valueChanged.connect(self.on_blacklevel_changed)
+
+        # Auto exposure / auto gain toggles, appended on the right of their
+        # rows. Hidden until a camera that has the respective auto feature is
+        # connected (see setup_auto_boxes).
+        self.ui.cb_auto_exposure = QtWidgets.QCheckBox(text="Auto")
+        self.ui.cb_auto_exposure.setVisible(False)
+        self.ui.hLay_exposure.addWidget(self.ui.cb_auto_exposure)
+        self.ui.cb_auto_exposure.toggled.connect(self.on_auto_exposure_toggled)
+        self.ui.cb_auto_gain = QtWidgets.QCheckBox(text="Auto")
+        self.ui.cb_auto_gain.setVisible(False)
+        self.ui.hLay_analog_gain.addWidget(self.ui.cb_auto_gain)
+        self.ui.cb_auto_gain.toggled.connect(self.on_auto_gain_toggled)
         self.ui.cb_histogram.checkStateChanged.connect(self.on_histogram_checked)
         self.ui.ImageView.timeLine.setPen(
             width=10
@@ -403,6 +422,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.pb_live.setText("Start")
             self.ui.lbl_status.setStyleSheet("color: red;")
             self.ui.settings.setHidden(True)
+            # Reset the per-camera row extensions until the next connect.
+            for checkbox, spinbox in (
+                (self.ui.cb_auto_exposure, self.ui.sb_exposure),
+                (self.ui.cb_auto_gain, self.ui.sb_analog_gain),
+            ):
+                checkbox.blockSignals(True)
+                checkbox.setChecked(False)
+                checkbox.setVisible(False)
+                checkbox.blockSignals(False)
+                spinbox.setEnabled(True)
+            self.profile = camera_profiles.SFNC_DEFAULT
             self.ui.pb_settings.setDisabled(True)
             self.ui.settings_window.timer.stop()
 
@@ -597,7 +627,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_fps_changed(self) -> None:
         """Update the fps based on the settings."""
         cam.set_attribute(
-            self.videothread.cap, "AcquisitionFrameRate", self.ui.sb_fps.value()
+            self.videothread.cap,
+            self.profile.frame_rate_node,
+            self.ui.sb_fps.value(),
         )
         self.ui.lbl_exposure_minmax.setText(
             f"(2 - {cam.get_max_exposure(self.ui.sb_fps.value())})"
@@ -608,17 +640,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_exposure_changed(self) -> None:
         """Update the exposure based on the settings."""
+        if self.ui.cb_auto_exposure.isChecked():
+            return  # camera is in auto mode; manual value not pushed
         logging.debug(f"Setting exposure to {self.ui.sb_exposure.value()}")
         exposure = cam.cap_at_max_exposure(
             self.ui.sb_exposure.value(), self.ui.sb_fps.value()
         )
         self.ui.sb_exposure.setValue(exposure)
-        cam.set_attribute(self.videothread.cap, "ExposureTime", exposure)
+        cam.set_attribute(self.videothread.cap, self.profile.exposure_node, exposure)
 
     def on_analog_gain_changed(self) -> None:
         """Update the gain based on the settings."""
         logging.debug(f"Setting analog gain to {self.ui.sb_analog_gain.value()}")
-        cam.set_attribute(self.videothread.cap, "Gain", self.ui.sb_analog_gain.value())
+        cam.set_attribute(
+            self.videothread.cap, self.profile.gain_node, self.ui.sb_analog_gain.value()
+        )
 
     def on_blacklevel_changed(self) -> None:
         """Update the blacklevel based on the settings."""
@@ -631,16 +667,97 @@ class MainWindow(QtWidgets.QMainWindow):
     def setup_settings(self) -> None:
         ia = self.videothread.cap
         node_map = ia.remote_device.node_map
-        # Some cameras (e.g. TLSimu) have no AcquisitionFrameRateMax node; keep
-        # the UI's default cap in that case instead of crashing on connect.
-        try:
-            max_fps = int(node_map.AcquisitionFrameRateMax.value)
-        except Exception as e:
-            logging.warning(f"AcquisitionFrameRateMax not available, keeping UI default: {e}")
+        self.profile = camera_profiles.detect_profile(node_map)
+        logging.info(f"Connected camera uses profile: {self.profile.key}")
+        # Some cameras (e.g. TLSimu) report no frame-rate maximum anywhere;
+        # keep the UI's default cap in that case instead of crashing.
+        max_fps = camera_profiles.max_frame_rate(node_map, self.profile)
+        if max_fps is None:
+            logging.warning("Camera reports no frame rate maximum, keeping UI default")
             max_fps = self.ui.sb_fps.maximum()
+        else:
+            max_fps = int(max_fps)
         self.ui.sb_fps.setMaximum(max_fps)
         self.ui.lbl_fps_minmax.setText(f"(1 - {max_fps})")
         self.on_fps_changed()
+        self.setup_auto_boxes()
+
+    def setup_auto_boxes(self) -> None:
+        """Show the Auto checkboxes for the features this camera can automate.
+
+        Runs after connecting a Harvester camera: a checkbox appears on the
+        right of its row only when the connected camera exposes the respective
+        auto node; its initial state mirrors the camera's current mode.
+        """
+        node_map = self.videothread.cap.remote_device.node_map
+        for checkbox, spinbox, node_name in (
+            (
+                self.ui.cb_auto_exposure,
+                self.ui.sb_exposure,
+                self.profile.auto_exposure_node,
+            ),
+            (
+                self.ui.cb_auto_gain,
+                self.ui.sb_analog_gain,
+                self.profile.auto_gain_node,
+            ),
+        ):
+            value = None
+            if node_name is not None:
+                with cam.IA_LOCK:
+                    try:
+                        value = str(getattr(node_map, node_name).value)
+                    except Exception as e:
+                        logging.debug(f"{node_name} not available: {e}")
+            checkbox.blockSignals(True)
+            checkbox.setVisible(value is not None)
+            checkbox.setChecked(value == camera_profiles.AUTO_ON)
+            checkbox.blockSignals(False)
+            spinbox.setEnabled(not checkbox.isChecked())
+        self.setup_gain_range(node_map)
+
+    def setup_gain_range(self, node_map) -> None:
+        """Clamp the gain spinbox (and its label) to what the camera allows."""
+        try:
+            with cam.IA_LOCK:
+                gain = getattr(node_map, self.profile.gain_node)
+                lo, hi = float(gain.min), float(gain.max)
+        except Exception as e:
+            logging.debug(f"Gain range not available, keeping defaults: {e}")
+            return
+        self.ui.sb_analog_gain.setMinimum(int(lo))
+        self.ui.sb_analog_gain.setMaximum(int(hi))
+        self.ui.lbl_analog_gain_minmax_2.setText(f"({lo:g}-{hi:g})")
+
+    def on_auto_exposure_toggled(self, checked: bool) -> None:
+        """Switch the camera between auto and manual exposure."""
+        if not self.videothread or type(self.videothread.cap) is not cam.ImageAcquirer:
+            return
+        if self.profile.auto_exposure_node is None:
+            return
+        cam.set_attribute(
+            self.videothread.cap,
+            self.profile.auto_exposure_node,
+            camera_profiles.AUTO_ON if checked else camera_profiles.AUTO_OFF,
+        )
+        self.ui.sb_exposure.setEnabled(not checked)
+        if not checked:
+            self.on_exposure_changed()  # push the manual value again
+
+    def on_auto_gain_toggled(self, checked: bool) -> None:
+        """Switch the camera between auto and manual gain."""
+        if not self.videothread or type(self.videothread.cap) is not cam.ImageAcquirer:
+            return
+        if self.profile.auto_gain_node is None:
+            return
+        cam.set_attribute(
+            self.videothread.cap,
+            self.profile.auto_gain_node,
+            camera_profiles.AUTO_ON if checked else camera_profiles.AUTO_OFF,
+        )
+        self.ui.sb_analog_gain.setEnabled(not checked)
+        if not checked:
+            self.on_analog_gain_changed()  # push the manual value again
 
     def setup_resolution_settings(self) -> None:
         """Populate the resolution row and re-apply a saved image size.

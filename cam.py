@@ -18,6 +18,8 @@ import time
 import threading
 from typing import Callable
 
+from camera_profiles import detect_profile, max_frame_rate
+
 # Serializes all access to the GenICam device (fetch + node_map reads/writes).
 # The worker thread fetches frames while the GUI thread polls/writes node values;
 # GenICam producers are not thread-safe, so concurrent device access from two
@@ -121,26 +123,26 @@ def setup_cam(
     ia = h.create(0)
 
     nodes = ia.remote_device.node_map
+    profile = detect_profile(nodes)
+    logging.info(f"Using camera feature profile: {profile.key}")
     # Check if the FPS are okay:
-    try:
-        max_fps = nodes.AcquisitionFrameRateMax.value
-    except Exception as e:
-        # e.g. TLSimu or cameras without such a node
-        logging.warning(f"AcquisitionFrameRateMax not available, skipping clamp: {e}")
-        max_fps = None
+    max_fps = max_frame_rate(nodes, profile)
+    if max_fps is None:
+        # e.g. TLSimu or cameras reporting neither a max node nor node.max
+        logging.warning("Camera reports no frame rate maximum, skipping clamp")
     if max_fps is not None and fps > max_fps:
         fps = max_fps
         logging.warning(
             f"FPS is too high for the camera. Setting it to the maximum possible: {fps}"
         )
     try:
-        nodes.AcquisitionFrameRate.value = fps
+        getattr(nodes, profile.frame_rate_node).value = fps
     except Exception as e:
-        logging.warning(f"Could not set AcquisitionFrameRate to {fps}: {e}")
+        logging.warning(f"Could not set {profile.frame_rate_node} to {fps}: {e}")
 
     exposure = cap_at_max_exposure(exposure, fps)
     try:
-        nodes.ExposureTime.set_value(exposure)
+        getattr(nodes, profile.exposure_node).set_value(exposure)
     except Exception as e:
         print(e)
 
