@@ -51,7 +51,9 @@ class VideoThread(QtCore.QThread):
         elif "Webcam" in self.source:
             self.cap = cam.setup_webcam(int(self.source.split(" ")[1]))
         else:
-            self.harvester, self.cap = cam.setup_cam(cti=ctis[0])
+            self.harvester, self.cap = cam.setup_cam(
+                cti=cam.find_cti_for_camera(self.source, ctis)
+            )
 
     def _stop_and_join(self) -> None:
         """Signal the run loop to exit and wait for the worker thread to finish.

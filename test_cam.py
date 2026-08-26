@@ -14,6 +14,9 @@ new observable contracts:
 Run:  .venv/bin/python -m unittest test_cam -v
 """
 
+import os
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -92,6 +95,65 @@ class FrameOrientationTests(unittest.TestCase):
         finally:
             cam.RESOLUTION_CONFIG_PATH.unlink(missing_ok=True)
             cam.RESOLUTION_CONFIG_PATH = original
+
+class CtiDiscoveryTests(unittest.TestCase):
+    """GENICAM_GENTL64_PATH parsing and well-known-location fallback.
+
+    Allied Vision's Install_GenTL_Path.sh registers colon-separated paths;
+    Vimba X tarballs also work unregistered via the well-known globs.
+    """
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="cti_test_"))
+        self._orig_well_known = cam._WELL_KNOWN_GENTL_DIRS
+        cam._WELL_KNOWN_GENTL_DIRS = []
+        os.environ.pop("GENICAM_GENTL64_PATH", None)
+
+    def tearDown(self):
+        os.environ.pop("GENICAM_GENTL64_PATH", None)
+        cam._WELL_KNOWN_GENTL_DIRS = self._orig_well_known
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make_cti_dir(self, name: str) -> str:
+        d = self._tmp / name
+        d.mkdir()
+        (d / f"{name}.cti").write_bytes(b"")
+        return str(d)
+
+    def test_single_dir_in_env_var(self):
+        d = self._make_cti_dir("gentl_a")
+        os.environ["GENICAM_GENTL64_PATH"] = d
+        self.assertEqual(cam.load_cti_envvar(), [os.path.join(d, "gentl_a.cti")])
+
+    def test_colon_separated_env_var_entries(self):
+        a = self._make_cti_dir("gentl_a")
+        b = self._make_cti_dir("gentl_b")
+        os.environ["GENICAM_GENTL64_PATH"] = ":".join([a, "", b, ""])
+        self.assertEqual(
+            cam.load_cti_envvar(),
+            [os.path.join(a, "gentl_a.cti"), os.path.join(b, "gentl_b.cti")],
+        )
+
+    def test_repeated_dir_reported_once(self):
+        d = self._make_cti_dir("gentl_a")
+        os.environ["GENICAM_GENTL64_PATH"] = f"{d}:{d}"
+        self.assertEqual(cam.load_cti_envvar(), [os.path.join(d, "gentl_a.cti")])
+
+    def test_well_known_locations_fallback_glob(self):
+        root = self._tmp / "opt"
+        cti_dir = root / "alliedvision" / "VimbaX_2026-2" / "cti"
+        cti_dir.mkdir(parents=True)
+        (cti_dir / "VimbaGigETL.cti").write_bytes(b"")
+        cam._WELL_KNOWN_GENTL_DIRS = [str(root / "alliedvision" / "VimbaX*" / "cti")]
+        self.assertEqual(
+            cam.load_cti_envvar(), [str(cti_dir / "VimbaGigETL.cti")]
+        )
+
+    def test_env_var_takes_precedence_over_well_known(self):
+        d = self._make_cti_dir("gentl_first")
+        os.environ["GENICAM_GENTL64_PATH"] = d
+        cam._WELL_KNOWN_GENTL_DIRS = [str(self._tmp / "nowhere")]
+        self.assertEqual(cam.load_cti_envvar(), [os.path.join(d, "gentl_first.cti")])
 
 
 class _FakeComponent:

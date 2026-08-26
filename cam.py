@@ -25,19 +25,67 @@ from typing import Callable
 IA_LOCK = threading.RLock()
 
 
+# Well-known GenTL producer install locations of the common SDKs (checked in
+# addition to GENICAM_GENTL64_PATH, e.g. for a tarball that was never
+# registered): Vimba X 2024+ and classic Vimba layouts.
+_WELL_KNOWN_GENTL_DIRS = [
+    "/opt/alliedvision/VimbaX*/cti",
+    "/opt/alliedvision/VimbaX*/GenTL/*/cti",
+    "/opt/Vimba*/VimbaGigETL/cti",
+    "/opt/Vimba*/VimbaUSBTL/cti",
+]
+
+
 def load_cti_envvar() -> list[str]:
     """Find the common *.cti files for the camera.
+
+    Scans every directory listed in GENICAM_GENTL64_PATH (colon-separated,
+    like PATH -- Allied Vision's Install_GenTL_Path.sh produces exactly this
+    format), then the well-known SDK install locations. Entries pointing at
+    the same file are reported once.
 
     Returns:
         list[str]: A list of paths to the *.cti files.
     """
     logging.info("Looking for *.cti files...")
-    ctis = []
+    search_dirs = []
     env_var = os.getenv("GENICAM_GENTL64_PATH")
     if env_var:
-        ctis.extend(glob.glob(f"{env_var}/*.cti"))
+        search_dirs.extend(d for d in env_var.split(os.pathsep) if d)
+    for pattern in _WELL_KNOWN_GENTL_DIRS:
+        search_dirs.extend(sorted(glob.glob(pattern)))
+    ctis = []
+    seen = set()
+    for directory in search_dirs:
+        for cti in sorted(glob.glob(os.path.join(directory, "*.cti"))):
+            real = os.path.realpath(cti)
+            if real not in seen:
+                seen.add(real)
+                ctis.append(cti)
     logging.info(f"Found *.cti files: {ctis}")
     return ctis
+
+
+def find_cti_for_camera(source: str, ctis: list[str]) -> str:
+    """Return the GenTL producer that enumerates the camera named *source*.
+
+    With several producers installed (GigE + USB + simulator), the first one
+    cannot know about every device; pick the one that actually lists the
+    selected display name. Falls back to the first producer (the historic
+    behaviour) when nothing matches.
+    """
+    for cti in ctis:
+        try:
+            names = [
+                device["display_name"]
+                for device in return_harvester_cameras([cti])
+            ]
+        except Exception as e:
+            logging.warning(f"Could not enumerate cameras via {cti}: {e}")
+            continue
+        if source in names:
+            return cti
+    return ctis[0]
 
 
 def setup_cam(
