@@ -56,19 +56,26 @@ class VideoThread(QtCore.QThread):
     def _stop_and_join(self) -> None:
         """Signal the run loop to exit and wait for the worker thread to finish.
 
-        Unblocks a fetch() waiting on the camera first, then joins. Only after
-        the worker has actually exited is it safe to stop/destroy the camera,
-        otherwise teardown races the driver's DMA buffers and can hang the machine.
+        ia.stop() does NOT reliably unblock a fetch() that is already blocked
+        waiting for a frame in another thread: harvesters' fetch() wait loop
+        never checks is_acquiring(), so a worker stuck between frames can stay
+        blocked well past stop() returning. We still call stop() (it's the
+        best available nudge and is a no-op if the camera isn't acquiring),
+        but the join below is what actually determines whether the worker
+        exited - callers must not assume teardown is safe just because this
+        method returned.
         """
         self._run_flag = False
-        if not self.isRunning():
-            return
-        # Unblock a fetch() that is waiting for a frame, then join.
+        # Stop acquisition regardless of whether the worker thread ever
+        # started: setup_cam() leaves a freshly connected Harvester camera
+        # acquiring even before Start is pressed.
         if type(self.cap) is ImageAcquirer:
             try:
                 self.cap.stop()
             except Exception as e:
                 logging.debug(f"Error stopping camera while joining thread: {e}")
+        if not self.isRunning():
+            return
         deadline = time.monotonic() + 10.0
         while self.isRunning() and time.monotonic() < deadline:
             self.wait(100)
@@ -79,17 +86,29 @@ class VideoThread(QtCore.QThread):
         self._stop_and_join()
         if type(self.cap) is cv2.VideoCapture:
             self.cap.release()
-        elif type(self.cap) is None:
+        elif self.cap is None:
             logging.debug("Cap was none")
         else:
-            # Only teardown the camera once the worker has actually exited, so we
-            # never destroy DMA buffers while the producer is still streaming.
-            if self.cap is not None and not self.isRunning():
-                self.cap.stop()
-                self.cap.destroy()
-            if self.harvester is not None:
-                self.harvester.reset()
-                self.harvester = None
+            # Only teardown the camera - and reset the harvester/GenTL producer
+            # it belongs to - once the worker has actually exited. Resetting the
+            # harvester while the worker is still blocked inside a fetch() call
+            # closes/unloads the GenTL producer out from under that in-flight
+            # call, which can crash the process or leave the physical camera
+            # wedged. If the worker never stopped, leak the handles and log
+            # loudly instead of tearing down a producer still in use.
+            if not self.isRunning():
+                if self.cap is not None:
+                    self.cap.stop()
+                    self.cap.destroy()
+                if self.harvester is not None:
+                    self.harvester.reset()
+                    self.harvester = None
+            else:
+                logging.warning(
+                    "VideoThread worker still running at teardown; "
+                    "leaking camera/harvester handles instead of destroying "
+                    "them out from under the stuck fetch()."
+                )
 
     def run(self) -> None:
         """Capture video frames and emit the frame to the main thread."""
