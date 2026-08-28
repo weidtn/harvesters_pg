@@ -6,6 +6,7 @@ All user interaction with the ui is handled in here and communicated to the modl
 import os
 
 import sys
+from pathlib import Path
 from PyQt6 import QtWidgets, QtCore
 import numpy as np
 import datetime
@@ -138,11 +139,33 @@ class SettingsWindow(QtWidgets.QMainWindow):
                 self.settings[field]["label"],
                 self.settings[field]["widget"],
             )
-        #timer should update fields every 500 ms
-        self.timer.timeout.connect(self.update_fields)
-        self._timer_connected = True
+        # The poll starts from showEvent, not here. Starting it on connect
+        # meant the app read the whole node map over GenCP twice a second from
+        # the moment a camera was connected - forever, whether or not anyone
+        # had this panel open. Continuous register traffic for zero user value.
+        if self.isVisible():
+            self.start_polling()
+
+    def start_polling(self) -> None:
+        """Poll the node map every 500 ms, and refresh once immediately."""
+        if not self.settings:
+            return  # nothing built yet: no camera connected
+        if not self._timer_connected:
+            self.timer.timeout.connect(self.update_fields)
+            self._timer_connected = True
+        self.update_fields()  # show current values now, not in 500 ms
         self.timer.setInterval(500)
         self.timer.start()
+
+    def showEvent(self, event) -> None:
+        """Start polling when the panel appears on screen."""
+        super().showEvent(event)
+        self.start_polling()
+
+    def hideEvent(self, event) -> None:
+        """Stop polling as soon as the panel is off screen."""
+        super().hideEvent(event)
+        self.timer.stop()
 
     def teardown(self) -> None:
         """Stop polling and drop every widget built for the current camera.
@@ -443,12 +466,16 @@ class MainWindow(QtWidgets.QMainWindow):
             # No worker, but the settings panel may still hold a running poll.
             self.ui.settings_window.teardown()
         self.ui.settings_window.close()
+        # Only here: this unloads the GenTL producers, which disconnect_video
+        # deliberately leaves alone.
+        cam.release_harvester()
         event.accept()
 
     def connect_video(self) -> None:
         """Read the video source and start the video thread."""
         if not self.videothread:
             self.source = self.ui.cb_source.currentText()
+            logging.info(f"Connecting to {self.source!r}")
             try:
                 videothread = VideoThread(self.source, self.ctis)
             except Exception as e:
@@ -492,6 +519,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"The camera connected, but its settings could not be "
                     f"read:\n\n{e}",
                 )
+            logging.info(f"Connected to {self.source!r}")
 
     def disconnect_video(self) -> None:
         """Stop the video thread, release the camera, and reset the UI."""
@@ -501,9 +529,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # teardown to __del__ kept the camera opened for an unpredictable
             # stretch, so a quick reconnect hit a device the producer still
             # held.
+            logging.info(f"Disconnecting from {self.source!r}")
             self.ui.settings_window.teardown()
             self.videothread.close()
             self.videothread = None
+            logging.info(f"Disconnected from {self.source!r}")
             self.is_running = False
             self.ui.pb_live.setDisabled(True)
             self.ui.pb_connect.setText("Connect")
@@ -933,14 +963,31 @@ class MainWindow(QtWidgets.QMainWindow):
             pb.setText("Play")
 
 
+def configure_logging(verbose: int = 0, log_file: str = "harvesters_pg.log") -> None:
+    """Send logs to the console and to *log_file*.
+
+    This used to live in the ``if __name__ == "__main__"`` block, so the
+    installed ``harvesters_pg`` console script - which calls main() directly -
+    ran with no logging configured at all and wrote an empty log file. Every
+    warning about a stuck worker, a leaked camera handle or a fetch timeout
+    was silently discarded, which is exactly the evidence needed to diagnose a
+    freeze. It is set up in main() now, so both entry points get it.
+
+    The thread name is in the format on purpose: when the app hangs, the last
+    line tells you whether the GUI thread or the capture worker got there last.
+    FileHandler flushes on every record, so nothing is lost to a hard freeze.
+    """
+    level = {0: logging.WARNING, 1: logging.INFO}.get(verbose, logging.DEBUG)
+    fmt = "%(asctime)s - %(levelname)s - [%(threadName)s] %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
+    handler = logging.FileHandler(log_file)
+    handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+    logging.getLogger().addHandler(handler)
+    logging.info(f"Logging to {Path(log_file).resolve()} at level {logging.getLevelName(level)}")
+
+
 def main() -> None:
-    app = QtWidgets.QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Add argument to set the log level by using -v or -vv or -vvv
     parser.add_argument(
@@ -950,21 +997,19 @@ if __name__ == "__main__":
         action="count",
         default=0,
     )
-    args = parser.parse_args()
-
-    if args.verbose == 0:
-        lvl = logging.WARNING
-    elif args.verbose == 1:
-        lvl = logging.INFO
-    else:
-        lvl = logging.DEBUG
-    logging.basicConfig(
-        level=lvl,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    parser.add_argument(
+        "--log-file",
+        default="harvesters_pg.log",
+        help="where to write the log (default: harvesters_pg.log in the working directory)",
     )
-    fh = logging.FileHandler("harvesters_pg.log")
-    fh.setLevel(logging.WARNING)
-    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logging.getLogger().addHandler(fh)
+    args = parser.parse_args()
+    configure_logging(args.verbose, args.log_file)
+
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
     main()

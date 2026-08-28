@@ -36,6 +36,91 @@ IA_LOCK = threading.RLock()
 # which gives up and returns None instead of hanging.
 FETCH_TIMEOUT_S = 5.0
 
+# One Harvester - and therefore one load of each GenTL producer - for the whole
+# process. Building a fresh Harvester per connect meant unloading and reloading
+# the producer library, plus a full device re-enumeration, on every
+# connect/disconnect cycle. That per-cycle control-plane churn is what the
+# Active Silicon FireBird's fatal-PCIe defect correlates with (raw-PHX
+# workloads never trigger it, GenTL producer churn does), and several vendor
+# producers are not safe to unload and reload in-process at all. Reset it only
+# at application exit, via release_harvester().
+_SHARED_HARVESTER: Harvester | None = None
+_SHARED_HARVESTER_CTIS: tuple[str, ...] = ()
+
+
+def get_harvester(ctis: list[str] | tuple[str, ...]) -> Harvester:
+    """Return the process-wide Harvester, loading *ctis* on first use.
+
+    The Harvester is rebuilt only when the set of producers changes (a new
+    ``.cti`` was picked), because add_file() cannot be undone selectively.
+
+    Args:
+        ctis (list[str] | tuple[str, ...]): Producer paths, duplicates ignored.
+
+    Returns:
+        Harvester: The shared Harvester with those producers loaded.
+    """
+    global _SHARED_HARVESTER, _SHARED_HARVESTER_CTIS
+    wanted = tuple(dict.fromkeys(ctis))
+    if _SHARED_HARVESTER is not None and wanted != _SHARED_HARVESTER_CTIS:
+        logging.info("Producer set changed; rebuilding the shared harvester")
+        release_harvester()
+    if _SHARED_HARVESTER is None:
+        logging.info(f"Loading GenTL producers: {list(wanted)}")
+        harvester = Harvester()
+        for path in wanted:
+            harvester.add_file(path)
+        _SHARED_HARVESTER = harvester
+        _SHARED_HARVESTER_CTIS = wanted
+    return _SHARED_HARVESTER
+
+
+def release_harvester() -> None:
+    """Reset and drop the process-wide Harvester, unloading its producers.
+
+    Call at application exit only - see MainWindow.closeEvent. Doing this per
+    disconnect is the churn get_harvester exists to avoid.
+    """
+    teardown_cam(_SHARED_HARVESTER, None)
+
+
+def _forget_shared_harvester(harvester: Harvester) -> None:
+    """Drop the module reference if *harvester* is the shared one.
+
+    Stops get_harvester() from later handing out an already-reset object, which
+    is what would happen when a standalone script tears its camera down with
+    disconnect_cam().
+    """
+    global _SHARED_HARVESTER, _SHARED_HARVESTER_CTIS
+    if harvester is _SHARED_HARVESTER:
+        _SHARED_HARVESTER = None
+        _SHARED_HARVESTER_CTIS = ()
+
+
+def _device_list_satisfies(harvester: Harvester, search_key) -> bool:
+    """Whether the cached device list can already resolve *search_key*.
+
+    Used to skip h.update(): a re-enumeration puts discovery traffic on every
+    interface, and it used to run on every single connect even though the
+    startup scan had just enumerated the very same devices.
+    """
+    devices = harvester.device_info_list
+    if not devices:
+        return False
+    if search_key is None:
+        return True
+    if isinstance(search_key, int):
+        return -len(devices) <= search_key < len(devices)
+    if isinstance(search_key, dict):
+        return any(
+            all(
+                value == getattr(device, key, None)
+                for key, value in search_key.items()
+            )
+            for device in devices
+        )
+    return False
+
 
 def load_cti_envvar() -> list[str]:
     """Find the common *.cti files for the camera.
@@ -81,16 +166,14 @@ def setup_cam(
         Exception: whatever the producer raised. The camera is always released
             before the exception leaves this function.
     """
-    ctis = [cti] if isinstance(cti, str) else list(dict.fromkeys(cti))
-    # Create a Harvester object:
-    h = Harvester()
+    ctis = [cti] if isinstance(cti, str) else list(cti)
+    # The process-wide Harvester, with the producers already loaded.
+    h = get_harvester(ctis)
     ia = None
     try:
-        # Load the GenTL Producers; you can load many more if you want to:
-        for path in ctis:
-            h.add_file(path)
-        # Enumerate the available devices that GenTL Producers can handle:
-        h.update()
+        # Enumerate only when the cached device list cannot serve the request.
+        if not _device_list_satisfies(h, search_key):
+            h.update()
 
         # Select a target device and create an ImageAcquire object. Opening
         # index 0 regardless of what the user picked meant a second camera (or
@@ -105,8 +188,10 @@ def setup_cam(
         # acquiring, so the next connect fails or blocks on a device the
         # producer still considers in use - the "I have to replug the cable"
         # symptom, produced entirely in software.
+        # Release the device but keep the shared harvester: the producers stay
+        # loaded for the next attempt, and nothing else is using this one.
         logging.exception("Camera setup failed; releasing the device")
-        teardown_cam(h, ia)
+        teardown_cam(None, ia)
         raise
     return h, ia
 
@@ -248,13 +333,13 @@ def return_harvester_cameras(ctis: list[str]) -> list[dict]:
     Returns:
         list[dict]: A list of dictionaries containing the properties of the cameras.
     """
-    h = Harvester()
-    [h.add_file(cti) for cti in ctis]
+    # The shared Harvester, so the startup scan loads each producer once and
+    # the connect that follows reuses both the producers and this very device
+    # list - instead of unloading them here and enumerating all over again.
+    h = get_harvester(ctis)
     # Enumerate the available devices that GenTL Producers can handle:
     h.update()
-    devices = [cam.property_dict for cam in h.device_info_list]
-    h.reset()
-    return devices
+    return [cam.property_dict for cam in h.device_info_list]
 
 def get_camera_indices() -> list[int]:
     """Get the indices of the first 10 cameras that are detectable by OpenCV.
@@ -302,18 +387,27 @@ def teardown_cam(h: Harvester | None, ia: ImageAcquirer | None) -> None:
     """
     if ia is not None:
         try:
+            logging.debug("teardown: stopping acquisition")
             ia.stop()
         except Exception as e:
             logging.debug(f"Error stopping camera during teardown: {e}")
         try:
+            logging.debug("teardown: destroying the image acquirer")
             ia.destroy()
         except Exception as e:
             logging.warning(f"Error destroying camera during teardown: {e}")
     if h is not None:
+        _forget_shared_harvester(h)
         try:
+            # This unloads the GenTL producer library. If the app ever hangs
+            # here, the log stops after this line: some vendor producers keep
+            # threads or device handles alive across a reset and do not
+            # survive being unloaded and reloaded per connect.
+            logging.debug("teardown: resetting the harvester (unloads the producer)")
             h.reset()
         except Exception as e:
             logging.warning(f"Error resetting harvester during teardown: {e}")
+    logging.debug("teardown: done")
 
 
 def disconnect_cam(h: Harvester, ia: ImageAcquirer) -> None:

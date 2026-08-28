@@ -254,6 +254,10 @@ class TlSimuTests(unittest.TestCase):
         if not cls.cti.exists():
             raise unittest.SkipTest(f"TLSimu.cti not found: {cls.cti}")
 
+    def tearDown(self):
+        # Don't leak a loaded producer into the next test.
+        cam.release_harvester()
+
     def test_setup_cam_guards_missing_nodes_and_records(self):
         h, ia = cam.setup_cam(cti=str(self.cti), fps=5)  # must not raise
         try:
@@ -294,29 +298,31 @@ class TlSimuTests(unittest.TestCase):
         setup_cam() used to ignore the picked source (always create(0)) and
         leave teardown to VideoThread.__del__, so a device could still be
         exclusively opened when the next connect ran - the software-only
-        "camera is wedged until I replug it" symptom.
+        "camera is wedged until I replug it" symptom. The cycle must also reuse
+        one producer load rather than unloading and reloading each time.
         """
-        from harvesters.core import Harvester
-
-        h = Harvester()
-        h.add_file(str(self.cti))
+        h = cam.get_harvester([str(self.cti)])
         h.update()
         names = [device.display_name for device in h.device_info_list]
-        h.reset()
         self.assertGreater(len(names), 1, "TLSimu should expose several devices")
 
         target = names[-1]  # deliberately not index 0
+        harvesters_seen = set()
         for attempt in range(3):
             harvester, ia = cam.setup_cam(
                 cti=[str(self.cti)], search_key={"display_name": target}, fps=5
             )
+            harvesters_seen.add(id(harvester))
             try:
                 self.assertIsNotNone(ia, f"connect {attempt} produced no camera")
                 frame = cam.get_harvester_image(ia)
                 self.assertEqual(frame.dtype, np.uint8)
                 self.assertEqual(frame.ndim, 2)
             finally:
-                cam.teardown_cam(harvester, ia)
+                # Exactly what a disconnect does now: release the device, leave
+                # the producers loaded.
+                cam.teardown_cam(None, ia)
+        self.assertEqual(len(harvesters_seen), 1, "producer reloaded per cycle")
 
     def test_setup_cam_releases_the_device_on_an_unknown_search_key(self):
         # create() raises for a key that matches nothing; the harvester and the
@@ -505,6 +511,14 @@ class BoundedFetchTests(unittest.TestCase):
 class CameraReleaseTests(unittest.TestCase):
     """A camera must never stay open because something failed on the way in."""
 
+    def setUp(self):
+        # The shared Harvester is module state; poke it directly rather than
+        # calling release_harvester(), which would reset() a mock.
+        cam._SHARED_HARVESTER = None
+        cam._SHARED_HARVESTER_CTIS = ()
+
+    tearDown = setUp
+
     def test_setup_cam_releases_the_device_when_configuration_fails(self):
         from unittest.mock import MagicMock, patch
 
@@ -520,7 +534,9 @@ class CameraReleaseTests(unittest.TestCase):
         # exclusively opened, so the *next* connect blocks on a device the
         # producer still considers in use.
         ia.destroy.assert_called_once()
-        h.reset.assert_called_once()
+        # ...but the producers stay loaded for the retry: unloading them per
+        # attempt is the churn the shared Harvester exists to avoid.
+        h.reset.assert_not_called()
 
     def test_setup_cam_opens_the_requested_device(self):
         from unittest.mock import MagicMock, patch
@@ -539,6 +555,90 @@ class CameraReleaseTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in h.add_file.call_args_list], ["a.cti", "b.cti"]
         )
+
+    def test_harvester_is_shared_across_connect_cycles(self):
+        from unittest.mock import MagicMock, patch
+
+        created = []
+
+        def make_harvester():
+            harvester = MagicMock()
+            harvester.device_info_list = []
+            created.append(harvester)
+            return harvester
+
+        with (
+            patch("cam.Harvester", side_effect=make_harvester),
+            patch("cam._configure_cam"),
+            patch("cam.warmup_cam"),
+        ):
+            h1, ia1 = cam.setup_cam(cti="a.cti")
+            cam.teardown_cam(None, ia1)  # what a disconnect does now
+            h2, _ = cam.setup_cam(cti="a.cti")
+        self.assertIs(h1, h2)
+        # One producer load for both connects. Building a Harvester per connect
+        # unloaded and reloaded the GenTL producer every cycle.
+        self.assertEqual(len(created), 1)
+        h1.reset.assert_not_called()
+        ia1.destroy.assert_called_once()
+
+    def test_release_harvester_resets_and_forgets_it(self):
+        from unittest.mock import MagicMock, patch
+
+        first, second = MagicMock(), MagicMock()
+        with patch("cam.Harvester", side_effect=[first, second]):
+            self.assertIs(cam.get_harvester(["a.cti"]), first)
+            self.assertIs(cam.get_harvester(["a.cti"]), first)  # reused
+            cam.release_harvester()
+            first.reset.assert_called_once()
+            # Rebuilt afterwards, not handed out already-reset.
+            self.assertIs(cam.get_harvester(["a.cti"]), second)
+
+    def test_changing_the_producer_set_rebuilds_the_harvester(self):
+        from unittest.mock import MagicMock, patch
+
+        first, second = MagicMock(), MagicMock()
+        with patch("cam.Harvester", side_effect=[first, second]):
+            self.assertIs(cam.get_harvester(["a.cti"]), first)
+            # add_file() cannot be undone selectively, so a new .cti means a
+            # new Harvester - and the old one must be released.
+            self.assertIs(cam.get_harvester(["a.cti", "b.cti"]), second)
+        first.reset.assert_called_once()
+        self.assertEqual(
+            [call.args[0] for call in second.add_file.call_args_list],
+            ["a.cti", "b.cti"],
+        )
+
+    def test_connect_skips_enumeration_for_an_already_known_device(self):
+        from unittest.mock import MagicMock, patch
+
+        device = MagicMock()
+        device.display_name = "Cam A"
+        h = MagicMock()
+        h.device_info_list = [device]
+        with (
+            patch("cam.Harvester", return_value=h),
+            patch("cam._configure_cam"),
+            patch("cam.warmup_cam"),
+        ):
+            cam.setup_cam(cti="a.cti", search_key={"display_name": "Cam A"})
+        # h.update() is a full re-enumeration, discovery traffic on every
+        # interface. It used to run on every connect even though the startup
+        # scan had just enumerated the very same device.
+        h.update.assert_not_called()
+
+    def test_connect_enumerates_for_an_unknown_device(self):
+        from unittest.mock import MagicMock, patch
+
+        h = MagicMock()
+        h.device_info_list = []
+        with (
+            patch("cam.Harvester", return_value=h),
+            patch("cam._configure_cam"),
+            patch("cam.warmup_cam"),
+        ):
+            cam.setup_cam(cti="a.cti", search_key={"display_name": "Cam A"})
+        h.update.assert_called_once()
 
     def test_teardown_cam_continues_after_a_failing_step(self):
         from unittest.mock import MagicMock
@@ -749,14 +849,39 @@ class SettingsPanelTests(unittest.TestCase):
             # update_fields to the same timer again, so after N cycles one tick
             # ran N complete node-map polls and the GUI never went idle again.
             self.assertEqual(panel.ui.formLayout.rowCount(), rows_after_one)
-            self.assertEqual(panel.timer.receivers(panel.timer.timeout), 1)
+            # And connecting must not start a poll while the panel is hidden.
+            self.assertFalse(panel.timer.isActive())
+            self.assertEqual(panel.timer.receivers(panel.timer.timeout), 0)
 
             panel.teardown()
-            self.assertEqual(panel.timer.receivers(panel.timer.timeout), 0)
             self.assertFalse(panel.timer.isActive())
             self.assertEqual(panel.settings, {})
             self.assertEqual(panel.ui.formLayout.rowCount(), 0)
         finally:
+            _reset_main_window(window)
+
+    def test_poll_runs_only_while_the_panel_is_on_screen(self):
+        from unittest.mock import MagicMock, patch
+
+        window = _shared_main_window()
+        panel = window.ui.settings_window
+        try:
+            window.videothread = MagicMock()
+            # fill_settings finds no usable nodes behind a mock node map, so
+            # stand one in - start_polling has nothing to poll otherwise.
+            panel.settings = {"SomeNode": {"widget": MagicMock()}}
+            with patch("ui.cam.get_harvester_nodemap", return_value=MagicMock()):
+                panel.show()
+                self.assertTrue(panel.timer.isActive())
+                self.assertEqual(panel.timer.receivers(panel.timer.timeout), 1)
+                panel.hide()
+                self.assertFalse(panel.timer.isActive())
+                # Reopening must not stack a second connection.
+                panel.show()
+                panel.hide()
+                self.assertEqual(panel.timer.receivers(panel.timer.timeout), 1)
+        finally:
+            panel.hide()
             _reset_main_window(window)
 
     def test_update_fields_never_waits_for_the_device_lock(self):

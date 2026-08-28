@@ -103,6 +103,7 @@ class VideoThread(QtCore.QThread):
         into a camera the producer still held. Callers release the camera by
         calling this explicitly (see MainWindow.disconnect_video).
         """
+        logging.debug("close(): stopping acquisition and joining the worker")
         self._stop_and_join()
         if self.isRunning():
             # Free nothing the stuck worker may still be inside. Resetting the
@@ -117,13 +118,17 @@ class VideoThread(QtCore.QThread):
             )
             return
         cap, self.cap = self.cap, None
-        harvester, self.harvester = self.harvester, None
+        # Drop the reference without resetting: the Harvester is shared for the
+        # whole session (see cam.get_harvester), so unloading its producers per
+        # disconnect is exactly the churn we are avoiding. MainWindow.closeEvent
+        # releases it via cam.release_harvester().
+        self.harvester = None
         if cap is None:
             logging.debug("Cap was none")
         elif type(cap) is cv2.VideoCapture:
             cap.release()
         else:
-            cam.teardown_cam(harvester, cap)
+            cam.teardown_cam(None, cap)
 
     def __del__(self) -> None:
         # Backstop only. Finalizers run at unpredictable times and swallow
