@@ -56,9 +56,17 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.mainwindow = mainwindow
         self.settings = {}
         self.timer = QtCore.QTimer(self)
+        self._timer_connected: bool = False
 
     def fill_settings(self):
         """Fill the settings window' with the camera settings."""
+        # Drop whatever the previous camera left behind first. This used to be
+        # purely additive: each connect appended another full set of rows, kept
+        # the dead camera's widgets in self.settings, and connected
+        # update_fields to the same long-lived timer again. After N
+        # connect/disconnect cycles a single 500 ms tick ran N complete
+        # node-map polls, and the GUI never got idle time back.
+        self.teardown()
         nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
         for node in dir(nodemap):
             self.settings[node] = {
@@ -132,8 +140,23 @@ class SettingsWindow(QtWidgets.QMainWindow):
             )
         #timer should update fields every 500 ms
         self.timer.timeout.connect(self.update_fields)
+        self._timer_connected = True
         self.timer.setInterval(500)
         self.timer.start()
+
+    def teardown(self) -> None:
+        """Stop polling and drop every widget built for the current camera.
+
+        Called on disconnect and before repopulating, so no poll outlives the
+        node map it reads and the panel cannot accumulate duplicate rows.
+        """
+        self.timer.stop()
+        if self._timer_connected:
+            self.timer.timeout.disconnect(self.update_fields)
+            self._timer_connected = False
+        while self.ui.formLayout.rowCount():
+            self.ui.formLayout.removeRow(0)
+        self.settings = {}
 
     def execute_command(self, node):
         """Execute a command on the camera.
@@ -160,7 +183,14 @@ class SettingsWindow(QtWidgets.QMainWindow):
             return
         # Serialize node_map reads against the worker's fetch() so the poll never
         # accesses the producer concurrently with a live fetch (not thread-safe).
-        with cam.IA_LOCK:
+        # Never *wait* for the lock, though: the worker holds it for a whole
+        # fetch, so blocking here froze the GUI thread for as long as the camera
+        # took to deliver - and forever when the fetch itself hung. A skipped
+        # poll only means the fields refresh 500 ms later, which is invisible.
+        if not cam.IA_LOCK.acquire(blocking=False):
+            logging.debug("Camera busy; skipping this settings poll")
+            return
+        try:
             for node in self.settings:
                 # Access_modes possible: NA (1), ?, RO (3), RW (4)
                 widget = self.settings[node]["widget"]
@@ -194,7 +224,14 @@ class SettingsWindow(QtWidgets.QMainWindow):
                         ) if access_mode == 4 else widget.setReadOnly(True)
                 except AccessException:
                     continue
-                widget.blockSignals(False)
+                finally:
+                    # In a finally, not a trailing statement: the
+                    # AccessException path above used to `continue` straight
+                    # past it, leaving that widget with its signals blocked for
+                    # the rest of the session.
+                    widget.blockSignals(False)
+        finally:
+            cam.IA_LOCK.release()
 
     def update_node(self, node, value):
         """Update the camera settings based on the settings window."""
@@ -345,13 +382,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.populate_video_sources()
 
     def populate_video_sources(self) -> None:
-        """Populate combobox with available video sources."""
+        """Populate combobox with available video sources.
+
+        Refuses to run while a camera is connected. Enumerating builds a second
+        Harvester over the same GenTL producer and resets it when done, which
+        unloads the producer library - with a device open through it, that
+        destroys handles still in use. Probing the OpenCV indices reopens a
+        webcam that may currently be streaming, for the same reason.
+        """
+        if self.videothread is not None:
+            logging.warning(
+                "Not rescanning video sources while a camera is connected: "
+                "re-enumerating would reset the GenTL producer in use."
+            )
+            QtWidgets.QMessageBox.information(
+                self,
+                "Camera connected",
+                "Disconnect the current camera before rescanning for sources.",
+            )
+            return
+
+        previous = self.ui.cb_source.currentText()
+        # Rebuild from scratch. This runs again whenever a .cti is added, and
+        # appending duplicated every entry that was already there.
+        self.ui.cb_source.clear()
+
         # Add OpenCV camera indices
         cam_indices: list[int] = cam.get_camera_indices()
         [self.ui.cb_source.addItem(f"Webcam {i}") for i in cam_indices]
 
-        # Add Harvester cameras
-        self.ctis.extend(cam.load_cti_envvar())
+        # Add Harvester cameras. Deduplicated: add_file() rejects a producer
+        # that is already loaded, so a repeated scan used to break enumeration
+        # outright.
+        for cti in cam.load_cti_envvar():
+            if cti not in self.ctis:
+                self.ctis.append(cti)
         harvester_cams: list[dict] = cam.return_harvester_cameras(self.ctis)
         [
             self.ui.cb_source.addItem(f"{cam['display_name']}")
@@ -360,6 +425,10 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         if self.ui.cb_source.findText("random") == -1:
             self.ui.cb_source.addItem("random")
+        if previous:
+            index = self.ui.cb_source.findText(previous)
+            if index != -1:
+                self.ui.cb_source.setCurrentIndex(index)
 
     def closeEvent(self, event) -> None:
         """Orderly stop the camera before the window closes.
@@ -370,13 +439,31 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if self.videothread:
             self.disconnect_video()
+        else:
+            # No worker, but the settings panel may still hold a running poll.
+            self.ui.settings_window.teardown()
+        self.ui.settings_window.close()
         event.accept()
 
     def connect_video(self) -> None:
         """Read the video source and start the video thread."""
         if not self.videothread:
             self.source = self.ui.cb_source.currentText()
-            self.videothread = VideoThread(self.source, self.ctis)
+            try:
+                videothread = VideoThread(self.source, self.ctis)
+            except Exception as e:
+                # An exception escaping a Qt slot reaches qFatal and aborts the
+                # process - possibly with the camera half-open. Report it and
+                # stay disconnected instead; setup_cam has already released
+                # whatever it managed to open.
+                logging.exception(f"Could not connect to {self.source}")
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Could not connect",
+                    f"Connecting to {self.source!r} failed:\n\n{e}",
+                )
+                return
+            self.videothread = videothread
             self.videothread.change_pixmap_signal.connect(self.update_image)
             self.ui.pb_live.setDisabled(False)
             self.ui.pb_acquire.setDisabled(False)
@@ -384,14 +471,38 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.pb_connect.clicked.disconnect()
             self.ui.pb_connect.clicked.connect(self.disconnect_video)
             self.ui.cb_source.setDisabled(True)
-            self.on_source_connected()
-            self.ui.lbl_status.setStyleSheet("color: orange;")
+            # Stop acquisition before reading the node map. setup_cam leaves
+            # the camera streaming, so the settings read-out and the saved-AOI
+            # re-apply below used to run against a live device whose buffers
+            # nobody was draining. pause_video() also sets the status to orange.
             self.pause_video()
+            try:
+                self.on_source_connected()
+            except Exception as e:
+                # Same qFatal concern as above, but here the camera is already
+                # open: keep the connection, drop the settings panel, and tell
+                # the user rather than aborting the process.
+                logging.exception("Could not populate the camera settings")
+                self.ui.settings_window.teardown()
+                self.ui.settings.setHidden(True)
+                self.ui.pb_settings.setDisabled(True)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Settings unavailable",
+                    f"The camera connected, but its settings could not be "
+                    f"read:\n\n{e}",
+                )
 
     def disconnect_video(self) -> None:
-        """Stop the video thread and reset the UI."""
+        """Stop the video thread, release the camera, and reset the UI."""
         if self.videothread:
-            self.videothread.stop()
+            # Stop polling the node map before the device goes away, then
+            # release it explicitly. Dropping the reference and leaving the
+            # teardown to __del__ kept the camera opened for an unpredictable
+            # stretch, so a quick reconnect hit a device the producer still
+            # held.
+            self.ui.settings_window.teardown()
+            self.videothread.close()
             self.videothread = None
             self.is_running = False
             self.ui.pb_live.setDisabled(True)
@@ -404,13 +515,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.lbl_status.setStyleSheet("color: red;")
             self.ui.settings.setHidden(True)
             self.ui.pb_settings.setDisabled(True)
-            self.ui.settings_window.timer.stop()
 
     def start_video(self) -> None:
         if not self.videothread:
             raise ValueError("Video thread not started")
         self.ui.pb_save.setDisabled(True)
-        self.videothread._start()  # starts camera acquisition and the worker thread once
+        # starts camera acquisition and the worker thread once
+        if not self.videothread._start():
+            # The previous worker never exited (a pause that timed out). Do not
+            # pretend the live view restarted: a second start() on the same
+            # device while the old fetch() is still in flight is exactly the
+            # race this guards against.
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Camera busy",
+                "The previous live view has not stopped yet, so it was not "
+                "restarted. Try again; if it keeps happening, disconnect and "
+                "reconnect the camera.",
+            )
+            return
         self.is_running = True
         self.ui.pb_live.setText("Pause")
         self.ui.lbl_status.setStyleSheet("color: green;")
@@ -488,15 +611,36 @@ class MainWindow(QtWidgets.QMainWindow):
         # A mid-recording AOI change would violate the preallocated (n, h, w)
         # buffer; hold the Apply button (and the camera keep-alive) until done.
         self.ui.pb_res_apply.setDisabled(True)
+        # The recording loop pumps the event loop after every frame while
+        # holding IA_LOCK. IA_LOCK is reentrant, so the settings poll would
+        # re-acquire it on this very thread and read the node map from inside
+        # the fetch loop - a lock cannot protect against the GUI thread
+        # re-entering itself. Suspend the poll, and the panel's own widgets,
+        # for the duration instead.
+        settings_window = self.ui.settings_window
+        was_polling = settings_window.timer.isActive()
+        settings_window.timer.stop()
+        settings_window.setEnabled(False)
         self.recording = np.array([])
         n_frames = int(self.ui.sb_frames.text())
         try:
             self.acquire(n_frames, self.ui.progressBar)
+        except Exception as e:
+            # A fetch timeout aborts the recording; letting it escape the slot
+            # would take the process down with qFatal.
+            logging.exception("Recording failed")
+            QtWidgets.QMessageBox.critical(
+                self, "Recording failed", f"The recording was aborted:\n\n{e}"
+            )
+            return
         finally:
             self.ui.pb_acquire.setDisabled(False)
             self.ui.pb_connect.setDisabled(False)
             self.ui.pb_live.setDisabled(False)
             self.ui.pb_res_apply.setDisabled(False)
+            settings_window.setEnabled(True)
+            if was_polling:
+                settings_window.timer.start()
         self.ui.pb_save.setDisabled(False)
         self.update_image(self.recording)
 
@@ -749,10 +893,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def find_cti_dialog(self) -> None:
         """Open a dialog to find the GenTL Producer file."""
+        if self.videothread is not None:
+            # populate_video_sources() below would reset the producer the
+            # connected camera runs through; say so before opening the dialog.
+            QtWidgets.QMessageBox.information(
+                self,
+                "Camera connected",
+                "Disconnect the current camera before adding a GenTL producer.",
+            )
+            return
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select GenTL Producer", "", "GenTL Producer (*.cti)"
         )
-        if filename:
+        if filename and filename not in self.ctis:
             self.ctis.append(filename)
         self.populate_video_sources()
 
