@@ -567,17 +567,23 @@ def record_harvester_frames(
     # frame (~10 ms at 2048x2048), which capped recording well below the
     # camera's nominal frame rate.
     frames = np.empty((n_frames, height, width), dtype=np.uint8)
-    ia.start()
-    for i in trange(n_frames):
-        _harvester_frame_into(ia, frames[i])
-        if preview is not None:
-            preview(frames[i])
-        if progress is not None:
-            if n_frames == 1:
-                progress.setValue(1)
-            else:
-                progress.setValue(i)
-    ia.stop()
+    # Hold IA_LOCK for the whole start->fetch loop->stop sequence, not just the
+    # individual fetches: start()/stop() are state-changing GenTL calls on the
+    # shared device, and leaving them unlocked let a still-running VideoThread
+    # fetch() interleave with them (see ui.on_btn_acquire_clicked). IA_LOCK is
+    # reentrant, so _harvester_frame_into's own per-frame lock nests fine here.
+    with IA_LOCK:
+        ia.start()
+        for i in trange(n_frames):
+            _harvester_frame_into(ia, frames[i])
+            if preview is not None:
+                preview(frames[i])
+            if progress is not None:
+                if n_frames == 1:
+                    progress.setValue(1)
+                else:
+                    progress.setValue(i)
+        ia.stop()
     return frames
 
 def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:

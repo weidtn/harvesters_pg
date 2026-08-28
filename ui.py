@@ -456,6 +456,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_btn_acquire_clicked(self) -> None:
         self.pause_video()
+        if self.videothread is not None and self.videothread.isRunning():
+            # pause_video() -> VideoThread.stop() can time out (10s) without
+            # actually stopping the worker: ia.stop() does not reliably
+            # unblock a fetch() already blocked inside the device (see
+            # VideoThread._stop_and_join's docstring). Recording now would
+            # start a second, concurrent start()/fetch()/stop() sequence on
+            # the same ImageAcquirer the stuck worker is still using, so
+            # refuse instead of silently racing it.
+            logging.warning(
+                "Video thread did not stop in time; aborting recording to "
+                "avoid a concurrent-access race on the camera."
+            )
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Camera busy",
+                "Live view did not stop in time, so recording was cancelled "
+                "to avoid accessing the camera from two threads at once. "
+                "Try again; if it keeps happening, disconnect and reconnect "
+                "the camera.",
+            )
+            return
         self.Image.clear()
         self.ui.pb_save.setDisabled(True)
         # Disable actions that touch the camera / re-enter the event loop while

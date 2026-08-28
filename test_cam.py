@@ -289,5 +289,78 @@ class TlSimuTests(unittest.TestCase):
             cam.disconnect_cam(h, ia)
 
 
+class UiRaceGuardTests(unittest.TestCase):
+    """Regression test for the record-vs-live-view race fixed 2026-08-28.
+
+    VideoThread.stop() can time out (10s) without actually stopping the
+    worker: ia.stop() does not reliably unblock a fetch() already blocked
+    inside the device (see VideoThread._stop_and_join's docstring). Before
+    the fix, on_btn_acquire_clicked() proceeded into record_harvester_frames()
+    regardless, driving a second start()/fetch()/stop() sequence on the same
+    ImageAcquirer a still-running worker might still be using. It must now
+    refuse instead.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6 import QtWidgets
+
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_acquire_aborts_when_video_thread_still_running(self):
+        from unittest.mock import MagicMock, patch
+
+        import ui
+
+        window = ui.MainWindow()
+        try:
+            fake_thread = MagicMock()
+            fake_thread.isRunning.return_value = True
+            window.videothread = fake_thread
+
+            with (
+                patch.object(window, "pause_video") as mock_pause,
+                patch.object(window, "acquire") as mock_acquire,
+                patch("ui.QtWidgets.QMessageBox.warning") as mock_box,
+            ):
+                window.on_btn_acquire_clicked()
+
+            mock_pause.assert_called_once()
+            mock_acquire.assert_not_called()  # the whole point of the guard
+            mock_box.assert_called_once()
+        finally:
+            window.videothread = None  # don't let close()/__del__ touch the fake
+            window.close()
+
+    def test_acquire_proceeds_when_video_thread_stopped(self):
+        from unittest.mock import MagicMock, patch
+
+        import ui
+
+        window = ui.MainWindow()
+        try:
+            fake_thread = MagicMock()
+            fake_thread.isRunning.return_value = False
+            window.videothread = fake_thread
+
+            with (
+                patch.object(window, "pause_video") as mock_pause,
+                patch.object(window, "acquire") as mock_acquire,
+                # on_btn_acquire_clicked() displays self.recording after
+                # acquire() returns; mocking acquire() leaves it as the
+                # placeholder np.array([]) it's reset to just before the
+                # call, which update_image() (unrelated to this guard) can't
+                # display. Not exercised here.
+                patch.object(window, "update_image"),
+            ):
+                window.on_btn_acquire_clicked()
+
+            mock_pause.assert_called_once()
+            mock_acquire.assert_called_once()  # unaffected by the new guard
+        finally:
+            window.videothread = None
+            window.close()
+
+
 if __name__ == "__main__":
     unittest.main()
