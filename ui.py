@@ -10,6 +10,7 @@ from PyQt6 import QtWidgets, QtCore
 import numpy as np
 import datetime
 import time
+import uuid
 
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
@@ -260,6 +261,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running: bool = False
         self.source: str = "random"
         self.recording: np.ndarray = np.array([])
+        # Identity of self.recording: every file it is saved to carries both.
+        self.recording_id: str | None = None
+        self.recording_timestamp: str | None = None  # start, %Y%m%d%H%M%S
         self.ctis: list[str] = []
         self.filename = "."
 
@@ -540,6 +544,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.update_image(frame)
             QtWidgets.QApplication.processEvents()
 
+        started = datetime.datetime.now()
         if self.source == "random":
             imgs = cam.record_random_frames(n_frames, progressbar, preview=preview)
         elif "Webcam" in self.source:
@@ -551,6 +556,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.videothread.cap, n_frames, progressbar, preview=preview
             )
         self.recording = imgs
+        self.recording_id = str(uuid.uuid4())
+        self.recording_timestamp = started.strftime("%Y%m%d%H%M%S")
         self.timestamps = [cam.extract_timestamp(img) / 25_000_000 for img in imgs]
         self.frame_counters = [cam.extract_frame_counter(img) for img in imgs]
         self.filename = "."
@@ -564,7 +571,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "",
             "HDF5 Files (*.h5);;Images (*.png);;Images (*.jpg)",
         )
-        metadata: dict = {"timestamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")}
+        if self.recording_id is None:  # loaded from a file saved without an id
+            self.recording_id = str(uuid.uuid4())
+        metadata: dict = {
+            "recording_id": self.recording_id,
+            "timestamp": self.recording_timestamp
+            or datetime.datetime.now().strftime("%Y%m%d%H%M%S"),
+        }
         # TODO: Better handling, especially if the video was loaded from a file
         if type(self.videothread.cap) is cam.VideoCapture:
             metadata["fps"] = cam.get_webcam_fps(self.videothread.cap)
@@ -839,6 +852,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.recording, self.metadata = importexport.load_frames_from_h5(
                 filename, progressbar=self.ui.progressBar
             )
+            self.recording_id = self.metadata.get("recording_id")
+            self.recording_timestamp = self.metadata.get("timestamp")
         self.update_image(self.recording)
         self.filename = filename
         self.ui.pb_save.setDisabled(False)

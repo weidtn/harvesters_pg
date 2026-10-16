@@ -5,7 +5,8 @@ Frames are stored and displayed in the camera's natural (height, width)
 orientation throughout the app (single exceptions: none). These tests pin the
 new observable contracts:
   * info-field extraction reads the top-left pixels of the (h, w) frame,
-  * h5 save/load round-trips preserve (n, h, w) without any transpose,
+  * h5 save/load round-trips preserve (n, h, w) without any transpose and
+    the recording identity (recording_id, timestamp) for re-saving,
   * PNG export writes the upright (h, w) frame,
   * setup_cam tolerates cameras without AcquisitionFrameRate/Max or other
     optional GenICam nodes (e.g. the bundled TLSimu producer),
@@ -52,6 +53,22 @@ class FrameOrientationTests(unittest.TestCase):
             out.unlink(missing_ok=True)
         self.assertEqual(loaded.shape, (5, 40, 30))
         np.testing.assert_array_equal(loaded, frames)
+
+    def test_h5_roundtrip_keeps_recording_identity(self):
+        # A loaded recording that is saved again must keep its id and start time.
+        identity = {
+            "recording_id": "1b4e28ba-2fa1-11d2-883f-0016d3cca427",
+            "timestamp": "20260415144348",
+        }
+        out = Path(__file__).parent / "test_identity_roundtrip.h5"
+        importexport.save_frames_to_h5(
+            np.zeros((2, 4, 3), dtype=np.uint8), str(out), metadata=dict(identity)
+        )
+        try:
+            _, metadata = importexport.load_frames_from_h5(str(out))
+        finally:
+            out.unlink(missing_ok=True)
+        self.assertEqual({k: metadata.get(k) for k in identity}, identity)
 
     def test_png_export_is_upright_hw(self):
         frame = np.zeros((40, 30), dtype=np.uint8)

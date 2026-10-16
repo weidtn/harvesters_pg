@@ -4,6 +4,7 @@ import numpy as np
 import h5py
 import tqdm
 import datetime
+import uuid
 
 from harvesters.core import Harvester, ImageAcquirer
 
@@ -25,6 +26,7 @@ for i in tqdm.tqdm(range(10), desc="warmup"):
     with ia.fetch() as buffer:
         pass
 
+started = datetime.datetime.now()
 try:
     for i in tqdm.tqdm(range(T*FPS), desc="Fetching frames"):
         with ia.fetch() as buffer:
@@ -34,7 +36,9 @@ except Exception as e:
 finally:
     cam.disconnect_cam(h, ia)
 
-timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+timestamp = started.strftime("%Y%m%d%H%M%S")
 filename = f"{timestamp}_{FPS}fps.h5"
 with h5py.File(filename, "w") as f:
     f.create_dataset("frames", data=frames, compression="gzip", compression_opts=9)
+    f.attrs["recording_id"] = str(uuid.uuid4())
+    f.attrs["timestamp"] = timestamp  # start of the recording
