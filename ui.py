@@ -425,6 +425,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.vLay_settings.addLayout(self.ui.hLay_resolution)
         self.ui.pb_res_apply.clicked.connect(self.on_resolution_apply)
 
+        # Lab ids of the particles and of the objective, saved with every
+        # recording (attributes particles and objective); NOMAD links them to
+        # the inventory entries with these ids. Next to the frames/seconds rows.
+        self.ui.le_particles = QtWidgets.QLineEdit()
+        self.ui.le_particles.setPlaceholderText("e.g. M270-2024-03, M450-2023-01")
+        self.ui.le_particles.setToolTip(
+            "Lab ids of the particle batches in the recording, comma-separated "
+            "(optional). Saved with each recording as attribute 'particles'."
+        )
+        self.ui.le_objective = QtWidgets.QLineEdit()
+        self.ui.le_objective.setPlaceholderText("e.g. OBJ-20x")
+        self.ui.le_objective.setToolTip(
+            "Lab id of the objective (optional). Saved with each recording as "
+            "attribute 'objective'."
+        )
+        self.ui.form_inventory = QtWidgets.QFormLayout()
+        self.ui.form_inventory.addRow("Particles", self.ui.le_particles)
+        self.ui.form_inventory.addRow("Objective", self.ui.le_objective)
+        self.ui.horizontalLayout_4.insertLayout(1, self.ui.form_inventory)
+
         self.populate_video_sources()
 
     def populate_video_sources(self) -> None:
@@ -773,6 +793,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "timestamp": self.recording_timestamp
             or datetime.datetime.now().strftime("%Y%m%d%H%M%S"),
         }
+        particles = ", ".join(
+            p.strip() for p in self.ui.le_particles.text().split(",") if p.strip()
+        )
+        if particles:
+            metadata["particles"] = particles
+        objective = self.ui.le_objective.text().strip()
+        if objective:
+            metadata["objective"] = objective
         # TODO: Better handling, especially if the video was loaded from a file
         if type(self.videothread.cap) is cam.VideoCapture:
             metadata["fps"] = cam.get_webcam_fps(self.videothread.cap)
@@ -1049,6 +1077,10 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.recording_id = self.metadata.get("recording_id")
             self.recording_timestamp = self.metadata.get("timestamp")
+            # Show the loaded recording's own values, so that saving it again
+            # keeps them and does not stamp it with another recording's.
+            self.ui.le_particles.setText(str(self.metadata.get("particles", "")))
+            self.ui.le_objective.setText(str(self.metadata.get("objective", "")))
         self.update_image(self.recording)
         self.filename = filename
         self.ui.pb_save.setDisabled(False)

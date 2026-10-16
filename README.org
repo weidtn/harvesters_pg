@@ -17,6 +17,8 @@ It is possible to record video. The frames can be inspected in the main window a
 
 h5 files carry the recording's metadata as root attributes: the camera settings, ~fps~, ~timestamp~ (local start time of the recording, ~%Y%m%d%H%M%S~) and ~recording_id~, a random UUID. Every file saved from one recording, also after loading it again, carries the same ~recording_id~. The tracking scripts copy these attributes into the trajectory files, so results can be matched to their recording.
 
+The optional fields /Particles/ and /Objective/ next to the frame count take the lab ids of the particle batches (comma-separated) and of the objective, as used for their entries in NOMAD. They are saved with each recording as attributes ~particles~ and ~objective~; NOMAD links the video and its tracks to these entries. Loading a recording shows its own values in the fields.
+
 * Replay
 It is possible to load a h5 file and show the video, click on File and open to do so.
 
