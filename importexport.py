@@ -160,6 +160,8 @@ def load_frames_from_h5(
         progressbar.setValue(0)
     with h5py.File(filename, "r") as f:
         frames = f["frames"][:]
+        for k, v in f.attrs.items():  # written by save_frames_to_h5
+            metadata[k] = v
         for k, v in f["frames"].attrs.items():
             metadata[k] = v
         if "timestamps" in f:
