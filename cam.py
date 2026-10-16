@@ -26,6 +26,103 @@ from camera_profiles import detect_profile, max_frame_rate
 # threads can corrupt the producer's state and hang the machine.
 IA_LOCK = threading.RLock()
 
+# Upper bound, in seconds, for every buffer fetch in this module.
+#
+# ImageAcquirer.fetch() defaults to timeout=0, which switches its timeout check
+# off entirely and spins in `while not buffer` forever (harvesters.core
+# ImageAcquirer._fetch). A camera that never delivers - trigger mode still
+# enabled, a GigE packet-size/MTU mismatch, a device left wedged by an earlier
+# crash - then blocks the calling thread with no way to cancel: a permanent GUI
+# freeze when the caller is the GUI thread, and a permanently held IA_LOCK when
+# it is the worker. Every fetch below goes through try_fetch(timeout=...),
+# which gives up and returns None instead of hanging.
+FETCH_TIMEOUT_S = 5.0
+
+# One Harvester - and therefore one load of each GenTL producer - for the whole
+# process. Building a fresh Harvester per connect meant unloading and reloading
+# the producer library, plus a full device re-enumeration, on every
+# connect/disconnect cycle. That per-cycle control-plane churn is what the
+# Active Silicon FireBird's fatal-PCIe defect correlates with (raw-PHX
+# workloads never trigger it, GenTL producer churn does), and several vendor
+# producers are not safe to unload and reload in-process at all. Reset it only
+# at application exit, via release_harvester().
+_SHARED_HARVESTER: Harvester | None = None
+_SHARED_HARVESTER_CTIS: tuple[str, ...] = ()
+
+
+def get_harvester(ctis: list[str] | tuple[str, ...]) -> Harvester:
+    """Return the process-wide Harvester, loading *ctis* on first use.
+
+    The Harvester is rebuilt only when the set of producers changes (a new
+    ``.cti`` was picked), because add_file() cannot be undone selectively.
+
+    Args:
+        ctis (list[str] | tuple[str, ...]): Producer paths, duplicates ignored.
+
+    Returns:
+        Harvester: The shared Harvester with those producers loaded.
+    """
+    global _SHARED_HARVESTER, _SHARED_HARVESTER_CTIS
+    wanted = tuple(dict.fromkeys(ctis))
+    if _SHARED_HARVESTER is not None and wanted != _SHARED_HARVESTER_CTIS:
+        logging.info("Producer set changed; rebuilding the shared harvester")
+        release_harvester()
+    if _SHARED_HARVESTER is None:
+        logging.info(f"Loading GenTL producers: {list(wanted)}")
+        harvester = Harvester()
+        for path in wanted:
+            harvester.add_file(path)
+        _SHARED_HARVESTER = harvester
+        _SHARED_HARVESTER_CTIS = wanted
+    return _SHARED_HARVESTER
+
+
+def release_harvester() -> None:
+    """Reset and drop the process-wide Harvester, unloading its producers.
+
+    Call at application exit only - see MainWindow.closeEvent. Doing this per
+    disconnect is the churn get_harvester exists to avoid.
+    """
+    teardown_cam(_SHARED_HARVESTER, None)
+
+
+def _forget_shared_harvester(harvester: Harvester) -> None:
+    """Drop the module reference if *harvester* is the shared one.
+
+    Stops get_harvester() from later handing out an already-reset object, which
+    is what would happen when a standalone script tears its camera down with
+    disconnect_cam().
+    """
+    global _SHARED_HARVESTER, _SHARED_HARVESTER_CTIS
+    if harvester is _SHARED_HARVESTER:
+        _SHARED_HARVESTER = None
+        _SHARED_HARVESTER_CTIS = ()
+
+
+def _device_list_satisfies(harvester: Harvester, search_key) -> bool:
+    """Whether the cached device list can already resolve *search_key*.
+
+    Used to skip h.update(): a re-enumeration puts discovery traffic on every
+    interface, and it used to run on every single connect even though the
+    startup scan had just enumerated the very same devices.
+    """
+    devices = harvester.device_info_list
+    if not devices:
+        return False
+    if search_key is None:
+        return True
+    if isinstance(search_key, int):
+        return -len(devices) <= search_key < len(devices)
+    if isinstance(search_key, dict):
+        return any(
+            all(
+                value == getattr(device, key, None)
+                for key, value in search_key.items()
+            )
+            for device in devices
+        )
+    return False
+
 
 # Well-known GenTL producer install locations of the common SDKs (checked in
 # addition to GENICAM_GENTL64_PATH, e.g. for a tarball that was never
@@ -68,60 +165,79 @@ def load_cti_envvar() -> list[str]:
     return ctis
 
 
-def find_cti_for_camera(source: str, ctis: list[str]) -> str:
-    """Return the GenTL producer that enumerates the camera named *source*.
-
-    With several producers installed (GigE + USB + simulator), the first one
-    cannot know about every device; pick the one that actually lists the
-    selected display name. Falls back to the first producer (the historic
-    behaviour) when nothing matches.
-    """
-    for cti in ctis:
-        try:
-            names = [
-                device["display_name"]
-                for device in return_harvester_cameras([cti])
-            ]
-        except Exception as e:
-            logging.warning(f"Could not enumerate cameras via {cti}: {e}")
-            continue
-        if source in names:
-            return cti
-    return ctis[0]
-
-
 def setup_cam(
-    cti: str,
+    cti: str | list[str],
     height: int | None = None,
     width: int | None = None,
     fps: int = 30,
     blacklevel: int = 125,
     exposure: int = 999,
+    search_key: int | dict | None = None,
 ) -> tuple[Harvester, ImageAcquirer]:
     """Set the camera up using the Harvester API.
 
     Args:
-        cti (str): The path to the GenTL Producer file.
+        cti (str | list[str]): Path(s) to the GenTL Producer file(s).
         height (int): The height of the image.
         width (int): The width of the image.
         fps (int): The frames per second.
         blacklevel (int): The black level of the image.
         exposure (int): The exposure time of the image.
+        search_key (int | dict | None): Which enumerated device to open - a
+            list index, or a device-info filter such as
+            ``{"display_name": ...}``. Defaults to the first device.
 
     Returns:
         tuple[Harvester, ImageAcquirer]: The Harvester object and the ImageAcquirer object.
 
+    Raises:
+        Exception: whatever the producer raised. The camera is always released
+            before the exception leaves this function.
     """
-    # Create a Harvester object:
-    h = Harvester()
-    # Load a GenTL Producer; you can load many more if you want to:
-    h.add_file(cti)
-    # Enumerate the available devices that GenTL Producers can handle:
-    h.update()
+    ctis = [cti] if isinstance(cti, str) else list(cti)
+    # The process-wide Harvester, with the producers already loaded.
+    h = get_harvester(ctis)
+    ia = None
+    try:
+        # Enumerate only when the cached device list cannot serve the request.
+        if not _device_list_satisfies(h, search_key):
+            h.update()
 
-    # Select a target device and create an ImageAcquire object
-    ia = h.create(0)
+        # Select a target device and create an ImageAcquire object. Opening
+        # index 0 regardless of what the user picked meant a second camera (or
+        # a camera behind a second producer) silently opened the wrong device -
+        # possibly one another process already holds.
+        ia = h.create(0 if search_key is None else search_key)
+        _configure_cam(ia, height, width, fps, blacklevel, exposure)
+        warmup_cam(ia)
+    except Exception:
+        # Never let a half-configured camera escape. An ImageAcquirer dropped
+        # without destroy() keeps the device exclusively opened, and possibly
+        # acquiring, so the next connect fails or blocks on a device the
+        # producer still considers in use - the "I have to replug the cable"
+        # symptom, produced entirely in software.
+        # Release the device but keep the shared harvester: the producers stay
+        # loaded for the next attempt, and nothing else is using this one.
+        logging.exception("Camera setup failed; releasing the device")
+        teardown_cam(None, ia)
+        raise
+    return h, ia
 
+
+def _configure_cam(
+    ia: ImageAcquirer,
+    height: int | None,
+    width: int | None,
+    fps: int,
+    blacklevel: int,
+    exposure: int,
+) -> None:
+    """Apply the node-map settings to a fresh camera and start acquisition.
+
+    Split out of setup_cam so the whole create -> configure -> warm-up sequence
+    fits under a single try/except there: every step below can raise, and a
+    camera left open after a failure wedges the next connect.
+    """
     nodes = ia.remote_device.node_map
     profile = detect_profile(nodes)
     logging.info(f"Using camera feature profile: {profile.key}")
@@ -191,23 +307,34 @@ def setup_cam(
         nodes.BlackLevel.value = blacklevel
     except Exception as e:
         logging.warning(f"Could not set BlackLevel to {blacklevel}: {e}")
-    warmup_cam(ia)
-    return h, ia
 
 
-def warmup_cam(ia, frames: int = 10) -> None:
+def warmup_cam(ia, frames: int = 10, timeout: float = FETCH_TIMEOUT_S) -> None:
     """Warm up the camera by collecting a few frames.
 
     Args:
         ia (ImageAcquirer): The ImageAcquirer object.
         frames (int): The number of frames to collect.
+        timeout (float): Seconds to wait for each frame.
 
     Returns:
         None
+
+    Raises:
+        TimeoutError: if the camera delivers no frame within *timeout*. This
+            runs on the GUI thread during connect, so it must never be allowed
+            to wait indefinitely - an unbounded fetch here was a permanent,
+            uncancellable freeze of the whole application.
     """
     logging.info(f"Warming up camera by collecting {frames} frames.")
-    for _ in range(frames):
-        buffer = ia.fetch()
+    for i in range(frames):
+        buffer = ia.try_fetch(timeout=timeout)
+        if buffer is None:
+            raise TimeoutError(
+                f"The camera delivered no frame within {timeout}s while warming "
+                f"up ({i} of {frames} collected). It is most likely waiting for "
+                f"a trigger, or the stream cannot get through (packet size / MTU)."
+            )
         buffer.queue()
 
 def setup_webcam(idx: int) -> VideoCapture:
@@ -234,13 +361,13 @@ def return_harvester_cameras(ctis: list[str]) -> list[dict]:
     Returns:
         list[dict]: A list of dictionaries containing the properties of the cameras.
     """
-    h = Harvester()
-    [h.add_file(cti) for cti in ctis]
+    # The shared Harvester, so the startup scan loads each producer once and
+    # the connect that follows reuses both the producers and this very device
+    # list - instead of unloading them here and enumerating all over again.
+    h = get_harvester(ctis)
     # Enumerate the available devices that GenTL Producers can handle:
     h.update()
-    devices = [cam.property_dict for cam in h.device_info_list]
-    h.reset()
-    return devices
+    return [cam.property_dict for cam in h.device_info_list]
 
 def get_camera_indices() -> list[int]:
     """Get the indices of the first 10 cameras that are detectable by OpenCV.
@@ -254,10 +381,62 @@ def get_camera_indices() -> list[int]:
             cap = VideoCapture(i)
         except cv2.error:
             continue
-        if cap.read()[0]:
-            arr.append(i)
+        try:
+            if cap.read()[0]:
+                arr.append(i)
+        finally:
+            # Release every probe, not only the ones that answered. The
+            # release() used to sit inside the `if`, so the nine indices that
+            # did not respond leaked their V4L2 handles and kept those devices
+            # busy for the rest of the session - and this runs again on every
+            # rescan.
             cap.release()
     return arr
+
+
+def teardown_cam(h: Harvester | None, ia: ImageAcquirer | None) -> None:
+    """Release a camera and unload its GenTL producer, best effort.
+
+    Each step is guarded on its own: a raising ia.stop() must not skip
+    ia.destroy(), and a raising ia.destroy() must not skip h.reset(). Skipping
+    any of them leaves the device exclusively opened or the producer loaded,
+    which is exactly what makes the *next* connect hang.
+
+    Callers must make sure no thread is still inside a fetch() on ``ia``:
+    resetting the harvester under an in-flight fetch unloads the producer out
+    from under it (see VideoThread.close).
+
+    Args:
+        h (Harvester | None): The Harvester object, if any.
+        ia (ImageAcquirer | None): The ImageAcquirer object, if any.
+
+    Returns:
+        None
+    """
+    if ia is not None:
+        try:
+            logging.debug("teardown: stopping acquisition")
+            ia.stop()
+        except Exception as e:
+            logging.debug(f"Error stopping camera during teardown: {e}")
+        try:
+            logging.debug("teardown: destroying the image acquirer")
+            ia.destroy()
+        except Exception as e:
+            logging.warning(f"Error destroying camera during teardown: {e}")
+    if h is not None:
+        _forget_shared_harvester(h)
+        try:
+            # This unloads the GenTL producer library. If the app ever hangs
+            # here, the log stops after this line: some vendor producers keep
+            # threads or device handles alive across a reset and do not
+            # survive being unloaded and reloaded per connect.
+            logging.debug("teardown: resetting the harvester (unloads the producer)")
+            h.reset()
+        except Exception as e:
+            logging.warning(f"Error resetting harvester during teardown: {e}")
+    logging.debug("teardown: done")
+
 
 def disconnect_cam(h: Harvester, ia: ImageAcquirer) -> None:
     """Disconnect the camera.
@@ -269,9 +448,7 @@ def disconnect_cam(h: Harvester, ia: ImageAcquirer) -> None:
     Returns:
         None
     """
-    ia.stop()
-    ia.destroy()
-    h.reset()
+    teardown_cam(h, ia)
 
 def get_webcam_image(cap: VideoCapture) -> np.ndarray:
     """Get an image from the webcam.
@@ -522,22 +699,28 @@ def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
         np.ndarray: The image as a numpy array.
     """
     with IA_LOCK:
-        with ia.fetch() as buffer:
-            if buffer:
-                component = buffer.payload.components[0]
-                # See component_to_grayscale8: Mono8 stays a plain copy, while
-                # 10/12/16-bit, Bayer and color formats are converted to a
-                # grayscale uint8 frame here so the whole app (display,
-                # recording, export) only ever deals with natural (h, w).
-                img = component_to_grayscale8(component)
-            else:  # If no buffer is available, return a black image
-                img = np.zeros(
-                    (
-                        ia.remote_device.node_map.Height.value,
-                        ia.remote_device.node_map.Width.value,
-                    ),
-                    dtype=np.uint8,
-                )
+        buffer = ia.try_fetch(timeout=FETCH_TIMEOUT_S)
+        if buffer is None:
+            # Timed out instead of hanging: a camera that stops delivering
+            # degrades to a black live view the user can still disconnect from,
+            # rather than freezing the app with IA_LOCK held.
+            logging.warning(
+                f"No frame within {FETCH_TIMEOUT_S}s; showing a black image"
+            )
+            return np.zeros(
+                (
+                    ia.remote_device.node_map.Height.value,
+                    ia.remote_device.node_map.Width.value,
+                ),
+                dtype=np.uint8,
+            )
+        with buffer:
+            component = buffer.payload.components[0]
+            # See component_to_grayscale8: Mono8 stays a plain copy, while
+            # 10/12/16-bit, Bayer and color formats are converted to a
+            # grayscale uint8 frame here so the whole app (display,
+            # recording, export) only ever deals with natural (h, w).
+            img = component_to_grayscale8(component)
     return img
 
 
@@ -553,21 +736,28 @@ def _harvester_frame_into(ia: ImageAcquirer, out: np.ndarray) -> None:
         out (np.ndarray): The output buffer of shape (height, width).
     """
     with IA_LOCK:
-        with ia.fetch() as buffer:
-            if buffer:
-                component = buffer.payload.components[0]
-                if component.data_format in ("Mono8", "Mono8Signed"):
-                    # Fast path: a single linear copy, no intermediate array.
-                    np.copyto(
-                        out,
-                        np.frombuffer(component.data, dtype=np.uint8).reshape(
-                            component.height, component.width
-                        ),
-                    )
-                else:
-                    np.copyto(out, component_to_grayscale8(component))
-            else:  # If no buffer is available, record a black frame
-                out.fill(0)
+        buffer = ia.try_fetch(timeout=FETCH_TIMEOUT_S)
+        if buffer is None:
+            # Bounded, so a camera that stops delivering aborts the recording
+            # instead of hanging the GUI thread. Raising rather than writing a
+            # black frame is deliberate: a silent black gap in the middle of a
+            # recording is worse than a loud failure.
+            raise TimeoutError(
+                f"The camera delivered no frame within {FETCH_TIMEOUT_S}s "
+                f"while recording."
+            )
+        with buffer:
+            component = buffer.payload.components[0]
+            if component.data_format in ("Mono8", "Mono8Signed"):
+                # Fast path: a single linear copy, no intermediate array.
+                np.copyto(
+                    out,
+                    np.frombuffer(component.data, dtype=np.uint8).reshape(
+                        component.height, component.width
+                    ),
+                )
+            else:
+                np.copyto(out, component_to_grayscale8(component))
 
 def get_remote_nodes(ia: ImageAcquirer) -> dict:
     """Get all nodes and their values from the camera.
@@ -617,17 +807,31 @@ def record_harvester_frames(
     # frame (~10 ms at 2048x2048), which capped recording well below the
     # camera's nominal frame rate.
     frames = np.empty((n_frames, height, width), dtype=np.uint8)
-    ia.start()
-    for i in trange(n_frames):
-        _harvester_frame_into(ia, frames[i])
-        if preview is not None:
-            preview(frames[i])
-        if progress is not None:
-            if n_frames == 1:
-                progress.setValue(1)
-            else:
-                progress.setValue(i)
-    ia.stop()
+    # Hold IA_LOCK for the whole start->fetch loop->stop sequence, not just the
+    # individual fetches: start()/stop() are state-changing GenTL calls on the
+    # shared device, and leaving them unlocked let a still-running VideoThread
+    # fetch() interleave with them (see ui.on_btn_acquire_clicked). IA_LOCK is
+    # reentrant, so _harvester_frame_into's own per-frame lock nests fine here.
+    with IA_LOCK:
+        ia.start()
+        try:
+            for i in trange(n_frames):
+                _harvester_frame_into(ia, frames[i])
+                if preview is not None:
+                    preview(frames[i])
+                if progress is not None:
+                    if n_frames == 1:
+                        progress.setValue(1)
+                    else:
+                        progress.setValue(i)
+        finally:
+            # Stop on every exit, including a fetch timeout. A camera left
+            # acquiring keeps filling buffers nobody drains, and the next
+            # start() would then run against an already-started device.
+            try:
+                ia.stop()
+            except Exception as e:
+                logging.warning(f"Error stopping camera after recording: {e}")
     return frames
 
 def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:

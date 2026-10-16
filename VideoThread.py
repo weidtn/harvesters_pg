@@ -51,47 +51,94 @@ class VideoThread(QtCore.QThread):
         elif "Webcam" in self.source:
             self.cap = cam.setup_webcam(int(self.source.split(" ")[1]))
         else:
+            if not ctis:
+                raise RuntimeError(
+                    "No GenTL producer (*.cti) available; set "
+                    "GENICAM_GENTL64_PATH or pick one via "
+                    "File > Select GenTL Producer."
+                )
+            # Hand over every known producer and select by display name. Using
+            # ctis[0] with device index 0 ignored the source the user picked,
+            # so a second camera - or one behind a second producer - silently
+            # opened the wrong device, possibly one already held elsewhere.
             self.harvester, self.cap = cam.setup_cam(
-                cti=cam.find_cti_for_camera(self.source, ctis)
+                cti=ctis, search_key={"display_name": self.source}
             )
 
     def _stop_and_join(self) -> None:
         """Signal the run loop to exit and wait for the worker thread to finish.
 
-        Unblocks a fetch() waiting on the camera first, then joins. Only after
-        the worker has actually exited is it safe to stop/destroy the camera,
-        otherwise teardown races the driver's DMA buffers and can hang the machine.
+        ia.stop() does NOT reliably unblock a fetch() that is already blocked
+        waiting for a frame in another thread: harvesters' fetch() wait loop
+        never checks is_acquiring(), so a worker stuck between frames can stay
+        blocked well past stop() returning. We still call stop() (it's the
+        best available nudge and is a no-op if the camera isn't acquiring),
+        but the join below is what actually determines whether the worker
+        exited - callers must not assume teardown is safe just because this
+        method returned.
         """
         self._run_flag = False
-        if not self.isRunning():
-            return
-        # Unblock a fetch() that is waiting for a frame, then join.
+        # Stop acquisition regardless of whether the worker thread ever
+        # started: setup_cam() leaves a freshly connected Harvester camera
+        # acquiring even before Start is pressed.
         if type(self.cap) is ImageAcquirer:
             try:
                 self.cap.stop()
             except Exception as e:
                 logging.debug(f"Error stopping camera while joining thread: {e}")
+        if not self.isRunning():
+            return
         deadline = time.monotonic() + 10.0
         while self.isRunning() and time.monotonic() < deadline:
             self.wait(100)
         if self.isRunning():
             logging.warning("VideoThread worker did not stop within 10s")
 
-    def __del__(self) -> None:
+    def close(self) -> None:
+        """Stop the worker and release the camera. Safe to call repeatedly.
+
+        This teardown used to live in __del__, which handed its timing to
+        CPython's refcounting and cyclic GC: the device could stay exclusively
+        opened long after the UI said "disconnected", so a quick reconnect ran
+        into a camera the producer still held. Callers release the camera by
+        calling this explicitly (see MainWindow.disconnect_video).
+        """
+        logging.debug("close(): stopping acquisition and joining the worker")
         self._stop_and_join()
-        if type(self.cap) is cv2.VideoCapture:
-            self.cap.release()
-        elif type(self.cap) is None:
+        if self.isRunning():
+            # Free nothing the stuck worker may still be inside. Resetting the
+            # harvester unloads the GenTL producer out from under an in-flight
+            # fetch(); releasing a VideoCapture frees buffers out from under an
+            # in-flight read(). Either one can crash the process or leave the
+            # device wedged. Leak the handles and log loudly instead.
+            logging.warning(
+                "VideoThread worker still running at teardown; leaking the "
+                "camera handles instead of releasing them out from under the "
+                "stuck call."
+            )
+            return
+        cap, self.cap = self.cap, None
+        # Drop the reference without resetting: the Harvester is shared for the
+        # whole session (see cam.get_harvester), so unloading its producers per
+        # disconnect is exactly the churn we are avoiding. MainWindow.closeEvent
+        # releases it via cam.release_harvester().
+        self.harvester = None
+        if cap is None:
             logging.debug("Cap was none")
+        elif type(cap) is cv2.VideoCapture:
+            cap.release()
         else:
-            # Only teardown the camera once the worker has actually exited, so we
-            # never destroy DMA buffers while the producer is still streaming.
-            if self.cap is not None and not self.isRunning():
-                self.cap.stop()
-                self.cap.destroy()
-            if self.harvester is not None:
-                self.harvester.reset()
-                self.harvester = None
+            cam.teardown_cam(None, cap)
+
+    def __del__(self) -> None:
+        # Backstop only. Finalizers run at unpredictable times and swallow
+        # exceptions, so nothing may depend on this; close() is the real
+        # teardown and has already run on the normal path, which leaves this a
+        # cheap no-op.
+        try:
+            self.close()
+        except Exception as e:
+            logging.debug(f"Error during VideoThread finalization: {e}")
 
     def run(self) -> None:
         """Capture video frames and emit the frame to the main thread."""
@@ -105,16 +152,37 @@ class VideoThread(QtCore.QThread):
                     frame = self.image_func(self.cap)
                 if frame is not None:
                     self.change_pixmap_signal.emit(frame)
-                time.sleep(1/30) # 30 fps
             except Exception as e:
-                print(e)
+                logging.warning(f"Error while capturing a frame: {e}")
+            # Outside the try on purpose. With the sleep inside it, any error
+            # from image_func skipped the pacing and turned this into a tight
+            # loop: it pegged a core, flooded the log, and cycled IA_LOCK fast
+            # enough to starve the GUI thread of it.
+            time.sleep(1 / 30)  # 30 fps
 
 
     def stop(self) -> None:
         self._stop_and_join()
 
-    def _start(self) -> None:
+    def _start(self) -> bool:
+        """Start acquisition and the worker thread.
+
+        Returns:
+            bool: False if the previous worker is still running, in which case
+                nothing was started. stop() can time out without the worker
+                actually exiting (see _stop_and_join), and calling start() on
+                the ImageAcquirer that worker is still fetching from means two
+                concurrent state changes on one device - precisely the producer
+                corruption IA_LOCK exists to prevent.
+        """
+        if self.isRunning():
+            logging.warning(
+                "The worker from the previous run has not stopped; refusing to "
+                "start acquisition a second time."
+            )
+            return False
         self._run_flag = True
         if type(self.cap) is ImageAcquirer:
             self.cap.start()
         super().start()
+        return True
