@@ -16,6 +16,48 @@ It is possible to record video. The frames can be inspected in the main window a
 * Replay
 It is possible to load a h5 file and show the video, click on File and open to do so.
 
+* Raw-PHX alternative (phx_ui.py)
+~ui.py~ streams through the GenTL producer (Harvester) for every frame,
+the whole time it is connected. On this rig's Active Silicon FireBird
+frame grabber, that GenTL/GenCP control-plane traffic is what correlates
+with a confirmed hardware defect that can hard-lock the whole machine -
+see the git history of ~ui.py~ and the investigation docs referenced
+there. Sustained acquisition through the vendor's raw PHX C API never
+triggered it in the same testing.
+
+~phx_ui.py~ is a second, from-scratch program with the same
+connect/live-view/record/save workflow, but it drives all actual
+acquisition through the raw PHX C API (~libphxapi-x86_64.so~ via
+~ctypes~, see ~phx_cam.py~) instead of streaming through the GenTL
+producer. There is no generic "every GenICam node is an editable field"
+settings panel in this program - that is what let a user reach the
+crash-inducing CoaXPress link-config registers from ~ui.py~'s Settings
+window.
+
+Exposure, gain and black level are editable while connected. Each change
+closes the raw-PHX board, runs one short GenICam session to write the
+new value, and reopens the board - raw PHX and the GenTL producer
+contend for the same handle, so there is no way to change a camera
+register without releasing the raw-PHX side first. That is bounded to
+explicit user actions (tabbing out of a field, releasing the
+black-level slider), not continuous, but it is a real instance of the
+GenTL-churn pattern the RMA investigation correlates with the hardware
+fault - see ~phx_cam.py~'s module docstring. Resolution stays
+connect-time-only.
+
+Measured 2026-09-21: looping plain connect/disconnect (no streaming, no
+settings changes) crashes the machine either way - ~ui.py~ survived 4
+cycles, ~phx_ui.py~ crashed on the first. Connecting always needs one real
+GenICam round trip, so this program is not a fix for that specific
+workload. What is demonstrated crash-free, repeatedly, in the same
+testing: staying connected and streaming, recording, and reconfiguring
+settings live. See ~stress_ui.py~/~stress_phx.py~ for the reproducer.
+
+Run with:
+#+begin_src
+uv run phx_ui.py
+#+end_src
+
 * TODO Add configuration file
 Configuration files (probably .ini) should be read at the beginning, so default values can be set and saved.
 

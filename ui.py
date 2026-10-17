@@ -31,6 +31,24 @@ from genicam.genapi import (
     ICommand,
 )
 
+# CoaXPress physical-link-training controls. fill_settings() below builds an
+# editable widget for every GenICam node it can enumerate, with no
+# allow/blocklist - which is how a generic Settings click path reaches raw
+# link-training registers a normal camera GUI would never expose. Writing to
+# either of these forces the frame grabber to retrain/reconfigure the
+# physical CoaXPress link speed/connection count. On this rig that has
+# produced a fatal, unrecoverable PCIe fault on the frame grabber's root port
+# (whole-machine hard lockup, hardware watchdog reboot required) - live
+# capture in harvesters_pg.log at 2026-09-21 15:13:48-49 ("Setting
+# ConnectionConfig to CONNECTION4SPEED12500", nothing logged after). See
+# ~/ASL-RMA-evidence-FBD-4XCXP12.md and ~/Desktop/handoff.md for the driver-
+# and hardware-level investigation; harvesters_pg itself is not the root
+# cause, but it should not be the thing that lets a user reach the trigger.
+_UNSAFE_NODES = {
+    "ConnectionConfig",
+    "CxpLinkConfiguration",
+}
+
 
 class SettingsWindow(QtWidgets.QMainWindow):
     """Settings window to change camera settings.
@@ -70,6 +88,9 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.teardown()
         nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
         for node in dir(nodemap):
+            if node in _UNSAFE_NODES:
+                logging.debug(f"Not exposing unsafe node {node} in the settings panel")
+                continue
             self.settings[node] = {
                 "label": QtWidgets.QLabel(text=node),
                 "widget": None,

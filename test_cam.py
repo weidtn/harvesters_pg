@@ -922,6 +922,55 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertLess(elapsed, 1.0)
         widget.blockSignals.assert_not_called()  # poll skipped, not performed
 
+    def test_unsafe_cxp_link_nodes_are_never_exposed(self):
+        """ConnectionConfig/CxpLinkConfiguration must never reach the panel.
+
+        Writing either through this panel forces the frame grabber to
+        retrain the physical CoaXPress link speed/connection count. On the
+        hardware this runs against, that produced a fatal, unrecoverable
+        PCIe fault on the frame grabber's root port - a whole-machine hard
+        lockup, not a Python exception - captured live in harvesters_pg.log
+        at 2026-09-21 15:13:48 ("Setting ConnectionConfig to
+        CONNECTION4SPEED12500", nothing logged after). fill_settings() must
+        skip these before ever reading them, not merely avoid building a
+        widget for them.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import ui
+
+        accessed = []
+
+        class FakeNodeMap:
+            ConnectionConfig = "unsafe"
+            CxpLinkConfiguration = "unsafe"
+            ExposureTime = "safe"
+
+            def __dir__(self):
+                return ["ConnectionConfig", "CxpLinkConfiguration", "ExposureTime"]
+
+            def __getattribute__(self, name):
+                if name in ("ConnectionConfig", "CxpLinkConfiguration", "ExposureTime"):
+                    accessed.append(name)
+                return object.__getattribute__(self, name)
+
+        window = _shared_main_window()
+        try:
+            panel = window.ui.settings_window
+            window.videothread = MagicMock()
+            with patch("ui.cam.get_harvester_nodemap", return_value=FakeNodeMap()):
+                panel.fill_settings()
+            self.assertNotIn("ConnectionConfig", panel.settings)
+            self.assertNotIn("CxpLinkConfiguration", panel.settings)
+            # Not merely unexposed: never even read, so the panel issues no
+            # GenCP transaction at all for the unsafe nodes.
+            self.assertNotIn("ConnectionConfig", accessed)
+            self.assertNotIn("CxpLinkConfiguration", accessed)
+            # A normal node on the same nodemap is unaffected.
+            self.assertIn("ExposureTime", accessed)
+        finally:
+            _reset_main_window(window)
+
 
 class ConnectDisconnectTests(unittest.TestCase):
     """MainWindow's connect/disconnect path."""

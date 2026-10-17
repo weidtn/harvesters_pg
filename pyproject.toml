@@ -19,7 +19,8 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["ui", "MainWindow", "cam", "acquire", "VideoThread", "liveview", "settings", "importexport", "frametime", "saving", "reset", "get_attributes", "attributes", "harvester_test"]
+py-modules = ["ui", "MainWindow", "cam", "acquire", "VideoThread", "liveview", "settings", "importexport", "frametime", "saving", "reset", "get_attributes", "attributes", "harvester_test", "phx_cam", "phx_video_thread", "phx_ui"]
 
 [project.scripts]
 harvesters_pg = "ui:main"
+phx_pg = "phx_ui:main"
