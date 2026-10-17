@@ -12,15 +12,22 @@ Available cameras should be automatically detected on startup. GenTL Producers (
 
 Because feature node names differ between camera families (SFNC ~ExposureTime~ vs. classic Allied Vision ~ExposureTimeAbs~, etc.), the UI resolves them through small per-camera profiles in [[file:camera_profiles.py][camera_profiles.py]]. The matching profile is auto-detected from the node map on connect; to support a new camera family, add one ~CameraProfile~ entry there. Cameras exposing ~ExposureAuto~ / ~GainAuto~ get an ~Auto~ checkbox on the right of the exposure/gain rows. The FPS spinbox cap follows the connected camera's reported maximum frame rate.
 
+The image size applied in the settings panel is stored per camera (vendor/model/serial) in =~/.config/harvesters_pg/camera_resolution.json= and re-applied when that camera connects again.
+
 * Recording
 It is possible to record video. The frames can be inspected in the main window and saved as image sequence or in a h5 file.
 
-h5 files carry the recording's metadata as root attributes: the camera settings, ~fps~, ~timestamp~ (local start time of the recording, ~%Y%m%d%H%M%S~) and ~recording_id~, a random UUID. Every file saved from one recording, also after loading it again, carries the same ~recording_id~. The tracking scripts copy these attributes into the trajectory files, so results can be matched to their recording.
+h5 files carry the recording's metadata as root attributes: the camera settings, ~fps~, ~timestamp~ (local start time of the recording, ~%Y%m%d%H%M%S~) and ~recording_id~, a random UUID. The camera settings are read right after the recording, so a recording can still be saved after disconnecting the camera. Every file saved from one recording, also after loading it again, carries the same ~recording_id~. The tracking scripts copy these attributes into the trajectory files, so results can be matched to their recording. The datasets ~timestamps~ and ~frame_counters~ are only written for cameras that superimpose the Mikrotron info fields on Mono8 frames.
+
+A recording that would not fit into the available RAM is refused before it starts (filling the RAM would make the whole machine swap). If the camera stops delivering in the middle of a recording, the frames recorded until then are kept. While a recording runs, the window cannot be closed and the camera controls are locked.
 
 The optional fields /Particles/ and /Objective/ next to the frame count take the lab ids of the particle batches (comma-separated) and of the objective, as used for their entries in NOMAD. They are saved with each recording as attributes ~particles~ and ~objective~; NOMAD links the video and its tracks to these entries. Loading a recording shows its own values in the fields.
 
 * Replay
 It is possible to load a h5 file and show the video, click on File and open to do so.
+
+* Troubleshooting
+The program logs to ~harvesters_pg.log~ in the working directory (~--log-file~ to change it, ~-v~ / ~-vv~ for more detail). If it crashes inside a GenTL producer, the stack traces of all threads are written to the same file, so attach it when reporting a crash or freeze.
 
 * TODO Add configuration file
 Configuration files (probably .ini) should be read at the beginning, so default values can be set and saved.

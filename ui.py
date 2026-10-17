@@ -3,6 +3,8 @@
 All user interaction with the ui is handled in here and communicated to the modle (cam.py)
 """
 
+import contextlib
+import faulthandler
 import os
 
 import sys
@@ -15,13 +17,14 @@ import uuid
 
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
+import cv2
 import cam
 import camera_profiles
 import importexport
 import logging
 from MainWindow import Ui_MainWindow
 from settings import Ui_SettingsWindow
-from VideoThread import VideoThread
+from VideoThread import VideoThread, has_stuck_workers
 import argparse
 from genicam.genapi import (
     IInteger,
@@ -32,6 +35,45 @@ from genicam.genapi import (
     AccessException,
     ICommand,
 )
+
+# GenICam commands the app drives itself. Executed from the settings panel
+# they change the acquisition state behind harvesters' back (after a manual
+# AcquisitionStart, ImageAcquirer.is_acquiring() stays False, so a disconnect
+# skips AcquisitionStop and closes the device while it streams), or reset the
+# device under handles that are still open.
+_APP_MANAGED_COMMANDS = frozenset(
+    {"AcquisitionStart", "AcquisitionStop", "AcquisitionAbort", "DeviceReset"}
+)
+
+
+class _InputBlocker(QtCore.QObject):
+    """Event filter that discards mouse and key input aimed at one window.
+
+    Dialogs are separate windows and keep working, so an error box shown
+    while the filter is installed can still be answered.
+    """
+
+    _INPUT_EVENTS = frozenset(
+        {
+            QtCore.QEvent.Type.MouseButtonPress,
+            QtCore.QEvent.Type.MouseButtonRelease,
+            QtCore.QEvent.Type.MouseButtonDblClick,
+            QtCore.QEvent.Type.KeyPress,
+            QtCore.QEvent.Type.KeyRelease,
+            QtCore.QEvent.Type.Wheel,
+        }
+    )
+
+    def __init__(self, window: QtWidgets.QWidget) -> None:
+        super().__init__(window)
+        self._window = window
+
+    def eventFilter(self, obj, event) -> bool:
+        return (
+            event.type() in self._INPUT_EVENTS
+            and isinstance(obj, QtWidgets.QWidget)
+            and obj.window() is self._window
+        )
 
 
 class SettingsWindow(QtWidgets.QMainWindow):
@@ -60,6 +102,32 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.settings = {}
         self.timer = QtCore.QTimer(self)
         self._timer_connected: bool = False
+        # Set on connect; the rows are built the first time the panel is shown.
+        self._needs_fill: bool = False
+
+    def request_fill(self) -> None:
+        """Build the rows for the newly connected camera when the panel is shown.
+
+        Building them on every connect enumerated the whole node map on the GUI
+        thread (hundreds of nodes, type/min/max/symbolic reads) for a panel
+        that usually is never opened.
+        """
+        self.teardown()
+        self._needs_fill = True
+        if self.isVisible():
+            self._fill_now()
+
+    def _fill_now(self) -> None:
+        try:
+            self.fill_settings()
+        except Exception as e:
+            logging.exception("Could not populate the camera settings")
+            self.teardown()
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Settings unavailable",
+                f"The camera settings could not be read:\n\n{e}",
+            )
 
     def fill_settings(self):
         """Fill the settings window' with the camera settings."""
@@ -71,6 +139,29 @@ class SettingsWindow(QtWidgets.QMainWindow):
         # node-map polls, and the GUI never got idle time back.
         self.teardown()
         nodemap = cam.get_harvester_nodemap(self.mainwindow.videothread.cap)
+        # Live view may be running: never enumerate the node map concurrently
+        # with the worker's access to the device.
+        with cam.IA_LOCK:
+            self._build_rows(nodemap)
+        for field in self.settings:
+            self.ui.formLayout.addRow(
+                self.settings[field]["label"],
+                self.settings[field]["widget"],
+            )
+        # The poll starts from showEvent, not here. Starting it on connect
+        # meant the app read the whole node map over GenCP twice a second from
+        # the moment a camera was connected - forever, whether or not anyone
+        # had this panel open. Continuous register traffic for zero user value.
+        if self.isVisible():
+            self.start_polling()
+
+    def _build_rows(self, nodemap) -> None:
+        # A wheel notch over a writable combo or spin box changed the camera
+        # (e.g. TriggerMode=On, after which no frame ever arrives). Pass wheel
+        # events on to the scroll area instead.
+        def ignore_wheel(widget):
+            widget.wheelEvent = lambda event: event.ignore()
+
         for node in dir(nodemap):
             self.settings[node] = {
                 "label": QtWidgets.QLabel(text=node),
@@ -80,6 +171,8 @@ class SettingsWindow(QtWidgets.QMainWindow):
             try:
                 if type(getattr(nodemap, node)) is IInteger:
                     widget = QtWidgets.QSpinBox(readOnly=True)
+                    # One write when editing is done, not one per keystroke.
+                    widget.setKeyboardTracking(False)
                     try:
                         widget.setMinimum(getattr(nodemap, node).min)
                         widget.setMaximum(getattr(nodemap, node).max)
@@ -92,16 +185,28 @@ class SettingsWindow(QtWidgets.QMainWindow):
                         widget.setText(str(getattr(nodemap, node).value))
                     except AttributeError:
                         logging.debug(f"AttributeError for {node}")
-                    widget.wheelEvent = lambda e: None
+                    ignore_wheel(widget)
                     self.settings[node]["widget"] = widget
                 elif type(getattr(nodemap, node)) is IFloat:
-                    widget = QtWidgets.QDoubleSpinBox()
+                    widget = QtWidgets.QDoubleSpinBox(readOnly=True)
+                    # Qt's default range is 0..99.99: larger values were shown
+                    # clamped, and the next edit wrote the clamped value back.
+                    try:
+                        float_node = getattr(nodemap, node)
+                        widget.setRange(float(float_node.min), float(float_node.max))
+                    except Exception:
+                        widget.setRange(-1e15, 1e15)
+                    widget.setDecimals(4)
+                    # One write when editing is done, not one per keystroke.
+                    widget.setKeyboardTracking(False)
+                    ignore_wheel(widget)
                     widget.valueChanged.connect(
                         lambda v, node=node: self.update_node(node, v)
                     )
                     self.settings[node]["widget"] = widget
                 elif type(getattr(nodemap, node)) is IEnumeration:
                     widget = QtWidgets.QComboBox(enabled=False)
+                    ignore_wheel(widget)
                     widget.addItems(getattr(nodemap, node)._get_symbolics())
                     widget.currentTextChanged.connect(
                         lambda value, node=node: self.update_node(node, value)
@@ -115,11 +220,20 @@ class SettingsWindow(QtWidgets.QMainWindow):
                     self.settings[node]["widget"] = widget
                 elif type(getattr(nodemap, node)) is IString:
                     widget = QtWidgets.QLineEdit()
+                    # Bind node and widget now: a bare lambda read the loop
+                    # variables when the edit finished, i.e. the LAST node and
+                    # widget of the loop, so every string edit went to the
+                    # wrong node with the wrong text.
                     widget.editingFinished.connect(
-                        lambda: self.update_node(node, widget.text())
+                        lambda node=node, widget=widget: self.update_node(
+                            node, widget.text()
+                        )
                     )
                     self.settings[node]["widget"] = widget
                 elif type(getattr(nodemap, node)) is ICommand:
+                    if node in _APP_MANAGED_COMMANDS:
+                        self.settings.pop(node)
+                        continue
                     widget = QtWidgets.QPushButton(text="Execute")
                     widget.pressed.connect(lambda node=node: self.execute_command(node))
                     self.settings[node]["widget"] = widget
@@ -136,22 +250,16 @@ class SettingsWindow(QtWidgets.QMainWindow):
                 logging.debug(f"Exception {e} for {node}")
                 self.settings.pop(node)
                 continue
-        for field in self.settings:
-            self.ui.formLayout.addRow(
-                self.settings[field]["label"],
-                self.settings[field]["widget"],
-            )
-        # The poll starts from showEvent, not here. Starting it on connect
-        # meant the app read the whole node map over GenCP twice a second from
-        # the moment a camera was connected - forever, whether or not anyone
-        # had this panel open. Continuous register traffic for zero user value.
-        if self.isVisible():
-            self.start_polling()
+        self._needs_fill = False
 
     def start_polling(self) -> None:
         """Poll the node map every 500 ms, and refresh once immediately."""
         if not self.settings:
             return  # nothing built yet: no camera connected
+        if self.mainwindow.is_recording:
+            # The recording loop pumps events while it owns the device; a poll
+            # from inside it would read the node map between two fetches.
+            return
         if not self._timer_connected:
             self.timer.timeout.connect(self.update_fields)
             self._timer_connected = True
@@ -160,9 +268,12 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.timer.start()
 
     def showEvent(self, event) -> None:
-        """Start polling when the panel appears on screen."""
+        """Build the rows if needed and start polling when the panel appears."""
         super().showEvent(event)
-        self.start_polling()
+        if self._needs_fill and self.mainwindow.videothread is not None:
+            self._fill_now()  # starts polling itself
+        else:
+            self.start_polling()
 
     def hideEvent(self, event) -> None:
         """Stop polling as soon as the panel is off screen."""
@@ -182,6 +293,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         while self.ui.formLayout.rowCount():
             self.ui.formLayout.removeRow(0)
         self.settings = {}
+        self._needs_fill = False
 
     def execute_command(self, node):
         """Execute a command on the camera.
@@ -208,10 +320,9 @@ class SettingsWindow(QtWidgets.QMainWindow):
             return
         # Serialize node_map reads against the worker's fetch() so the poll never
         # accesses the producer concurrently with a live fetch (not thread-safe).
-        # Never *wait* for the lock, though: the worker holds it for a whole
-        # fetch, so blocking here froze the GUI thread for as long as the camera
-        # took to deliver - and forever when the fetch itself hung. A skipped
-        # poll only means the fields refresh 500 ms later, which is invisible.
+        # Never *wait* for the lock, though: a poll that queues behind the
+        # device only stalls the GUI thread. A skipped poll only means the
+        # fields refresh 500 ms later, which is invisible.
         if not cam.IA_LOCK.acquire(blocking=False):
             logging.debug("Camera busy; skipping this settings poll")
             return
@@ -228,7 +339,14 @@ class SettingsWindow(QtWidgets.QMainWindow):
                             False
                         ) if access_mode == 4 else widget.setReadOnly(True)
                     elif type(widget) is QtWidgets.QDoubleSpinBox:
-                        widget.setValue(getattr(nodemap, node).value)
+                        value = float(getattr(nodemap, node).value)
+                        # A node's range can move (e.g. ExposureTime max with
+                        # the frame rate); widen instead of showing it clamped.
+                        if not widget.minimum() <= value <= widget.maximum():
+                            widget.setRange(
+                                min(value, widget.minimum()), max(value, widget.maximum())
+                            )
+                        widget.setValue(value)
                         widget.setReadOnly(
                             False
                         ) if access_mode == 4 else widget.setReadOnly(True)
@@ -262,17 +380,20 @@ class SettingsWindow(QtWidgets.QMainWindow):
         """Update the camera settings based on the settings window."""
         logging.debug(f"Setting {node} to {value}")
         profile = self.mainwindow.profile
+        # The main-window mirrors are integer widgets, and PyQt6 rejects a
+        # float in QSpinBox/QSlider.setValue with a TypeError - which ended
+        # this slot before the value ever reached the camera.
         if node == profile.frame_rate_node:
-            self.mainwindow.ui.sb_fps.setValue(value)
+            self.mainwindow.ui.sb_fps.setValue(int(round(value)))
             self.mainwindow.on_fps_changed()
         elif node == profile.exposure_node:
-            self.mainwindow.ui.sb_exposure.setValue(value)
+            self.mainwindow.ui.sb_exposure.setValue(int(round(value)))
             self.mainwindow.on_exposure_changed()
         elif node == profile.gain_node:
-            self.mainwindow.ui.sb_analog_gain.setValue(int(value))
+            self.mainwindow.ui.sb_analog_gain.setValue(int(round(value)))
             self.mainwindow.on_analog_gain_changed()
         elif node == "BlackLevel":
-            self.mainwindow.ui.hsli_black_level.setValue(value)
+            self.mainwindow.ui.hsli_black_level.setValue(int(round(value)))
             self.mainwindow.on_blacklevel_changed()
         cam.set_attribute(self.mainwindow.videothread.cap, node, value)
         self.update_fields()
@@ -300,6 +421,10 @@ class MainWindow(QtWidgets.QMainWindow):
         super(MainWindow, self).__init__(*args, **kwargs)
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        # True while on_btn_acquire_clicked records. The recording loop pumps
+        # the event loop for its preview, so everything that could re-enter the
+        # camera (or close the window) has to check this.
+        self.is_recording: bool = False
         # Quirks of the connected camera family (node names); replaced with
         # the detected profile in setup_settings() once a Harvester camera
         # connects. The settings window reads it from here as well.
@@ -324,6 +449,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Identity of self.recording: every file it is saved to carries both.
         self.recording_id: str | None = None
         self.recording_timestamp: str | None = None  # start, %Y%m%d%H%M%S
+        # Everything else saved with self.recording (camera attributes, fps,
+        # timestamps, frame counters), captured when it was recorded or loaded
+        # from its file. save() used to read these from whatever camera was
+        # connected at save time - or fail when none was.
+        self.recording_metadata: dict = {}
         self.ctis: list[str] = []
         self.filename = "."
 
@@ -356,6 +486,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.sb_exposure.editingFinished.connect(self.on_exposure_changed)
         self.ui.sb_analog_gain.valueChanged.connect(self.on_analog_gain_changed)
         self.ui.hsli_black_level.valueChanged.connect(self.on_blacklevel_changed)
+        # One camera write per edit, not one per keystroke or per pixel of a
+        # slider drag: each write is a GenCP transaction through the grabber.
+        self.ui.sb_analog_gain.setKeyboardTracking(False)
+        self.ui.hsli_black_level.setTracking(False)
+        self.ui.hsli_black_level.sliderMoved.connect(
+            lambda value: self.ui.lbl_black_level_current.setText(str(value))
+        )
 
         # Auto exposure / auto gain toggles, appended on the right of their
         # rows. Hidden until a camera that has the respective auto feature is
@@ -467,6 +604,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Disconnect the current camera before rescanning for sources.",
             )
             return
+        if has_stuck_workers():
+            # Re-enumerating destroys every ImageAcquirer of the producer and
+            # reloads it - under the call the old worker is still stuck in.
+            QtWidgets.QMessageBox.information(
+                self,
+                "Camera busy",
+                "The previous camera has not been released yet. Try again once "
+                "it has (see the status bar).",
+            )
+            return
 
         previous = self.ui.cb_source.currentText()
         # Rebuild from scratch. This runs again whenever a .cti is added, and
@@ -503,6 +650,15 @@ class MainWindow(QtWidgets.QMainWindow):
         GenTL producer is never destroyed while still streaming (a whole-system
         freeze cause).
         """
+        if self.is_recording:
+            # The recording loop is still on the stack - it pumps events for
+            # its preview, which is how this close got here. Tearing the camera
+            # down now destroyed it under the loop and discarded the recording.
+            event.ignore()
+            self.statusBar().showMessage(
+                "Recording in progress - close the window once it has finished.", 10000
+            )
+            return
         if self.videothread:
             self.disconnect_video()
         else:
@@ -510,63 +666,100 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.settings_window.teardown()
         self.ui.settings_window.close()
         # Only here: this unloads the GenTL producers, which disconnect_video
-        # deliberately leaves alone.
-        cam.release_harvester()
+        # deliberately leaves alone. Not while a worker is stuck inside one:
+        # unloading it under that call is the crash teardown exists to avoid.
+        if has_stuck_workers():
+            cam.abandon_harvester()
+        else:
+            cam.release_harvester()
         event.accept()
+
+    @contextlib.contextmanager
+    def _dropping_queued_input(self):
+        """Run a blocking operation, then drop the input queued meanwhile.
+
+        Connect and disconnect block the GUI thread. Clicks made in that time
+        are queued and delivered afterwards, to whatever the buttons mean by
+        then: a second click on Connect arrived as Disconnect and tore the
+        camera down again right away (open/start/stop/destroy churn on the
+        frame grabber). Those clicks now go to a filter that discards them.
+        """
+        app = QtWidgets.QApplication.instance()
+        blocker = _InputBlocker(self)
+        app.installEventFilter(blocker)
+        try:
+            yield
+        finally:
+            try:
+                app.processEvents()  # delivers the queued clicks to the filter
+            finally:
+                app.removeEventFilter(blocker)
 
     def connect_video(self) -> None:
         """Read the video source and start the video thread."""
-        if not self.videothread:
-            self.source = self.ui.cb_source.currentText()
-            logging.info(f"Connecting to {self.source!r}")
-            try:
-                videothread = VideoThread(self.source, self.ctis)
-            except Exception as e:
-                # An exception escaping a Qt slot reaches qFatal and aborts the
-                # process - possibly with the camera half-open. Report it and
-                # stay disconnected instead; setup_cam has already released
-                # whatever it managed to open.
-                logging.exception(f"Could not connect to {self.source}")
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Could not connect",
-                    f"Connecting to {self.source!r} failed:\n\n{e}",
-                )
-                return
-            self.videothread = videothread
-            self.videothread.change_pixmap_signal.connect(self.update_image)
-            self.ui.pb_live.setDisabled(False)
-            self.ui.pb_acquire.setDisabled(False)
-            self.ui.pb_connect.setText("Disconnect")
-            self.ui.pb_connect.clicked.disconnect()
-            self.ui.pb_connect.clicked.connect(self.disconnect_video)
-            self.ui.cb_source.setDisabled(True)
-            # Stop acquisition before reading the node map. setup_cam leaves
-            # the camera streaming, so the settings read-out and the saved-AOI
-            # re-apply below used to run against a live device whose buffers
-            # nobody was draining. pause_video() also sets the status to orange.
-            self.pause_video()
-            try:
-                self.on_source_connected()
-            except Exception as e:
-                # Same qFatal concern as above, but here the camera is already
-                # open: keep the connection, drop the settings panel, and tell
-                # the user rather than aborting the process.
-                logging.exception("Could not populate the camera settings")
-                self.ui.settings_window.teardown()
-                self.ui.settings.setHidden(True)
-                self.ui.pb_settings.setDisabled(True)
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Settings unavailable",
-                    f"The camera connected, but its settings could not be "
-                    f"read:\n\n{e}",
-                )
-            logging.info(f"Connected to {self.source!r}")
+        if self.videothread:
+            return
+        if has_stuck_workers():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Camera busy",
+                "The previous camera has not been released yet. Try again once "
+                "it has (see the status bar).",
+            )
+            return
+        with self._dropping_queued_input():
+            self._connect_video()
+
+    def _connect_video(self) -> None:
+        self.source = self.ui.cb_source.currentText()
+        logging.info(f"Connecting to {self.source!r}")
+        try:
+            videothread = VideoThread(self.source, self.ctis)
+        except Exception as e:
+            # Report it and stay disconnected; setup_cam has already released
+            # whatever it managed to open. (pyqtgraph replaces sys.excepthook,
+            # so an escaping exception only reached stderr and left the user
+            # with a button that silently did nothing.)
+            logging.exception(f"Could not connect to {self.source}")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not connect",
+                f"Connecting to {self.source!r} failed:\n\n{e}",
+            )
+            return
+        self.videothread = videothread
+        self.videothread.change_pixmap_signal.connect(self.update_image)
+        self.ui.pb_live.setDisabled(False)
+        self.ui.pb_acquire.setDisabled(False)
+        self.ui.pb_connect.setText("Disconnect")
+        self.ui.pb_connect.clicked.disconnect()
+        self.ui.pb_connect.clicked.connect(self.disconnect_video)
+        self.ui.cb_source.setDisabled(True)
+        # Puts the UI into the paused state (status orange). The camera is
+        # connected without acquiring; live view or a recording starts it.
+        self.pause_video()
+        try:
+            self.on_source_connected()
+        except Exception as e:
+            # The camera is already open: keep the connection, drop the
+            # settings panel, and tell the user.
+            logging.exception("Could not populate the camera settings")
+            self.ui.settings_window.teardown()
+            self.ui.settings.setHidden(True)
+            self.ui.pb_settings.setDisabled(True)
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Settings unavailable",
+                f"The camera connected, but its settings could not be "
+                f"read:\n\n{e}",
+            )
+        logging.info(f"Connected to {self.source!r}")
 
     def disconnect_video(self) -> None:
         """Stop the video thread, release the camera, and reset the UI."""
-        if self.videothread:
+        if not self.videothread:
+            return
+        with self._dropping_queued_input():
             # Stop polling the node map before the device goes away, then
             # release it explicitly. Dropping the reference and leaving the
             # teardown to __del__ kept the camera opened for an unpredictable
@@ -574,7 +767,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # held.
             logging.info(f"Disconnecting from {self.source!r}")
             self.ui.settings_window.teardown()
-            self.videothread.close()
+            worker = self.videothread
+            worker.close()
             self.videothread = None
             logging.info(f"Disconnected from {self.source!r}")
             self.is_running = False
@@ -599,13 +793,47 @@ class MainWindow(QtWidgets.QMainWindow):
                 spinbox.setEnabled(True)
             self.profile = camera_profiles.SFNC_DEFAULT
             self.ui.pb_settings.setDisabled(True)
+            if worker.isRunning():
+                self._hold_until_released(worker)
+
+    def _hold_until_released(self, worker: VideoThread) -> None:
+        """Keep camera access closed until a stuck worker has really exited.
+
+        close() keeps such a worker's camera handles (freeing them under the
+        stuck call is a use-after-free) and releases them when it finishes. A
+        connect or rescan before that would re-enumerate or reset the producer
+        under the stuck call, or block on the device it still holds.
+        """
+        logging.warning("The capture worker is stuck; camera access is blocked until it exits")
+        for widget in (self.ui.pb_connect, self.ui.cb_source):
+            widget.setEnabled(False)
+        self.ui.actionSelect_GenTLProducer.setEnabled(False)
+        self.statusBar().showMessage(
+            "The camera driver has not returned yet; waiting for it to release the camera..."
+        )
+        worker.finished.connect(self._on_stuck_worker_released)
+
+    def _on_stuck_worker_released(self) -> None:
+        if has_stuck_workers():
+            return
+        for widget in (self.ui.pb_connect, self.ui.cb_source):
+            widget.setEnabled(True)
+        self.ui.actionSelect_GenTLProducer.setEnabled(True)
+        self.statusBar().showMessage("The previous camera has been released.", 10000)
 
     def start_video(self) -> None:
         if not self.videothread:
             raise ValueError("Video thread not started")
-        self.ui.pb_save.setDisabled(True)
         # starts camera acquisition and the worker thread once
-        if not self.videothread._start():
+        try:
+            started = self.videothread._start()
+        except Exception as e:
+            logging.exception("Could not start the live view")
+            QtWidgets.QMessageBox.critical(
+                self, "Could not start", f"Starting the live view failed:\n\n{e}"
+            )
+            return
+        if not started:
             # The previous worker never exited (a pause that timed out). Do not
             # pretend the live view restarted: a second start() on the same
             # device while the old fetch() is still in flight is exactly the
@@ -618,6 +846,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "reconnect the camera.",
             )
             return
+        # No saving while live: save() runs on the GUI thread, and every frame
+        # emitted meanwhile would queue up in memory until it returned.
+        self.ui.pb_save.setDisabled(True)
         self.is_running = True
         self.ui.pb_live.setText("Pause")
         self.ui.lbl_status.setStyleSheet("color: green;")
@@ -629,6 +860,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running = False
         self.ui.pb_live.setText("Start")
         self.ui.lbl_status.setStyleSheet("color: orange;")
+        # Start disabled Save; an unsaved recording must be saveable again.
+        self.ui.pb_save.setEnabled(self.recording.size > 0)
 
     def toggle_video(self) -> None:
         if not self.is_running:
@@ -652,7 +885,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.lbl_img_minmax.setText(
             f"Pixelvalue Min: {disp.T[1::4,::4].min()} - Max: {disp.T[1::4,::4].max()}"
         )
-        if not self.ui.pb_save_frame.isEnabled():
+        # Not during a recording: its dialog would stall the recording loop.
+        if not self.is_recording and not self.ui.pb_save_frame.isEnabled():
             self.ui.pb_save_frame.setDisabled(False)
         if frame.ndim == 3:
             self.ui.recording.setHidden(False)
@@ -664,12 +898,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_btn_acquire_clicked(self) -> None:
         self.pause_video()
         if self.videothread is not None and self.videothread.isRunning():
-            # pause_video() -> VideoThread.stop() can time out (10s) without
-            # actually stopping the worker: ia.stop() does not reliably
-            # unblock a fetch() already blocked inside the device (see
-            # VideoThread._stop_and_join's docstring). Recording now would
-            # start a second, concurrent start()/fetch()/stop() sequence on
-            # the same ImageAcquirer the stuck worker is still using, so
+            # pause_video() -> VideoThread.stop() only gives up on the worker
+            # when a call inside the driver does not return. Recording now
+            # would start a second, concurrent start()/fetch()/stop() sequence
+            # on the same ImageAcquirer the stuck worker is still using, so
             # refuse instead of silently racing it.
             logging.warning(
                 "Video thread did not stop in time; aborting recording to "
@@ -684,49 +916,82 @@ class MainWindow(QtWidgets.QMainWindow):
                 "the camera.",
             )
             return
-        self.Image.clear()
-        self.ui.pb_save.setDisabled(True)
-        # Disable actions that touch the camera / re-enter the event loop while
-        # recording: the loop below pumps events (so preview frames repaint), and
-        # a re-entered connect/start/acquire would race fetch() on the device.
-        self.ui.pb_acquire.setDisabled(True)
-        self.ui.pb_connect.setDisabled(True)
-        self.ui.pb_live.setDisabled(True)
-        # A mid-recording AOI change would violate the preallocated (n, h, w)
-        # buffer; hold the Apply button (and the camera keep-alive) until done.
-        self.ui.pb_res_apply.setDisabled(True)
-        # The recording loop pumps the event loop after every frame while
-        # holding IA_LOCK. IA_LOCK is reentrant, so the settings poll would
-        # re-acquire it on this very thread and read the node map from inside
-        # the fetch loop - a lock cannot protect against the GUI thread
-        # re-entering itself. Suspend the poll, and the panel's own widgets,
-        # for the duration instead.
+        # Let go of the previous recording before allocating the next one;
+        # otherwise both are resident at once.
+        self._release_display()
+        self.recording = np.array([])
+        self.recording_metadata = {}
+        n_frames = int(self.ui.sb_frames.text())
+        with self._recording_mode():
+            try:
+                self.acquire(n_frames, self.ui.progressBar)
+            except cam.RecordingInterrupted as e:
+                # acquire() kept the frames recorded before the camera stopped.
+                logging.warning(f"Recording stopped early: {e}")
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Recording incomplete",
+                    f"{e}\n\nThe frames recorded until then were kept.",
+                )
+            except Exception as e:
+                logging.exception("Recording failed")
+                QtWidgets.QMessageBox.critical(
+                    self, "Recording failed", f"The recording was aborted:\n\n{e}"
+                )
+        self.ui.pb_save.setEnabled(self.recording.size > 0)
+        if self.recording.size > 0:
+            self.update_image(self.recording)
+
+    @contextlib.contextmanager
+    def _recording_mode(self):
+        """Hold everything that could touch the camera while recording.
+
+        The recording loop pumps the event loop after every frame (so the
+        preview repaints) while it owns the device. Any control left enabled
+        re-enters it from inside the loop: closing the window tore the camera
+        down under the loop, File > Open stopped acquisition mid-recording,
+        Settings restarted the node-map poll between two fetches, and the
+        fps/exposure/gain controls wrote the camera mid-recording (the saved
+        fps then no longer matched). A dialog opened from inside the loop would
+        stall it while the camera keeps streaming.
+        """
+        widgets = (
+            self.ui.pb_acquire,
+            self.ui.pb_connect,
+            self.ui.pb_live,
+            self.ui.pb_res_apply,
+            self.ui.pb_settings,
+            self.ui.pb_save,
+            self.ui.pb_save_frame,
+            self.ui.cb_source,
+            self.ui.settings,
+            self.ui.actionOpen,
+            self.ui.actionSelect_GenTLProducer,
+            self.ui.actionExit,
+        )
+        was_enabled = {widget: widget.isEnabled() for widget in widgets}
         settings_window = self.ui.settings_window
-        was_polling = settings_window.timer.isActive()
         settings_window.timer.stop()
         settings_window.setEnabled(False)
-        self.recording = np.array([])
-        n_frames = int(self.ui.sb_frames.text())
+        for widget in widgets:
+            widget.setEnabled(False)
+        self.is_recording = True
         try:
-            self.acquire(n_frames, self.ui.progressBar)
-        except Exception as e:
-            # A fetch timeout aborts the recording; letting it escape the slot
-            # would take the process down with qFatal.
-            logging.exception("Recording failed")
-            QtWidgets.QMessageBox.critical(
-                self, "Recording failed", f"The recording was aborted:\n\n{e}"
-            )
-            return
+            yield
         finally:
-            self.ui.pb_acquire.setDisabled(False)
-            self.ui.pb_connect.setDisabled(False)
-            self.ui.pb_live.setDisabled(False)
-            self.ui.pb_res_apply.setDisabled(False)
+            self.is_recording = False
+            for widget, enabled in was_enabled.items():
+                widget.setEnabled(enabled)
             settings_window.setEnabled(True)
-            if was_polling:
-                settings_window.timer.start()
-        self.ui.pb_save.setDisabled(False)
-        self.update_image(self.recording)
+            if settings_window.isVisible():
+                settings_window.start_polling()
+
+    def _release_display(self) -> None:
+        """Clear the view and let go of the array it shows."""
+        self.Image.clear()
+        # pyqtgraph's ImageView.clear() keeps imageDisp - a view of the
+        # previous recording - so that whole array stayed resident.
+        self.Image.imageDisp = None
 
     def toggle_settings(self) -> None:
         if self.ui.settings.isHidden():
@@ -760,39 +1025,68 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents()
 
         started = datetime.datetime.now()
-        if self.source == "random":
-            imgs = cam.record_random_frames(n_frames, progressbar, preview=preview)
-        elif "Webcam" in self.source:
-            imgs = cam.record_webcam_frames(
-                self.videothread.cap, n_frames, progressbar, preview=preview
-            )
-        else:
-            imgs = cam.record_harvester_frames(
-                self.videothread.cap, n_frames, progressbar, preview=preview
-            )
-        self.recording = imgs
+        try:
+            if self.source == "random":
+                imgs = cam.record_random_frames(n_frames, progressbar, preview=preview)
+            elif "Webcam" in self.source:
+                imgs = cam.record_webcam_frames(
+                    self.videothread.cap, n_frames, progressbar, preview=preview
+                )
+            else:
+                imgs = cam.record_harvester_frames(
+                    self.videothread.cap, n_frames, progressbar, preview=preview
+                )
+        except cam.RecordingInterrupted as e:
+            if len(e.frames) == 0:
+                raise
+            self._store_recording(e.frames, started)
+            raise
+        self._store_recording(imgs, started)
+
+    def _store_recording(self, frames: np.ndarray, started: datetime.datetime) -> None:
+        """Keep a fresh recording together with the metadata that belongs to it.
+
+        The camera attributes are read now, right after recording, so the file
+        saved later describes this recording - not the camera's state (or a
+        different camera) at save time.
+        """
+        self.recording = frames
         self.recording_id = str(uuid.uuid4())
         self.recording_timestamp = started.strftime("%Y%m%d%H%M%S")
-        self.timestamps = [cam.extract_timestamp(img) / 25_000_000 for img in imgs]
-        self.frame_counters = [cam.extract_frame_counter(img) for img in imgs]
+        metadata: dict = {}
+        cap = self.videothread.cap if self.videothread else None
+        if self.source == "random":
+            metadata["fps"] = 30
+        elif isinstance(cap, cv2.VideoCapture):
+            metadata["fps"] = cam.get_webcam_fps(cap)
+        elif isinstance(cap, cam.ImageAcquirer):
+            metadata.update(cam.get_all_attributes_harvesters(cap))
+            metadata["fps"] = self.ui.sb_fps.value()
+            # Only the Mikrotron info fields carry a counter and a timestamp in
+            # the first pixels; on any other camera those are image content.
+            if cam.info_fields_enabled(cap):
+                metadata["timestamps"] = [
+                    cam.extract_timestamp(frame) / 25_000_000 for frame in frames
+                ]
+                metadata["frame_counters"] = [
+                    cam.extract_frame_counter(frame) for frame in frames
+                ]
+        self.recording_metadata = metadata
         self.filename = "."
 
-    def save(self) -> None:
-        """Save the recorded frames to a hdf5 file."""
-        # Get filename with a file dialog
-        filename, filter = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save File",
-            "",
-            "HDF5 Files (*.h5);;Images (*.png);;Images (*.jpg)",
-        )
+    def _metadata_for_saving(self) -> dict:
+        """The recording's own metadata plus its identity and the lab ids."""
         if self.recording_id is None:  # loaded from a file saved without an id
             self.recording_id = str(uuid.uuid4())
-        metadata: dict = {
-            "recording_id": self.recording_id,
-            "timestamp": self.recording_timestamp
-            or datetime.datetime.now().strftime("%Y%m%d%H%M%S"),
-        }
+        metadata = dict(self.recording_metadata)
+        metadata["recording_id"] = self.recording_id
+        metadata["timestamp"] = (
+            self.recording_timestamp or datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        )
+        # The fields win (open_file shows a loaded file's values there), so an
+        # id the user cleared is dropped instead of resurrected from the file.
+        metadata.pop("particles", None)
+        metadata.pop("objective", None)
         particles = ", ".join(
             p.strip() for p in self.ui.le_particles.text().split(",") if p.strip()
         )
@@ -801,38 +1095,60 @@ class MainWindow(QtWidgets.QMainWindow):
         objective = self.ui.le_objective.text().strip()
         if objective:
             metadata["objective"] = objective
-        # TODO: Better handling, especially if the video was loaded from a file
-        if type(self.videothread.cap) is cam.VideoCapture:
-            metadata["fps"] = cam.get_webcam_fps(self.videothread.cap)
-        elif self.source == "random":
-            metadata["fps"] = 30
-        elif type(self.videothread.cap) is cam.ImageAcquirer:
-            nodemap = cam.get_all_attributes_harvesters(self.videothread.cap)
-            [metadata.update({k: v}) for k, v in nodemap.items()]
-            metadata["fps"] = self.ui.sb_fps.value()
-            metadata["timestamps"] = self.timestamps
-            metadata["frame_counters"] = self.frame_counters
-        if filter == "HDF5 Files (*.h5)":
-            if ".h5" not in filename:
-                filename += ".h5"
-            importexport.save_frames_to_h5(
-                self.recording,
-                filename,
-                metadata=metadata,
-                progressbar=self.ui.progressBar,
+        return metadata
+
+    def save(self) -> None:
+        """Save the current recording (recorded or loaded) to a file."""
+        if self.recording.size == 0:
+            QtWidgets.QMessageBox.information(
+                self, "Nothing to save", "Record or open a recording first."
             )
-        elif filter == "Images (*.png)":
-            if ".png" not in filename:
-                filename += ".png"
-            importexport.save_frames_to_png(
-                self.recording, filename, progressbar=self.ui.progressBar
+            return
+        filename, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save File",
+            "",
+            "HDF5 Files (*.h5);;Images (*.png);;Images (*.jpg)",
+        )
+        if not filename:
+            return  # cancelled
+        suffix = {"Images (*.png)": ".png", "Images (*.jpg)": ".jpg"}.get(
+            selected_filter, ".h5"
+        )
+        if not filename.lower().endswith(suffix):
+            filename += suffix
+            # The dialog's overwrite prompt covered the name as typed, not this.
+            if os.path.exists(filename) and (
+                QtWidgets.QMessageBox.question(
+                    self, "Overwrite?", f"{filename} already exists. Overwrite it?"
+                )
+                != QtWidgets.QMessageBox.StandardButton.Yes
+            ):
+                return
+        try:
+            if suffix == ".h5":
+                importexport.save_frames_to_h5(
+                    self.recording,
+                    filename,
+                    metadata=self._metadata_for_saving(),
+                    progressbar=self.ui.progressBar,
+                )
+            elif suffix == ".png":
+                importexport.save_frames_to_png(
+                    self.recording, filename, progressbar=self.ui.progressBar
+                )
+            else:
+                importexport.save_frames_to_jpg(
+                    self.recording, filename, progressbar=self.ui.progressBar
+                )
+        except Exception as e:
+            logging.exception(f"Saving the recording to {filename} failed")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Saving failed",
+                f"The recording could not be saved to {filename}:\n\n{e}",
             )
-        elif filter == "Images (*.jpg)":
-            if ".jpg" not in filename:
-                filename += ".jpg"
-            importexport.save_frames_to_jpg(
-                self.recording, filename, progressbar=self.ui.progressBar
-            )
+            return
         logging.info(f"Saved recording to {filename}")
         self.filename = filename
 
@@ -858,7 +1174,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.setup_resolution_settings()  # populate + re-apply saved image size
             self.ui.pb_settings.setDisabled(False)
             self.ui.settings.setHidden(False)
-            self.ui.settings_window.fill_settings()
+            # Built when the panel is first shown, not on every connect.
+            self.ui.settings_window.request_fill()
 
     def on_fps_changed(self) -> None:
         """Update the fps based on the settings."""
@@ -1016,7 +1333,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 logging.warning(f"Resolution {node_name} not available: {e}")
                 sb.setDisabled(True)
-        cfg = cam.load_resolution_config()
+        cfg = cam.load_resolution_config(cam.camera_config_key(ia))
         if isinstance(cfg.get("width"), int) and isinstance(cfg.get("height"), int):
             w, h, ox, oy = cam.set_resolution(
                 ia,
@@ -1054,9 +1371,17 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.ui.sb_res_width.setValue(w)
         self.ui.sb_res_height.setValue(h)
-        cam.save_resolution_config(
-            {"width": w, "height": h, "offset_x": ox, "offset_y": oy}
-        )
+        resolution = {"width": w, "height": h, "offset_x": ox, "offset_y": oy}
+        try:
+            cam.save_resolution_config(cam.camera_config_key(self.videothread.cap), resolution)
+        except OSError as e:
+            logging.warning(f"Could not save the resolution: {e}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Resolution not saved",
+                f"The image size was applied but could not be saved for the next "
+                f"connect:\n\n{e}",
+            )
         logging.info(f"Resolution set to {w}x{h}")
 
     def on_settings_pressed(self) -> None:
@@ -1064,23 +1389,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.settings_window.show()
 
     def open_file(self) -> None:
-        """Open a file dialog to load a video file."""
+        """Open a file dialog to load a recording from an h5 file."""
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open File", "", "HDF5 Files (*.h5 *.hdf5);;All Files (*)"
+        )
+        if not filename:
+            return  # cancelled: leave the live view and the current recording alone
         if self.videothread:
             self.pause_video()
-            self.Image.clear()
-        filename, filter = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open File", "", "HDF5 Files (*.h5);;All Files (*)"
-        )
-        if filter == "HDF5 Files (*.h5)":
-            self.recording, self.metadata = importexport.load_frames_from_h5(
+        try:
+            # Whatever the filter said: an .h5 picked under "All Files" was
+            # silently not loaded before. A file that is not a recording fails
+            # here, with a message instead of a traceback on stderr.
+            recording, metadata = importexport.load_frames_from_h5(
                 filename, progressbar=self.ui.progressBar
             )
-            self.recording_id = self.metadata.get("recording_id")
-            self.recording_timestamp = self.metadata.get("timestamp")
-            # Show the loaded recording's own values, so that saving it again
-            # keeps them and does not stamp it with another recording's.
-            self.ui.le_particles.setText(str(self.metadata.get("particles", "")))
-            self.ui.le_objective.setText(str(self.metadata.get("objective", "")))
+        except Exception as e:
+            logging.exception(f"Could not open {filename}")
+            QtWidgets.QMessageBox.critical(
+                self, "Could not open", f"{filename} could not be opened:\n\n{e}"
+            )
+            return
+        self._release_display()
+        self.recording = recording
+        self.metadata = metadata
+        self.recording_id = metadata.get("recording_id")
+        self.recording_timestamp = metadata.get("timestamp")
+        # The file's own metadata goes with it when it is saved again, instead
+        # of the connected camera's attributes and the last recording's
+        # timestamps.
+        self.recording_metadata = {
+            k: v for k, v in metadata.items() if k not in ("recording_id", "timestamp")
+        }
+        # Show the loaded recording's own values, so that saving it again
+        # keeps them and does not stamp it with another recording's.
+        self.ui.le_particles.setText(str(metadata.get("particles", "")))
+        self.ui.le_objective.setText(str(metadata.get("objective", "")))
         self.update_image(self.recording)
         self.filename = filename
         self.ui.pb_save.setDisabled(False)
@@ -1096,11 +1440,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Disconnect the current camera before adding a GenTL producer.",
             )
             return
+        if has_stuck_workers():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Camera busy",
+                "The previous camera has not been released yet. Try again once "
+                "it has (see the status bar).",
+            )
+            return
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select GenTL Producer", "", "GenTL Producer (*.cti)"
         )
-        if filename and filename not in self.ctis:
-            self.ctis.append(filename)
+        if not filename or filename in self.ctis:
+            # Nothing new to load. A rescan reloads every producer and
+            # re-enumerates every interface, so do not run one for nothing.
+            return
+        self.ctis.append(filename)
         self.populate_video_sources()
 
     def on_histogram_checked(self) -> None:
@@ -1108,15 +1463,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.ImageView.getHistogramWidget().setHidden(not state)
 
     def save_current_frame(self) -> None:
-        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+        item = self.Image.getImageItem()
+        if item.image is None:
+            return
+        # Capture the frame shown when the button was pressed; live view keeps
+        # replacing it while the dialog is open.
+        item.render()
+        if item.qimage is None:
+            return
+        snapshot = item.qimage.copy()
+        filename, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save Image", "", "Image (*.png);;Image (*.jpg)"
         )
-        if filename != "" and self.Image.image is not None:
-            if ".png" not in filename:
-                filename += ".png"
-            if ".jpg" not in filename:
-                filename += ".jpg"
-            self.Image.getImageItem().save(filename)
+        if not filename:
+            return
+        # The old suffix logic appended both extensions, so 'x.png' was written
+        # as a JPEG named 'x.png.jpg'.
+        if Path(filename).suffix.lower() not in (".png", ".jpg", ".jpeg"):
+            filename += ".jpg" if "jpg" in selected_filter else ".png"
+        if not snapshot.save(filename):
+            QtWidgets.QMessageBox.critical(
+                self, "Saving failed", f"The frame could not be saved to {filename}."
+            )
 
     def on_play_clicked(self) -> None:
         self.Image.togglePause()
@@ -1140,14 +1508,24 @@ def configure_logging(verbose: int = 0, log_file: str = "harvesters_pg.log") -> 
     The thread name is in the format on purpose: when the app hangs, the last
     line tells you whether the GUI thread or the capture worker got there last.
     FileHandler flushes on every record, so nothing is lost to a hard freeze.
+    A crash inside a GenTL producer (SIGSEGV) leaves no Python traceback at
+    all, so faulthandler dumps every thread's stack into the same log first.
     """
     level = {0: logging.WARNING, 1: logging.INFO}.get(verbose, logging.DEBUG)
     fmt = "%(asctime)s - %(levelname)s - [%(threadName)s] %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
-    handler = logging.FileHandler(log_file)
+    try:
+        handler = logging.FileHandler(log_file)
+    except OSError as e:
+        # e.g. started from a read-only working directory: run without a file
+        # instead of not starting at all.
+        logging.warning(f"Cannot write the log file {log_file!r} ({e}); logging to the console only")
+        faulthandler.enable(all_threads=True)
+        return
     handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
     logging.getLogger().addHandler(handler)
+    faulthandler.enable(file=handler.stream, all_threads=True)
     logging.info(f"Logging to {Path(log_file).resolve()} at level {logging.getLevelName(level)}")
 
 

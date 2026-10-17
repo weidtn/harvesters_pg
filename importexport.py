@@ -5,6 +5,9 @@ import cv2
 from PyQt6.QtWidgets import QProgressBar
 import os
 import pathlib
+import re
+
+import cam
 
 
 def save_frames_to_h5(
@@ -28,38 +31,36 @@ def save_frames_to_h5(
         progressbar.setMaximum(0)
         progressbar.setValue(0)
         progressbar.setTextVisible(True)
-    with h5py.File(filename, "w") as f:
-        dset = f.create_dataset(
-            "frames",
-            data=frames,
-            compression="gzip",
-            compression_opts=complevel,
-        )
-        if "timestamps" in metadata:
+    # Work on a copy: popping the datasets out of the caller's dict removed
+    # them from it, so a second save of the same recording lost them.
+    metadata = dict(metadata)
+    try:
+        with h5py.File(filename, "w") as f:
             f.create_dataset(
-                "timestamps",
-                data=metadata["timestamps"],
+                "frames",
+                data=frames,
                 compression="gzip",
                 compression_opts=complevel,
             )
-            metadata.pop("timestamps")
-        if "frame_counters" in metadata:
-            f.create_dataset(
-                "frame_counters",
-                data=metadata["frame_counters"],
-                compression="gzip",
-                compression_opts=complevel,
-            )
-            metadata.pop("frame_counters")
-        for k, v in metadata.items():
-            try:
-                f.attrs.create(k, v)
-            except Exception as e:
-                pass
-    if progressbar is not None:
-        progressbar.setMaximum(1)
-        progressbar.setValue(1)
-        progressbar.setFormat("%p%")
+            for name in ("timestamps", "frame_counters"):
+                if name in metadata:
+                    f.create_dataset(
+                        name,
+                        data=metadata.pop(name),
+                        compression="gzip",
+                        compression_opts=complevel,
+                    )
+            for k, v in metadata.items():
+                try:
+                    f.attrs.create(k, v)
+                except Exception:
+                    pass
+    finally:
+        # Also on a failed write: the bar used to stay busy with "Saving...".
+        if progressbar is not None:
+            progressbar.setMaximum(1)
+            progressbar.setValue(1)
+            progressbar.setFormat("%p%")
 
 
 def create_path(filename: str) -> None:
@@ -76,68 +77,84 @@ def create_path(filename: str) -> None:
     return new_path
 
 
-def save_frames_to_png(
-    frames: np.ndarray, filename: str, progressbar: QProgressBar | None = None
-) -> None:
-    """Save frames to a png file.
+def _write_image(path: str, frame: np.ndarray) -> None:
+    if not cv2.imwrite(path, frame):
+        raise OSError(f"Could not write {path}")
 
-    Args:
-        frames (np.ndarray): The frames to save
-        filename (str): The name of the file to save the frames to
-        progressbar (QProgressBar): The progress bar to update
+
+def _remove_stale_frames(prefix: str, extension: str, n_frames: int) -> None:
+    """Delete numbered frames an earlier, longer export left in the folder.
+
+    Only files named exactly like this export's frames (<prefix>_<n>.<ext>)
+    with n beyond the new frame count are removed; otherwise the folder mixed
+    the new recording with the tail of an old one.
     """
-    # Save a single frame as a single image:
-    if ".png" not in filename:
-        filename += ".png"
+    pattern = re.compile(re.escape(os.path.basename(prefix)) + r"_(\d+)\." + extension + "$")
+    folder = os.path.dirname(prefix) or "."
+    for name in os.listdir(folder):
+        match = pattern.match(name)
+        if match and int(match.group(1)) >= n_frames:
+            os.remove(os.path.join(folder, name))
+
+
+def _save_frames_as_images(
+    frames: np.ndarray, filename: str, extension: str, progressbar: QProgressBar | None
+) -> None:
+    suffix = f".{extension}"
+    if suffix not in filename:
+        filename += suffix
     path = create_path(filename)
     new_filename = f"{path}/{filename.split('/')[-1]}"
+    # Save a single frame as a single image:
     if frames.ndim == 2:
-        cv2.imwrite(f"{new_filename}", frames)
+        _write_image(new_filename, frames)
         return
     if progressbar is not None:
         if len(frames) == 1:
             progressbar.setMaximum(2)
         else:
             progressbar.setMaximum(len(frames))
+    prefix = new_filename.split(suffix)[0]
     for i, frame in enumerate(frames):
-        cv2.imwrite(f"{new_filename.split('.png')[0]}_{i}.png", frame)
+        _write_image(f"{prefix}_{i}{suffix}", frame)
         if progressbar is not None:
             if len(frames) == 1:
                 progressbar.setValue(2)
             else:
                 progressbar.setValue(i)
+    _remove_stale_frames(prefix, extension, len(frames))
+
+
+def save_frames_to_png(
+    frames: np.ndarray, filename: str, progressbar: QProgressBar | None = None
+) -> None:
+    """Save frames to png files, one per frame, in a folder named after *filename*.
+
+    Args:
+        frames (np.ndarray): The frames to save
+        filename (str): The name of the file to save the frames to
+        progressbar (QProgressBar): The progress bar to update
+
+    Raises:
+        OSError: if an image could not be written.
+    """
+    _save_frames_as_images(frames, filename, "png", progressbar)
 
 
 def save_frames_to_jpg(
     frames: np.ndarray, filename: str, progressbar: QProgressBar | None = None
 ) -> None:
-    """Save frames to a png file.
+    """Save frames to jpg files, one per frame, in a folder named after *filename*.
 
     Args:
         frames (np.ndarray): The frames to save
         filename (str): The name of the file to save the frames to
         progressbar (QProgressBar): The progress bar to update
+
+    Raises:
+        OSError: if an image could not be written.
     """
-    # Save a single frame as a single image:
-    if ".jpg" not in filename:
-        filename += ".jpg"
-    path = create_path(filename)
-    new_filename = f"{path}/{filename.split('/')[-1]}"
-    if frames.ndim == 2:
-        cv2.imwrite(f"{new_filename}", frames)
-        return
-    if progressbar is not None:
-        if len(frames) == 1:
-            progressbar.setMaximum(2)
-        else:
-            progressbar.setMaximum(len(frames))
-    for i, frame in enumerate(frames):
-        cv2.imwrite(f"{new_filename.split('.jpg')[0]}_{i}.jpg", frame)
-        if progressbar is not None:
-            if len(frames) == 1:
-                progressbar.setValue(2)
-            else:
-                progressbar.setValue(i)
+    _save_frames_as_images(frames, filename, "jpg", progressbar)
 
 
 def load_frames_from_h5(
@@ -158,18 +175,24 @@ def load_frames_from_h5(
         progressbar.setFormat("Loading...")
         progressbar.setMaximum(0)
         progressbar.setValue(0)
-    with h5py.File(filename, "r") as f:
-        frames = f["frames"][:]
-        for k, v in f.attrs.items():  # written by save_frames_to_h5
-            metadata[k] = v
-        for k, v in f["frames"].attrs.items():
-            metadata[k] = v
-        if "timestamps" in f:
-            metadata["timestamps"] = f["timestamps"][:]
-        if "frame_counters" in f:
-            metadata["frame_counters"] = f["frame_counters"][:]
-    if progressbar is not None:
-        progressbar.setMaximum(1)
-        progressbar.setValue(1)
-        progressbar.setFormat("%p%")
+    try:
+        with h5py.File(filename, "r") as f:
+            dataset = f["frames"]
+            # Refuse before reading: a file larger than the free RAM would push
+            # the machine into swap while it loads.
+            cam.ensure_memory_for(dataset.size * dataset.dtype.itemsize, "file")
+            frames = dataset[:]
+            for k, v in f.attrs.items():  # written by save_frames_to_h5
+                metadata[k] = v
+            for k, v in dataset.attrs.items():
+                metadata[k] = v
+            if "timestamps" in f:
+                metadata["timestamps"] = f["timestamps"][:]
+            if "frame_counters" in f:
+                metadata["frame_counters"] = f["frame_counters"][:]
+    finally:
+        if progressbar is not None:
+            progressbar.setMaximum(1)
+            progressbar.setValue(1)
+            progressbar.setFormat("%p%")
     return frames, metadata

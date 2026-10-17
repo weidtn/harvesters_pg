@@ -18,8 +18,12 @@ Run:  .venv/bin/python -m unittest test_cam -v
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -98,20 +102,27 @@ class FrameOrientationTests(unittest.TestCase):
         self.assertEqual(cam._snap_to_increment(node, 2), 8)  # clamp to min
         self.assertEqual(cam._snap_to_increment(node, 99999), 4096)  # clamp to max
 
-    def test_resolution_config_roundtrip(self):
+    def test_resolution_config_is_kept_per_camera(self):
         original = cam.RESOLUTION_CONFIG_PATH
         cam.RESOLUTION_CONFIG_PATH = Path(__file__).parent / "test_res_config.json"
         try:
             cam.save_resolution_config(
-                {"width": 160, "height": 120, "offset_x": None, "offset_y": 4}
+                "Mikrotron/EoSens/1", {"width": 160, "height": 120, "offset_x": None, "offset_y": 4}
             )
+            cam.save_resolution_config("Allied/Mako/2", {"width": 640, "height": 480})
             self.assertEqual(
-                cam.load_resolution_config(),
+                cam.load_resolution_config("Mikrotron/EoSens/1"),
                 {"width": 160, "height": 120, "offset_y": 4},
             )
+            self.assertEqual(
+                cam.load_resolution_config("Allied/Mako/2"), {"width": 640, "height": 480}
+            )
+            # A camera that never saved one must not inherit another camera's AOI.
+            self.assertEqual(cam.load_resolution_config("Other/Model/3"), {})
         finally:
             cam.RESOLUTION_CONFIG_PATH.unlink(missing_ok=True)
             cam.RESOLUTION_CONFIG_PATH = original
+
 
 class CtiDiscoveryTests(unittest.TestCase):
     """GENICAM_GENTL64_PATH parsing and well-known-location fallback.
@@ -183,6 +194,33 @@ class _FakeComponent:
         self.height = height
 
 
+class _FakeBuffer:
+    """Stand-in for a fetched harvesters Buffer: a context manager whose exit
+    is the queue() that hands it back to the producer."""
+
+    def __init__(self, component, on_exit=None):
+        self.payload = SimpleNamespace(components=[component])
+        self._on_exit = on_exit
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self._on_exit is not None:
+            self._on_exit()
+
+
+def _mono8_buffer(value, width=2, height=2, on_exit=None):
+    data = np.full(width * height, value, np.uint8)
+    return _FakeBuffer(_FakeComponent("Mono8", data, width, height), on_exit=on_exit)
+
+
+def _stalled_fetch(timeout):
+    """What try_fetch does on a stream that delivers nothing: wait, then None."""
+    time.sleep(timeout)
+    return None
+
+
 class PixelFormatTests(unittest.TestCase):
     """Every delivered pixel format must become an owned uint8 (h, w).
 
@@ -229,22 +267,35 @@ class PixelFormatTests(unittest.TestCase):
             )
 
     def test_bayer8_demosaic_matches_cv2(self):
+        import cv2
+
         mosaic = (np.arange(8 * 8) * 7) % 256
         mosaic = mosaic.reshape(8, 8).astype(np.uint8)
+        # GenICam names the top-left 2x2 cell; OpenCV's matching codes are the
+        # explicit four-letter ones (its short names are shifted by one).
         for pattern, code in (
-            ("BayerGR8", "GR"),
-            ("BayerRG8", "RG"),
-            ("BayerGB8", "GB"),
-            ("BayerBG8", "BG"),
+            ("BayerGR8", cv2.COLOR_BayerGRBG2GRAY),
+            ("BayerRG8", cv2.COLOR_BayerRGGB2GRAY),
+            ("BayerGB8", cv2.COLOR_BayerGBRG2GRAY),
+            ("BayerBG8", cv2.COLOR_BayerBGGR2GRAY),
         ):
-            import cv2
-
-            expected = cv2.cvtColor(mosaic, getattr(cv2, f"COLOR_Bayer{code}2GRAY"))
             self.assertEqual(
                 cam.grayscale8_from_bytes(pattern, mosaic, 8, 8).tolist(),
-                expected.tolist(),
+                cv2.cvtColor(mosaic, code).tolist(),
                 pattern,
             )
+
+    def test_bayer_red_scene_is_weighted_as_red(self):
+        # BayerRG8: R at even rows/even columns, B at odd rows/odd columns.
+        red = np.zeros((8, 8), np.uint8)
+        red[0::2, 0::2] = 255
+        blue = np.zeros((8, 8), np.uint8)
+        blue[1::2, 1::2] = 255
+        red_luma = cam.grayscale8_from_bytes("BayerRG8", red, 8, 8).mean()
+        blue_luma = cam.grayscale8_from_bytes("BayerRG8", blue, 8, 8).mean()
+        # Luminance weighs red (0.299) far above blue (0.114). With OpenCV's
+        # shifted short names the two were swapped.
+        self.assertGreater(red_luma, 2 * blue_luma)
 
     def test_bayer10_16bit_demosaic(self):
         import cv2
@@ -253,12 +304,12 @@ class PixelFormatTests(unittest.TestCase):
         mosaic8 = (mosaic16 >> 2).astype(np.uint8)
         self.assertEqual(
             cam.grayscale8_from_bytes("BayerRG10", mosaic16, 8, 8).tolist(),
-            cv2.cvtColor(mosaic8, cv2.COLOR_BayerRG2GRAY).tolist(),
+            cv2.cvtColor(mosaic8, cv2.COLOR_BayerRGGB2GRAY).tolist(),
         )
         mosaic16b = (np.arange(8 * 8).reshape(8, 8) * 32).astype(np.uint16)
         self.assertEqual(
             cam.grayscale8_from_bytes("BayerBG12Packed", mosaic16b, 8, 8).tolist(),
-            cv2.cvtColor((mosaic16b >> 4).astype(np.uint8), cv2.COLOR_BayerBG2GRAY).tolist(),
+            cv2.cvtColor((mosaic16b >> 4).astype(np.uint8), cv2.COLOR_BayerBGGR2GRAY).tolist(),
         )
 
     def test_rgb_and_rgba_match_cv2(self):
@@ -298,6 +349,29 @@ class PixelFormatTests(unittest.TestCase):
         self.assertEqual(
             cam.grayscale8_from_bytes("YUV411Packed", yuv411, 12, 2).tolist(),
             (np.tile([10, 20, 40, 50], 6)).reshape(2, 12).tolist(),
+        )
+
+    def test_pfnc_yuv_names_extract_luma(self):
+        # Current cameras report PFNC names; these used to degrade to black.
+        yuyv = np.array([10, 0, 20, 1, 30, 2, 40, 3], np.uint8)  # Y0 U Y1 V
+        uyvy = np.array([0, 10, 1, 20, 2, 30, 3, 40], np.uint8)  # U Y0 V Y1
+        for fmt, data in (
+            ("YUV422_8", yuyv),
+            ("YCbCr422_8", yuyv),
+            ("YUV422_8_UYVY", uyvy),
+            ("YCbCr422_8_CbYCrY", uyvy),
+        ):
+            self.assertEqual(
+                cam.grayscale8_from_bytes(fmt, data, 4, 1).tolist(), [[10, 20, 30, 40]], fmt
+            )
+        cbycr = np.array([9, 1, 9, 9, 2, 9, 9, 3, 9], np.uint8)  # Cb Y Cr per pixel
+        self.assertEqual(
+            cam.grayscale8_from_bytes("YCbCr8_CbYCr", cbycr, 3, 1).tolist(), [[1, 2, 3]]
+        )
+        uyyvyy = np.tile([5, 10, 20, 30, 40, 50], 2).astype(np.uint8)
+        self.assertEqual(
+            cam.grayscale8_from_bytes("YUV411_8_UYYVYY", uyyvyy, 8, 1).tolist(),
+            [[10, 20, 40, 50, 10, 20, 40, 50]],
         )
 
     def test_unsupported_format_mismatch_raises(self):
@@ -438,7 +512,13 @@ def _reset_main_window(window):
     """Return the shared window to a disconnected, idle state."""
     window.videothread = None
     window.is_running = False
+    window.is_recording = False
+    window.recording = np.array([])
+    window.recording_metadata = {}
     window.ui.settings_window.teardown()
+    for widget in (window.ui.pb_connect, window.ui.cb_source):
+        widget.setEnabled(True)
+    window.ui.actionSelect_GenTLProducer.setEnabled(True)
 
 
 class UiRaceGuardTests(unittest.TestCase):
@@ -558,7 +638,7 @@ class BoundedFetchTests(unittest.TestCase):
         ia.try_fetch.return_value = None
         ia.remote_device.node_map.Height.value = 6
         ia.remote_device.node_map.Width.value = 5
-        img = cam.get_harvester_image(ia)
+        img = cam.get_harvester_image(ia, timeout=0.05)
         self.assertEqual(img.shape, (6, 5))
         self.assertEqual(int(img.max()), 0)
         ia.fetch.assert_not_called()
@@ -570,7 +650,7 @@ class BoundedFetchTests(unittest.TestCase):
         ia.try_fetch.return_value = None
         out = np.zeros((4, 4), dtype=np.uint8)
         with self.assertRaises(TimeoutError):
-            cam._harvester_frame_into(ia, out)
+            cam._harvester_frame_into(ia, out, timeout=0.05)
         ia.fetch.assert_not_called()
 
     def test_record_stops_the_camera_when_a_fetch_times_out(self):
@@ -580,11 +660,63 @@ class BoundedFetchTests(unittest.TestCase):
         ia.try_fetch.return_value = None
         ia.remote_device.node_map.Height.value = 4
         ia.remote_device.node_map.Width.value = 4
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(TimeoutError), patch.object(cam, "FETCH_TIMEOUT_S", 0.05):
             cam.record_harvester_frames(ia, 2, None)
         # A camera left acquiring keeps filling buffers nobody drains, and the
         # next start() then runs against an already-started device.
         ia.stop.assert_called_once()
+
+    def test_live_fetch_waits_through_incomplete_buffers(self):
+        # harvesters requeues an incomplete buffer and returns None at once.
+        # That is one lost frame, not a stalled camera: no black frame.
+        ia = MagicMock()
+        ia.try_fetch.side_effect = [None, None, _mono8_buffer(42)]
+        img = cam.get_harvester_image(ia, timeout=5)
+        self.assertEqual(img.tolist(), [[42, 42], [42, 42]])
+
+    def test_recording_carries_on_after_an_incomplete_buffer(self):
+        ia = MagicMock()
+        ia.remote_device.node_map.Height.value = 2
+        ia.remote_device.node_map.Width.value = 2
+        deliveries = iter([_mono8_buffer(0), None, _mono8_buffer(1), _mono8_buffer(2)])
+        ia.try_fetch.side_effect = lambda timeout: next(deliveries, None)
+        recording = cam.record_harvester_frames(ia, 3, None)
+        # A single dropped frame used to abort the whole recording with a
+        # "no frame within 5.0s" error.
+        self.assertEqual([int(frame[0, 0]) for frame in recording], [0, 1, 2])
+
+    def test_interrupted_recording_keeps_what_was_recorded(self):
+        ia = MagicMock()
+        ia.remote_device.node_map.Height.value = 2
+        ia.remote_device.node_map.Width.value = 2
+        deliveries = iter([_mono8_buffer(7), _mono8_buffer(8)])  # then the camera stops
+        ia.try_fetch.side_effect = lambda timeout: next(deliveries, None)
+        with patch.object(cam, "FETCH_TIMEOUT_S", 0.05):
+            with self.assertRaises(cam.RecordingInterrupted) as caught:
+                cam.record_harvester_frames(ia, 5, None)
+        self.assertEqual([int(frame[0, 0]) for frame in caught.exception.frames], [7, 8])
+        ia.stop.assert_called_once()
+
+    def test_oversized_recording_is_refused_before_it_fills_the_ram(self):
+        # 1000 full-HD frames are ~2 GB. Under Linux overcommit the allocation
+        # itself succeeds, and the machine swaps itself into a freeze while the
+        # frames are written - so it has to be refused up front.
+        with patch.object(cam, "available_memory_bytes", return_value=1024**3):
+            with self.assertRaises(MemoryError):
+                cam.record_random_frames(1000, None)
+
+    def test_info_fields_are_only_decoded_where_the_camera_writes_them(self):
+        ia = MagicMock()
+        nodes = ia.remote_device.node_map
+        nodes.InfoFieldFrameCounterEnable.value = True
+        nodes.InfoFieldTimeStampEnable.value = True
+        nodes.PixelFormat.value = "Mono8"
+        self.assertTrue(cam.info_fields_enabled(ia))
+        nodes.PixelFormat.value = "Mono12"  # the field bytes are bit-shifted away
+        self.assertFalse(cam.info_fields_enabled(ia))
+        # Cameras without the Mikrotron nodes: the first pixels are image content.
+        ia.remote_device.node_map = SimpleNamespace(PixelFormat=SimpleNamespace(value="Mono8"))
+        self.assertFalse(cam.info_fields_enabled(ia))
 
 
 class CameraReleaseTests(unittest.TestCase):
@@ -748,6 +880,79 @@ class CameraReleaseTests(unittest.TestCase):
             # of the indices that did not answer - on every rescan.
             probe.release.assert_called_once()
 
+    def test_connect_rescans_once_when_the_cached_device_cannot_be_opened(self):
+        device = MagicMock()
+        device.display_name = "Cam A"
+        h, ia = MagicMock(), MagicMock()
+        h.device_info_list = [device]
+        h.create.side_effect = [RuntimeError("stale device handle"), ia]
+        with (
+            patch("cam.Harvester", return_value=h),
+            patch("cam._configure_cam"),
+            patch("cam.warmup_cam"),
+        ):
+            _, opened = cam.setup_cam(cti="a.cti", search_key={"display_name": "Cam A"})
+        # A camera power-cycled since the startup scan failed every Connect
+        # from the cached list until something re-enumerated.
+        self.assertIs(opened, ia)
+        h.update.assert_called_once()
+
+    def test_connect_opens_a_camera_two_producers_both_list(self):
+        first, second = MagicMock(), MagicMock()
+        first.display_name = second.display_name = "Cam A"
+        h = MagicMock()
+        h.device_info_list = [first, second]
+        with (
+            patch("cam.Harvester", return_value=h),
+            patch("cam._configure_cam"),
+            patch("cam.warmup_cam"),
+        ):
+            cam.setup_cam(cti=["vimba.cti", "vimbax.cti"], search_key={"display_name": "Cam A"})
+        # harvesters' create(dict) refuses with "multiple devices found".
+        h.create.assert_called_once_with(first)
+
+    def test_saved_offsets_survive_a_camera_that_starts_at_full_size(self):
+        width_max, height_max = 2336, 1728
+        state = {"Width": width_max, "Height": height_max, "OffsetX": 0, "OffsetY": 0}
+
+        class CoupledNode:
+            """SFNC AOI node: an offset and its size share the sensor."""
+
+            inc = 1
+
+            def __init__(self, name):
+                self.name = name
+
+            @property
+            def min(self):
+                return 0 if self.name.startswith("Offset") else 16
+
+            @property
+            def max(self):
+                return {
+                    "Width": width_max - state["OffsetX"],
+                    "Height": height_max - state["OffsetY"],
+                    "OffsetX": width_max - state["Width"],
+                    "OffsetY": height_max - state["Height"],
+                }[self.name]
+
+            @property
+            def value(self):
+                return state[self.name]
+
+            @value.setter
+            def value(self, value):
+                if not self.min <= value <= self.max:
+                    raise ValueError(f"{self.name}={value} out of range")
+                state[self.name] = value
+
+        ia = MagicMock()
+        ia.is_acquiring.return_value = False
+        ia.remote_device.node_map = SimpleNamespace(**{name: CoupledNode(name) for name in state})
+        applied = cam.set_resolution(ia, width=1024, height=1024, offset_x=656, offset_y=352)
+        # Offsets written first were clamped to 0 by the full-size AOI.
+        self.assertEqual(applied, (1024, 1024, 656, 352))
+
 
 class VideoThreadTeardownTests(unittest.TestCase):
     """Nothing may be freed out from under a worker that is still inside it."""
@@ -901,6 +1106,117 @@ class VideoThreadTeardownTests(unittest.TestCase):
         self.assertGreater(len(calls), 1)
         self.assertLess(len(calls), 30)
 
+    def _harvester_thread(self, ia):
+        thread = self._bare_thread()
+        thread.cap = ia
+        thread.image_func = thread._harvester_frame
+        return thread
+
+    def test_stop_waits_for_the_worker_to_hand_its_buffer_back(self):
+        """harvesters' stop() revokes every announced buffer. A buffer the
+        worker was still holding crashed the producer when it was queued
+        afterwards (SIGSEGV in queue_buffer)."""
+        from harvesters.core import ImageAcquirer
+
+        events = []
+        holding, stopped = threading.Event(), threading.Event()
+
+        def hold_then_queue():
+            holding.set()
+            stopped.wait(0.3)  # a slow frame conversion: still holding it
+            events.append("queue")
+
+        ia = MagicMock(spec=ImageAcquirer)
+        ia.try_fetch.side_effect = lambda timeout: _mono8_buffer(1, on_exit=hold_then_queue)
+        ia.stop.side_effect = lambda: (events.append("stop"), stopped.set())
+        thread = self._harvester_thread(ia)
+        self.assertTrue(thread._start())
+        try:
+            self.assertTrue(holding.wait(5))
+        finally:
+            thread.stop()
+        self.assertFalse(thread.isRunning())
+        self.assertEqual(events[-1], "stop")  # nothing queued after the stop
+
+    def test_stop_is_prompt_while_the_camera_delivers_nothing(self):
+        from harvesters.core import ImageAcquirer
+
+        ia = MagicMock(spec=ImageAcquirer)
+        ia.try_fetch.side_effect = _stalled_fetch
+        thread = self._harvester_thread(ia)
+        self.assertTrue(thread._start())
+        time.sleep(0.3)
+        started = time.monotonic()
+        thread.stop()
+        # Pause/Disconnect sat out the whole 5 s fetch timeout on the GUI thread.
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertFalse(thread.isRunning())
+
+    def test_camera_writes_are_not_held_up_by_a_stalled_camera(self):
+        from harvesters.core import ImageAcquirer
+
+        ia = MagicMock(spec=ImageAcquirer)
+        ia.try_fetch.side_effect = _stalled_fetch
+        thread = self._harvester_thread(ia)
+        self.assertTrue(thread._start())
+        try:
+            time.sleep(0.2)
+            started = time.monotonic()
+            cam.set_attribute(ia, "Gain", 3)  # one step of a GUI control
+            elapsed = time.monotonic() - started
+        finally:
+            thread.stop()
+        # The worker held IA_LOCK across its whole 5 s wait for a frame.
+        self.assertLess(elapsed, 1.0)
+
+    def test_stop_on_the_worker_itself_returns_at_once(self):
+        # What __del__ -> close() does when the last reference is dropped on
+        # the worker thread: QThread.wait() on itself returns immediately, so
+        # the join loop spun (and flooded stderr) for the full 10 s.
+        thread = self._bare_thread()
+        durations = []
+
+        def stop_from_inside(cap):
+            started = time.monotonic()
+            thread._stop_and_join()
+            durations.append(time.monotonic() - started)
+
+        thread.image_func = stop_from_inside
+        self.assertTrue(thread._start())
+        self.assertTrue(thread.wait(5000))
+        self.assertEqual(len(durations), 1)
+        self.assertLess(durations[0], 1.0)
+
+    def test_a_stuck_worker_keeps_its_camera_until_it_exits(self):
+        import VideoThread as videothread_module
+
+        inside, release = threading.Event(), threading.Event()
+
+        def hanging_driver_call(cap):
+            inside.set()
+            release.wait(10)
+
+        thread = self._bare_thread()
+        thread.cap = object()
+        thread.image_func = hanging_driver_call
+        thread.JOIN_TIMEOUT_S = 0.2
+        self.assertTrue(thread._start())
+        self.assertTrue(inside.wait(5))
+        with patch("cam.teardown_cam") as teardown:
+            thread.close()
+            # Releasing (or resetting the producer) under the hung call is a
+            # use-after-free; and the UI must know the camera is still taken.
+            teardown.assert_not_called()
+            self.assertTrue(videothread_module.has_stuck_workers())
+            release.set()
+            deadline = time.monotonic() + 5
+            while not teardown.called and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            # Released once the worker is really gone.
+            teardown.assert_called_once()
+        self.assertFalse(videothread_module.has_stuck_workers())
+
 
 class SettingsPanelTests(unittest.TestCase):
     """The 500 ms node-map poll must not outlive or multiply across cameras."""
@@ -1001,6 +1317,130 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertLess(elapsed, 1.0)
         widget.blockSignals.assert_not_called()  # poll skipped, not performed
 
+    def _fill_with(self, panel, nodemap, **node_types):
+        """fill_settings() over a fake node map; node_types patches ui.IString etc."""
+        patches = [patch(f"ui.{name}", fake) for name, fake in node_types.items()]
+        patches.append(patch("ui.cam.get_harvester_nodemap", return_value=nodemap))
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        panel.fill_settings()
+
+    def test_string_edits_go_to_their_own_node(self):
+        class FakeString:
+            value = ""
+
+        window = _shared_main_window()
+        panel = window.ui.settings_window
+        try:
+            window.videothread = MagicMock()
+            nodemap = SimpleNamespace(DeviceLabel=FakeString(), DeviceUserID=FakeString())
+            self._fill_with(panel, nodemap, IString=FakeString)
+            with patch.object(panel, "update_node") as update_node:
+                widget = panel.settings["DeviceLabel"]["widget"]
+                widget.setText("rig A")
+                widget.editingFinished.emit()
+            # The lambda used to read the loop variables when the edit finished:
+            # the last node of the loop, with the last widget's text.
+            update_node.assert_called_once_with("DeviceLabel", "rig A")
+        finally:
+            _reset_main_window(window)
+
+    def test_float_rows_show_large_values_and_ignore_the_wheel(self):
+        from PyQt6 import QtCore, QtGui, QtWidgets
+
+        class FakeFloat:
+            value = 999.5
+            min = 0.0
+            max = 1e6
+
+            def get_access_mode(self):
+                return 4  # RW
+
+        class FakeEnum:
+            value = "Off"
+
+            def _get_symbolics(self):
+                return ("Off", "On")
+
+            def get_access_mode(self):
+                return 4
+
+        window = _shared_main_window()
+        panel = window.ui.settings_window
+        try:
+            window.videothread = MagicMock()
+            nodemap = SimpleNamespace(ExposureTime=FakeFloat(), TriggerMode=FakeEnum())
+            self._fill_with(panel, nodemap, IFloat=FakeFloat, IEnumeration=FakeEnum)
+            panel.update_fields()
+            exposure = panel.settings["ExposureTime"]["widget"]
+            trigger = panel.settings["TriggerMode"]["widget"]
+            # Qt's default 0..99.99 range showed 999.5 as 99.99.
+            self.assertEqual(exposure.value(), 999.5)
+            with patch.object(panel, "update_node") as update_node:
+                for widget in (exposure, trigger):
+                    notch = QtGui.QWheelEvent(
+                        QtCore.QPointF(5, 5),
+                        QtCore.QPointF(5, 5),
+                        QtCore.QPoint(0, 0),
+                        QtCore.QPoint(0, -120),
+                        QtCore.Qt.MouseButton.NoButton,
+                        QtCore.Qt.KeyboardModifier.NoModifier,
+                        QtCore.Qt.ScrollPhase.NoScrollPhase,
+                        False,
+                    )
+                    QtWidgets.QApplication.sendEvent(widget, notch)
+            # Scrolling the panel over a row wrote the camera (TriggerMode=On:
+            # no frame ever arrived afterwards).
+            update_node.assert_not_called()
+            self.assertEqual(trigger.currentText(), "Off")
+        finally:
+            _reset_main_window(window)
+
+    def test_acquisition_and_reset_commands_are_not_offered(self):
+        class FakeCommand:
+            pass
+
+        window = _shared_main_window()
+        panel = window.ui.settings_window
+        try:
+            window.videothread = MagicMock()
+            nodemap = SimpleNamespace(
+                AcquisitionStart=FakeCommand(),
+                AcquisitionStop=FakeCommand(),
+                DeviceReset=FakeCommand(),
+                TriggerSoftware=FakeCommand(),
+            )
+            self._fill_with(panel, nodemap, ICommand=FakeCommand)
+            # Run behind harvesters' back they leave it believing the camera is
+            # stopped while it streams (or reset it under open handles).
+            self.assertEqual(list(panel.settings), ["TriggerSoftware"])
+        finally:
+            _reset_main_window(window)
+
+    def test_connect_defers_reading_the_node_map_until_the_panel_opens(self):
+        window = _shared_main_window()
+        panel = window.ui.settings_window
+        window.ui.cb_source.addItem("Cam X")
+        try:
+            window.ui.cb_source.setCurrentText("Cam X")
+            window.videothread = MagicMock()
+            with (
+                patch.object(window, "setup_settings"),
+                patch.object(window, "setup_resolution_settings"),
+                patch("ui.cam.get_harvester_nodemap", return_value=SimpleNamespace()) as nodemap,
+            ):
+                window.on_source_connected()
+                # Every connect walked the whole node map on the GUI thread
+                # for a panel that is usually never opened.
+                nodemap.assert_not_called()
+                panel.show()
+                nodemap.assert_called_once()
+        finally:
+            panel.hide()
+            window.ui.cb_source.removeItem(window.ui.cb_source.findText("Cam X"))
+            _reset_main_window(window)
+
 
 class ConnectDisconnectTests(unittest.TestCase):
     """MainWindow's connect/disconnect path."""
@@ -1019,6 +1459,7 @@ class ConnectDisconnectTests(unittest.TestCase):
         window = _shared_main_window()
         try:
             worker = MagicMock()
+            worker.isRunning.return_value = False  # it stopped, as close() ensures
             window.videothread = worker
             window.disconnect_video()
             # Teardown used to wait for __del__, so the device stayed open for
@@ -1123,6 +1564,219 @@ class ConnectDisconnectTests(unittest.TestCase):
             self.assertFalse(window.is_running)
         finally:
             _reset_main_window(window)
+
+    def test_clicks_queued_during_a_blocking_connect_are_dropped(self):
+        from PyQt6 import QtCore, QtGui, QtWidgets
+
+        window = _shared_main_window()
+        button = window.ui.pb_connect
+
+        def blocking_connect():
+            # The user clicks the button again while the GUI thread is busy;
+            # by the time the click is delivered the button means Disconnect.
+            center = QtCore.QPointF(button.rect().center())
+            for kind in (
+                QtCore.QEvent.Type.MouseButtonPress,
+                QtCore.QEvent.Type.MouseButtonRelease,
+            ):
+                QtWidgets.QApplication.postEvent(
+                    button,
+                    QtGui.QMouseEvent(
+                        kind,
+                        center,
+                        center,
+                        QtCore.Qt.MouseButton.LeftButton,
+                        QtCore.Qt.MouseButton.LeftButton,
+                        QtCore.Qt.KeyboardModifier.NoModifier,
+                    ),
+                )
+            window.videothread = MagicMock()
+            button.clicked.disconnect()
+            button.clicked.connect(window.disconnect_video)
+
+        try:
+            with (
+                patch.object(window, "_connect_video", side_effect=blocking_connect),
+                patch.object(window, "disconnect_video") as disconnect,
+            ):
+                window.connect_video()
+                self.app.processEvents()
+            disconnect.assert_not_called()
+        finally:
+            button.clicked.disconnect()
+            button.clicked.connect(window.connect_video)
+            _reset_main_window(window)
+
+    def test_connect_stays_locked_until_a_stuck_worker_lets_go(self):
+        window = _shared_main_window()
+        try:
+            worker = MagicMock()
+            worker.isRunning.return_value = True  # close() had to leave it running
+            window.videothread = worker
+            window.disconnect_video()
+            # Connecting or rescanning now would re-enumerate or reset the
+            # producer under the stuck call, or block on the device it holds.
+            self.assertFalse(window.ui.pb_connect.isEnabled())
+            self.assertFalse(window.ui.actionSelect_GenTLProducer.isEnabled())
+            worker.finished.connect.call_args.args[0]()  # the worker exits
+            self.assertTrue(window.ui.pb_connect.isEnabled())
+            self.assertTrue(window.ui.actionSelect_GenTLProducer.isEnabled())
+        finally:
+            _reset_main_window(window)
+
+
+class RecordingAndSavingTests(unittest.TestCase):
+    """A recording must survive the UI around it until it is saved."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6 import QtWidgets
+
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def setUp(self):
+        self.window = _shared_main_window()
+        self.tmp = Path(tempfile.mkdtemp(prefix="hpg_test_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        _reset_main_window(self.window)
+
+    def _save_as(self, path, file_filter="HDF5 Files (*.h5)"):
+        with patch(
+            "ui.QtWidgets.QFileDialog.getSaveFileName", return_value=(str(path), file_filter)
+        ):
+            self.window.save()
+
+    def test_recording_can_be_saved_after_disconnecting(self):
+        window = self.window
+        window.videothread = None  # recorded, then disconnected
+        window.recording = np.zeros((2, 4, 4), np.uint8)
+        window.recording_id = "rec-1"
+        window.recording_timestamp = "20260101120000"
+        window.recording_metadata = {"fps": 123, "ExposureTime": 5.0, "timestamps": [0.0, 0.5]}
+        out = self.tmp / "rec.h5"
+        self._save_as(out)
+        frames, metadata = importexport.load_frames_from_h5(str(out))
+        # save() read the camera at save time: AttributeError, nothing written.
+        self.assertEqual(frames.shape, (2, 4, 4))
+        self.assertEqual(metadata["fps"], 123)
+        self.assertEqual(metadata["ExposureTime"], 5.0)
+        self.assertEqual(list(metadata["timestamps"]), [0.0, 0.5])
+        self.assertEqual(metadata["recording_id"], "rec-1")
+        # Saving again (e.g. as a second copy) still has the datasets.
+        self._save_as(self.tmp / "copy.h5")
+        _, again = importexport.load_frames_from_h5(str(self.tmp / "copy.h5"))
+        self.assertEqual(list(again["timestamps"]), [0.0, 0.5])
+
+    def test_reopened_recording_is_saved_with_its_own_metadata(self):
+        source = self.tmp / "b.h5"
+        importexport.save_frames_to_h5(
+            np.ones((3, 4, 4), np.uint8),
+            str(source),
+            metadata={
+                "recording_id": "B",
+                "timestamp": "20260102120000",
+                "fps": 500,
+                "frame_counters": [1, 2, 3],
+            },
+        )
+        with patch(
+            "ui.QtWidgets.QFileDialog.getOpenFileName", return_value=(str(source), "")
+        ):
+            self.window.open_file()
+        self._save_as(self.tmp / "c.h5")
+        _, metadata = importexport.load_frames_from_h5(str(self.tmp / "c.h5"))
+        self.assertEqual(metadata["recording_id"], "B")
+        self.assertEqual(metadata["timestamp"], "20260102120000")
+        self.assertEqual(metadata["fps"], 500)
+        self.assertEqual(list(metadata["frame_counters"]), [1, 2, 3])
+
+    def test_cancelled_dialogs_change_nothing(self):
+        window = self.window
+        worker = MagicMock()
+        window.videothread = worker
+        window.is_running = True
+        with patch("ui.QtWidgets.QFileDialog.getOpenFileName", return_value=("", "")):
+            window.open_file()  # used to pause the live view, then raise AxisError
+        worker.stop.assert_not_called()
+        window.recording = np.zeros((1, 2, 2), np.uint8)
+        with patch("ui.importexport.save_frames_to_h5") as write:
+            self._save_as("", "")
+        write.assert_not_called()
+        window.videothread = None
+        with (
+            patch("ui.QtWidgets.QFileDialog.getOpenFileName", return_value=("", "")),
+            patch.object(window, "populate_video_sources") as rescan,
+        ):
+            window.find_cti_dialog()
+        # A rescan reloads every producer; not for a cancelled dialog.
+        rescan.assert_not_called()
+
+    def test_close_is_refused_while_recording(self):
+        from PyQt6 import QtGui
+
+        window = self.window
+        window.is_recording = True
+        event = QtGui.QCloseEvent()
+        with (
+            patch.object(window, "disconnect_video") as disconnect,
+            patch("ui.cam.release_harvester") as release,
+        ):
+            window.closeEvent(event)
+        # The recording loop pumps events; a close from inside it destroyed
+        # the camera under the loop and discarded the recording.
+        self.assertFalse(event.isAccepted())
+        disconnect.assert_not_called()
+        release.assert_not_called()
+
+    def test_recording_locks_out_everything_that_reenters_the_camera(self):
+        window = self.window
+        window.videothread = MagicMock()
+        window.videothread.isRunning.return_value = False
+        window.ui.actionOpen.setEnabled(True)
+        controls = {
+            "File>Open": window.ui.actionOpen,
+            "File>Exit": window.ui.actionExit,
+            "Settings": window.ui.pb_settings,
+            "camera controls": window.ui.settings,
+            "Save frame": window.ui.pb_save_frame,
+            "Connect": window.ui.pb_connect,
+        }
+        seen = {}
+
+        def record(n_frames, progressbar):
+            seen.update({name: widget.isEnabled() for name, widget in controls.items()})
+
+        with (
+            patch.object(window, "pause_video"),
+            patch.object(window, "acquire", side_effect=record),
+        ):
+            window.on_btn_acquire_clicked()
+        self.assertEqual({name: False for name in controls}, seen)
+        self.assertTrue(window.ui.actionOpen.isEnabled())  # restored afterwards
+
+    def test_frame_export_keeps_the_chosen_format(self):
+        window = self.window
+        window.Image.setImage(np.zeros((8, 6), np.uint8))
+        out = self.tmp / "frame.png"
+        with patch(
+            "ui.QtWidgets.QFileDialog.getSaveFileName",
+            return_value=(str(out), "Image (*.png)"),
+        ):
+            window.save_current_frame()
+        # 'frame.png' used to be written as a JPEG named 'frame.png.jpg'.
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["frame.png"])
+
+    def test_image_export_replaces_a_longer_earlier_export(self):
+        target = self.tmp / "rec.png"
+        importexport.save_frames_to_png(np.zeros((5, 4, 4), np.uint8), str(target))
+        importexport.save_frames_to_png(np.ones((2, 4, 4), np.uint8), str(target))
+        # The folder used to mix the new frames with the old export's tail.
+        self.assertEqual(
+            sorted(p.name for p in (self.tmp / "rec").iterdir()), ["rec_0.png", "rec_1.png"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

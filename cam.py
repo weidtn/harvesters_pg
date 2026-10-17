@@ -38,6 +38,30 @@ IA_LOCK = threading.RLock()
 # which gives up and returns None instead of hanging.
 FETCH_TIMEOUT_S = 5.0
 
+# Longest single wait inside the device. Waits for a frame are split into slices
+# of this length, with IA_LOCK released between them, so a stop request or a
+# GUI-thread node write never waits for a whole FETCH_TIMEOUT_S - even when
+# the camera has stopped delivering.
+FETCH_SLICE_S = 0.1
+
+# try_fetch(timeout=0) switches the timeout off and waits forever (harvesters
+# only watches the clock for timeout > 0), so a computed wait is never allowed
+# to reach zero.
+_MIN_FETCH_S = 0.001
+
+
+class RecordingInterrupted(TimeoutError):
+    """The camera stopped delivering in the middle of a recording.
+
+    ``frames`` holds the frames recorded up to that point, so a long recording
+    is not thrown away because its tail is missing.
+    """
+
+    def __init__(self, message: str, frames: np.ndarray):
+        super().__init__(message)
+        self.frames = frames
+
+
 # One Harvester - and therefore one load of each GenTL producer - for the whole
 # process. Building a fresh Harvester per connect meant unloading and reloading
 # the producer library, plus a full device re-enumeration, on every
@@ -45,7 +69,10 @@ FETCH_TIMEOUT_S = 5.0
 # Active Silicon FireBird's fatal-PCIe defect correlates with (raw-PHX
 # workloads never trigger it, GenTL producer churn does), and several vendor
 # producers are not safe to unload and reload in-process at all. Reset it only
-# at application exit, via release_harvester().
+# at application exit, via release_harvester(). Note that Harvester.update()
+# also unloads and reloads every producer (and destroys every ImageAcquirer it
+# created), so it runs only for an explicit scan and when a connect cannot be
+# served from the cached device list.
 _SHARED_HARVESTER: Harvester | None = None
 _SHARED_HARVESTER_CTIS: tuple[str, ...] = ()
 
@@ -86,6 +113,32 @@ def release_harvester() -> None:
     teardown_cam(_SHARED_HARVESTER, None)
 
 
+def abandon_harvester() -> None:
+    """Drop the process-wide Harvester WITHOUT resetting it.
+
+    For application exit while a capture worker is still stuck inside the
+    producer: reset() would destroy the ImageAcquirer and unload the producer
+    under that call, which is the use-after-free release_harvester() must never
+    cause. harvesters also registers its own atexit finalizers that would do the
+    same reset at interpreter exit, so those are detached here and the OS
+    reclaims the device when the process ends.
+    """
+    global _SHARED_HARVESTER, _SHARED_HARVESTER_CTIS
+    harvester = _SHARED_HARVESTER
+    _SHARED_HARVESTER = None
+    _SHARED_HARVESTER_CTIS = ()
+    if harvester is None:
+        return
+    logging.warning(
+        "Leaving the GenTL producers loaded at exit: a capture worker is still "
+        "inside the producer, and unloading it under that call can crash."
+    )
+    for obj in (*getattr(harvester, "_ias", ()), harvester):
+        finalizer = getattr(obj, "_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()
+
+
 def _forget_shared_harvester(harvester: Harvester) -> None:
     """Drop the module reference if *harvester* is the shared one.
 
@@ -99,29 +152,32 @@ def _forget_shared_harvester(harvester: Harvester) -> None:
         _SHARED_HARVESTER_CTIS = ()
 
 
-def _device_list_satisfies(harvester: Harvester, search_key) -> bool:
-    """Whether the cached device list can already resolve *search_key*.
+def _find_device(harvester: Harvester, search_key):
+    """Return the cached DeviceInfo that *search_key* selects, or None.
 
-    Used to skip h.update(): a re-enumeration puts discovery traffic on every
-    interface, and it used to run on every single connect even though the
-    startup scan had just enumerated the very same devices.
+    Used to skip h.update(): a re-enumeration unloads and reloads every
+    producer and puts discovery traffic on every interface, and it used to run
+    on every single connect even though the startup scan had just enumerated
+    the very same devices. A dict key resolves to the FIRST match: when two
+    producers (e.g. classic Vimba and Vimba X) enumerate the same camera, both
+    entries lead to that camera, and harvesters' own create(dict) would refuse
+    with "multiple devices found".
     """
-    devices = harvester.device_info_list
+    devices = list(harvester.device_info_list or [])
     if not devices:
-        return False
+        return None
     if search_key is None:
-        return True
+        return devices[0]
     if isinstance(search_key, int):
-        return -len(devices) <= search_key < len(devices)
+        return devices[search_key] if -len(devices) <= search_key < len(devices) else None
     if isinstance(search_key, dict):
-        return any(
-            all(
+        for device in devices:
+            if all(
                 value == getattr(device, key, None)
                 for key, value in search_key.items()
-            )
-            for device in devices
-        )
-    return False
+            ):
+                return device
+    return None
 
 
 # Well-known GenTL producer install locations of the common SDKs (checked in
@@ -173,6 +229,7 @@ def setup_cam(
     blacklevel: int = 125,
     exposure: int = 999,
     search_key: int | dict | None = None,
+    start: bool = True,
 ) -> tuple[Harvester, ImageAcquirer]:
     """Set the camera up using the Harvester API.
 
@@ -186,6 +243,10 @@ def setup_cam(
         search_key (int | dict | None): Which enumerated device to open - a
             list index, or a device-info filter such as
             ``{"display_name": ...}``. Defaults to the first device.
+        start (bool): Start acquisition and collect a few warm-up frames.
+            The GUI passes False: it starts acquisition itself when live view
+            or a recording begins, and a start/warm-up/kill-stop cycle per
+            connect is pure GenTL churn on the frame grabber.
 
     Returns:
         tuple[Harvester, ImageAcquirer]: The Harvester object and the ImageAcquirer object.
@@ -200,16 +261,38 @@ def setup_cam(
     ia = None
     try:
         # Enumerate only when the cached device list cannot serve the request.
-        if not _device_list_satisfies(h, search_key):
+        device = _find_device(h, search_key)
+        enumerated = device is None
+        if enumerated:
             h.update()
+            device = _find_device(h, search_key)
 
-        # Select a target device and create an ImageAcquire object. Opening
-        # index 0 regardless of what the user picked meant a second camera (or
-        # a camera behind a second producer) silently opened the wrong device -
-        # possibly one another process already holds.
-        ia = h.create(0 if search_key is None else search_key)
-        _configure_cam(ia, height, width, fps, blacklevel, exposure)
-        warmup_cam(ia)
+        # Open exactly the device that was picked. Opening index 0 regardless
+        # of what the user picked meant a second camera (or a camera behind a
+        # second producer) silently opened the wrong device - possibly one
+        # another process already holds. With nothing found, harvesters raises
+        # its own "no device" error from the original key.
+        fallback_key = 0 if search_key is None else search_key
+        try:
+            ia = h.create(fallback_key if device is None else device)
+        except Exception:
+            if enumerated:
+                raise
+            # The cached entry may be stale: a camera that was unplugged,
+            # power-cycled or re-linked since the last scan keeps failing to
+            # open from it until something re-enumerates. Do that once here
+            # instead of leaving every further Connect failing the same way.
+            logging.warning(
+                "Opening the camera from the cached device list failed; "
+                "re-enumerating and retrying once",
+                exc_info=True,
+            )
+            h.update()
+            device = _find_device(h, search_key)
+            ia = h.create(fallback_key if device is None else device)
+        _configure_cam(ia, height, width, fps, blacklevel, exposure, start=start)
+        if start:
+            warmup_cam(ia)
     except Exception:
         # Never let a half-configured camera escape. An ImageAcquirer dropped
         # without destroy() keeps the device exclusively opened, and possibly
@@ -231,8 +314,9 @@ def _configure_cam(
     fps: int,
     blacklevel: int,
     exposure: int,
+    start: bool = True,
 ) -> None:
-    """Apply the node-map settings to a fresh camera and start acquisition.
+    """Apply the node-map settings to a fresh camera, then optionally start it.
 
     Split out of setup_cam so the whole create -> configure -> warm-up sequence
     fits under a single try/except there: every step below can raise, and a
@@ -260,7 +344,7 @@ def _configure_cam(
     try:
         getattr(nodes, profile.exposure_node).set_value(exposure)
     except Exception as e:
-        print(e)
+        logging.warning(f"Could not set {profile.exposure_node} to {exposure}: {e}")
 
     if height is not None:
         try:
@@ -298,7 +382,8 @@ def _configure_cam(
         except Exception as e:
             logging.warning(f"Could not set {node_name} = {node_value}: {e}")
 
-    ia.start()
+    if start:
+        ia.start()
     try:
         logging.info(f"Camera pixel format: {nodes.PixelFormat.value}")
     except Exception as e:
@@ -450,6 +535,51 @@ def disconnect_cam(h: Harvester, ia: ImageAcquirer) -> None:
     """
     teardown_cam(h, ia)
 
+
+# A recording (or a loaded file) may use at most this share of the RAM that is
+# available when it starts. np.empty/np.zeros succeed instantly under Linux
+# overcommit and only commit pages as frames are written, so an oversized
+# recording does not fail up front - it fills RAM frame by frame and then
+# swap-thrashes the whole machine into what looks like a freeze.
+MEMORY_BUDGET_FRACTION = 0.8
+
+
+def available_memory_bytes() -> int | None:
+    """RAM that can be used without swapping, or None if it cannot be determined."""
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def ensure_memory_for(nbytes: int, what: str) -> None:
+    """Raise MemoryError if *nbytes* do not fit in the available RAM budget.
+
+    Args:
+        nbytes (int): Size of the array about to be allocated.
+        what (str): What it is for, used in the error message.
+    """
+    available = available_memory_bytes()
+    if available is None:
+        return
+    budget = int(available * MEMORY_BUDGET_FRACTION)
+    if nbytes > budget:
+        gib = 1024**3
+        raise MemoryError(
+            f"The {what} needs {nbytes / gib:.1f} GiB, but only "
+            f"{available / gib:.1f} GiB of RAM is available ({budget / gib:.1f} GiB "
+            f"usable). Use fewer frames or a smaller image size, or free memory "
+            f"first (e.g. save and close the current recording)."
+        )
+
+
 def get_webcam_image(cap: VideoCapture) -> np.ndarray:
     """Get an image from the webcam.
 
@@ -487,6 +617,7 @@ def record_webcam_frames(
             progress.setMaximum(n_frames - 1)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    ensure_memory_for(n_frames * height * width, "recording")
     frames = np.zeros((n_frames, height, width), dtype=np.uint8)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_webcam_image(cap)
@@ -530,6 +661,7 @@ def record_random_frames(
             progress.setMaximum(1)
         else:
             progress.setMaximum(n_frames - 1)
+    ensure_memory_for(n_frames * 1080 * 1920, "recording")
     frames = np.zeros((n_frames, 1080, 1920), dtype=np.uint8)
     for i in trange(n_frames, desc="Recording frames"):
         frames[i] = get_random_image(None)
@@ -552,11 +684,47 @@ def record_random_frames(
 # (height, width) grayscale frame: demosaic Bayer mosaics, extract luma from
 # YUV, drop the high byte of >8-bit formats, and keep Mono8 as a plain copy.
 
+# GenICam names a Bayer mosaic by its top-left 2x2 cell (BayerRG8 = R G / G B).
+# OpenCV's short names are shifted by one (COLOR_BayerRG2GRAY is RGGB's
+# neighbour, == COLOR_BayerBGGR2GRAY), which swaps the red and blue weights of
+# the luminance; its explicit four-letter names match GenICam's.
 _BAYER_DEMOSAIC = {
-    "GR": cv2.COLOR_BayerGR2GRAY,
-    "RG": cv2.COLOR_BayerRG2GRAY,
-    "GB": cv2.COLOR_BayerGB2GRAY,
-    "BG": cv2.COLOR_BayerBG2GRAY,
+    "GR": cv2.COLOR_BayerGRBG2GRAY,
+    "RG": cv2.COLOR_BayerRGGB2GRAY,
+    "GB": cv2.COLOR_BayerGBRG2GRAY,
+    "BG": cv2.COLOR_BayerBGGR2GRAY,
+}
+
+# Packed YUV / YCbCr layouts, upper-cased format name ->
+# (bytes per group, pixels per group, positions of the luma bytes in a group).
+# Legacy GigE Vision names plus their PFNC spellings, which is what current
+# cameras report; without them those formats degraded to black frames.
+_YUV_LUMA = {
+    # 4:2:2, U Y0 V Y1 (UYVY)
+    "YUV422PACKED": (4, 2, (1, 3)),
+    "YUV422_8_UYVY": (4, 2, (1, 3)),
+    "YCBCR422_8_CBYCRY": (4, 2, (1, 3)),
+    "YCBCR601_422_8_CBYCRY": (4, 2, (1, 3)),
+    "YCBCR709_422_8_CBYCRY": (4, 2, (1, 3)),
+    # 4:2:2, Y0 U Y1 V (YUYV)
+    "YUV422_8": (4, 2, (0, 2)),
+    "YCBCR422_8": (4, 2, (0, 2)),
+    "YCBCR601_422_8": (4, 2, (0, 2)),
+    "YCBCR709_422_8": (4, 2, (0, 2)),
+    # 4:1:1, U Y0 Y1 V Y2 Y3
+    "YUV411PACKED": (6, 4, (1, 2, 4, 5)),
+    "YUV411_8_UYYVYY": (6, 4, (1, 2, 4, 5)),
+    "YCBCR411_8_CBYYCRYY": (6, 4, (1, 2, 4, 5)),
+    "YCBCR601_411_8_CBYYCRYY": (6, 4, (1, 2, 4, 5)),
+    "YCBCR709_411_8_CBYYCRYY": (6, 4, (1, 2, 4, 5)),
+    # 4:4:4 with luma first (legacy YUV444Packed as handled before, YCbCr8)
+    "YUV444PACKED": (3, 1, (0,)),
+    "YCBCR8": (3, 1, (0,)),
+    # 4:4:4, U Y V / Cb Y Cr
+    "YUV8_UYV": (3, 1, (1,)),
+    "YCBCR8_CBYCR": (3, 1, (1,)),
+    "YCBCR601_8_CBYCR": (3, 1, (1,)),
+    "YCBCR709_8_CBYCR": (3, 1, (1,)),
 }
 
 _BITS_FROM_FMT = re.compile(r"(1[0-6])")
@@ -619,21 +787,16 @@ def grayscale8_from_bytes(
             shift8(data).reshape(h, w), _BAYER_DEMOSAIC[bayer.group(1)]
         )
 
-    # 2) YUV 4:2:2 / 4:1:1 / 4:4:4: luma extraction from the packed byte order.
-    if up == "YUV422PACKED":  # UYVY: luma at the odd byte of each pair
-        if data.size != 2 * h * w:
-            raise ValueError(f"{fmt}: expected {2 * h * w} bytes, got {data.size}")
-        return data.reshape(h, 2 * w)[:, 1::2].copy()
-    if up == "YUV444PACKED":  # Y,U,V per pixel; luma is the first byte
-        if data.size != 3 * h * w:
-            raise ValueError(f"{fmt}: expected {3 * h * w} bytes, got {data.size}")
-        return data.reshape(h, w, 3)[..., 0].copy()
-    if up == "YUV411PACKED":  # U,Y0,Y1,V,Y2,Y3 per 4 pixels
-        if (h * w) % 4 or data.size != (h * w // 4) * 6:
+    # 2) YUV / YCbCr: luma extraction from the packed byte order.
+    yuv = _YUV_LUMA.get(up)
+    if yuv is not None:
+        group, pixels, luma = yuv
+        if (h * w) % pixels or data.size != (h * w // pixels) * group:
             raise ValueError(
-                f"{fmt}: expected {(h * w // 4) * 6} bytes for {w}x{h}, got {data.size}"
+                f"{fmt}: expected {(h * w // pixels) * group} bytes for {w}x{h}, "
+                f"got {data.size}"
             )
-        return data.reshape(h * w // 4, 6)[:, [1, 2, 4, 5]].reshape(h, w).copy()
+        return data.reshape(-1, group)[:, list(luma)].reshape(h, w).copy()
 
     # 3) 3- and 4-component color (RGB/BGR or RGBA/BGRA; channel order does not
     #    matter for luminance).
@@ -688,43 +851,61 @@ def component_to_grayscale8(component) -> np.ndarray:
 
 _warned_formats = set()
 
-def get_harvester_image(ia: ImageAcquirer) -> np.ndarray:
+def get_harvester_image(
+    ia: ImageAcquirer,
+    timeout: float | None = None,
+    keep_waiting: Callable[[], bool] | None = None,
+) -> np.ndarray | None:
     """
     Get the image from the camera using the Harvester API.
 
+    The wait for a frame is split into FETCH_SLICE_S slices with IA_LOCK
+    released in between: a GUI-thread node write waits at most one slice for
+    the lock, and *keep_waiting* is checked after every slice so a stop request
+    ends the wait within a slice instead of after the full timeout.
+    Incomplete buffers (harvesters requeues them and returns None at once) just
+    mean another slice; they are not mistaken for a stalled camera.
+
     Args:
         ia (ImageAcquirer): The ImageAcquirer object.
+        timeout (float | None): Seconds to wait for a frame, FETCH_TIMEOUT_S by
+            default.
+        keep_waiting (Callable[[], bool] | None): Polled between slices; once it
+            returns False the wait is abandoned.
 
     Returns:
-        np.ndarray: The image as a numpy array.
+        np.ndarray | None: The frame; a black frame if the camera delivered
+        nothing within *timeout*; None if *keep_waiting* ended the wait.
     """
+    timeout = FETCH_TIMEOUT_S if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        with IA_LOCK:
+            buffer = ia.try_fetch(timeout=max(min(FETCH_SLICE_S, remaining), _MIN_FETCH_S))
+            if buffer is not None:
+                with buffer:
+                    # See component_to_grayscale8: Mono8 stays a plain copy,
+                    # while 10/12/16-bit, Bayer and color formats are converted
+                    # to a grayscale uint8 frame here so the whole app
+                    # (display, recording, export) only ever deals with
+                    # natural (h, w).
+                    return component_to_grayscale8(buffer.payload.components[0])
+        if keep_waiting is not None and not keep_waiting():
+            return None
+        if time.monotonic() >= deadline:
+            break
+    # Timed out instead of hanging: a camera that stops delivering degrades to
+    # a black live view the user can still disconnect from.
+    logging.warning(f"No frame within {timeout}s; showing a black image")
     with IA_LOCK:
-        buffer = ia.try_fetch(timeout=FETCH_TIMEOUT_S)
-        if buffer is None:
-            # Timed out instead of hanging: a camera that stops delivering
-            # degrades to a black live view the user can still disconnect from,
-            # rather than freezing the app with IA_LOCK held.
-            logging.warning(
-                f"No frame within {FETCH_TIMEOUT_S}s; showing a black image"
-            )
-            return np.zeros(
-                (
-                    ia.remote_device.node_map.Height.value,
-                    ia.remote_device.node_map.Width.value,
-                ),
-                dtype=np.uint8,
-            )
-        with buffer:
-            component = buffer.payload.components[0]
-            # See component_to_grayscale8: Mono8 stays a plain copy, while
-            # 10/12/16-bit, Bayer and color formats are converted to a
-            # grayscale uint8 frame here so the whole app (display,
-            # recording, export) only ever deals with natural (h, w).
-            img = component_to_grayscale8(component)
-    return img
+        nodes = ia.remote_device.node_map
+        return np.zeros((nodes.Height.value, nodes.Width.value), dtype=np.uint8)
 
 
-def _harvester_frame_into(ia: ImageAcquirer, out: np.ndarray) -> None:
+def _harvester_frame_into(
+    ia: ImageAcquirer, out: np.ndarray, timeout: float | None = None
+) -> int:
     """Fetch one frame from the camera directly into a preallocated buffer.
 
     Writes the (height, width) C-contiguous frame into ``out`` with a single
@@ -734,18 +915,37 @@ def _harvester_frame_into(ia: ImageAcquirer, out: np.ndarray) -> None:
     Args:
         ia (ImageAcquirer): The ImageAcquirer object.
         out (np.ndarray): The output buffer of shape (height, width).
+        timeout (float | None): Seconds to wait for a complete frame,
+            FETCH_TIMEOUT_S by default.
+
+    Returns:
+        int: How many incomplete buffers were dropped before this frame.
+
+    Raises:
+        TimeoutError: if no complete frame arrived within *timeout*.
     """
+    timeout = FETCH_TIMEOUT_S if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    incomplete = 0
     with IA_LOCK:
-        buffer = ia.try_fetch(timeout=FETCH_TIMEOUT_S)
-        if buffer is None:
-            # Bounded, so a camera that stops delivering aborts the recording
-            # instead of hanging the GUI thread. Raising rather than writing a
-            # black frame is deliberate: a silent black gap in the middle of a
-            # recording is worse than a loud failure.
-            raise TimeoutError(
-                f"The camera delivered no frame within {FETCH_TIMEOUT_S}s "
-                f"while recording."
-            )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Bounded, so a camera that stops delivering aborts the
+                # recording instead of hanging the GUI thread. Raising rather
+                # than writing a black frame is deliberate: a silent black gap
+                # in the middle of a recording is worse than a loud failure.
+                raise TimeoutError(
+                    f"The camera delivered no frame within {timeout}s "
+                    f"while recording."
+                )
+            buffer = ia.try_fetch(timeout=max(remaining, _MIN_FETCH_S))
+            if buffer is not None:
+                break
+            # harvesters requeues an incomplete buffer and returns None at
+            # once; that is one lost frame, not a stalled camera. Keep going
+            # until the deadline instead of discarding the whole recording.
+            incomplete += 1
         with buffer:
             component = buffer.payload.components[0]
             if component.data_format in ("Mono8", "Mono8Signed"):
@@ -758,6 +958,7 @@ def _harvester_frame_into(ia: ImageAcquirer, out: np.ndarray) -> None:
                 )
             else:
                 np.copyto(out, component_to_grayscale8(component))
+    return incomplete
 
 def get_remote_nodes(ia: ImageAcquirer) -> dict:
     """Get all nodes and their values from the camera.
@@ -793,20 +994,29 @@ def record_harvester_frames(
 
     Returns:
         np.ndarray: The recorded frames as a numpy array.
+
+    Raises:
+        MemoryError: if the recording would not fit in the available RAM.
+        RecordingInterrupted: if the camera stopped delivering part-way; its
+            ``frames`` attribute holds what was recorded until then.
     """
     if progress is not None:
         if n_frames == 1:
             progress.setMaximum(1)
         else:
             progress.setMaximum(n_frames - 1)
-    width = ia.remote_device.node_map.Width.value
-    height = ia.remote_device.node_map.Height.value
+    with IA_LOCK:
+        width = ia.remote_device.node_map.Width.value
+        height = ia.remote_device.node_map.Height.value
+    ensure_memory_for(n_frames * height * width, "recording")
     # Preallocate the full recording once as (n_frames, height, width) and
     # copy each frame in place. Every per-frame step is a linear memcpy; the
     # old append-a-list-then-stack path re-ran the slow strided transpose per
     # frame (~10 ms at 2048x2048), which capped recording well below the
     # camera's nominal frame rate.
     frames = np.empty((n_frames, height, width), dtype=np.uint8)
+    recorded = 0
+    incomplete = 0
     # Hold IA_LOCK for the whole start->fetch loop->stop sequence, not just the
     # individual fetches: start()/stop() are state-changing GenTL calls on the
     # shared device, and leaving them unlocked let a still-running VideoThread
@@ -816,7 +1026,8 @@ def record_harvester_frames(
         ia.start()
         try:
             for i in trange(n_frames):
-                _harvester_frame_into(ia, frames[i])
+                incomplete += _harvester_frame_into(ia, frames[i])
+                recorded = i + 1
                 if preview is not None:
                     preview(frames[i])
                 if progress is not None:
@@ -824,6 +1035,13 @@ def record_harvester_frames(
                         progress.setValue(1)
                     else:
                         progress.setValue(i)
+        except TimeoutError as e:
+            # Keep what was recorded. frames[:recorded] is a view, but the
+            # untouched tail of np.empty was never committed, so it costs no RAM.
+            raise RecordingInterrupted(
+                f"{e} {recorded} of {n_frames} frames were recorded.",
+                frames[:recorded],
+            ) from e
         finally:
             # Stop on every exit, including a fetch timeout. A camera left
             # acquiring keeps filling buffers nobody drains, and the next
@@ -832,25 +1050,62 @@ def record_harvester_frames(
                 ia.stop()
             except Exception as e:
                 logging.warning(f"Error stopping camera after recording: {e}")
+    if incomplete:
+        logging.warning(
+            f"{incomplete} incomplete frame(s) were dropped by the producer during "
+            f"the recording; the recording has gaps there."
+        )
     return frames
 
-def get_all_attributes_harvesters(ia: ImageAcquirer) -> dict:
+def get_all_attributes_harvesters(ia: ImageAcquirer, budget_s: float = 10.0) -> dict:
     """Get all attributes of the camera.
 
     Args:
         ia (ImageAcquirer): The ImageAcquirer object.
+        budget_s (float): Stop reading after this many seconds. Every node is a
+            register read; on a camera that stopped answering each one waits
+            for its own GenCP timeout, and hundreds of them froze the GUI for
+            minutes.
 
     Returns:
         dict: A dictionary containing all attributes of the camera.
     """
-    nodes = ia.remote_device.node_map
-    dict = {}
-    for node in dir(nodes):
+    attributes = {}
+    deadline = time.monotonic() + budget_s
+    with IA_LOCK:
+        nodes = ia.remote_device.node_map
+        for node in dir(nodes):
+            if time.monotonic() > deadline:
+                logging.warning(
+                    f"Reading the camera attributes took over {budget_s:.0f}s; "
+                    f"stored the {len(attributes)} read so far"
+                )
+                break
+            try:
+                attributes[node] = getattr(nodes, node).value
+            except Exception as e:
+                logging.debug(f"Error while getting node {node}'s value: {e}")
+    return attributes
+
+
+def info_fields_enabled(ia: ImageAcquirer) -> bool:
+    """Whether the camera superimposes the Mikrotron info fields on Mono8 frames.
+
+    Only then do the first pixels of a frame carry a frame counter and a
+    timestamp. On every other camera (or pixel format) they are image content,
+    and decoding them would store pixel values as "frame_counters" and
+    "timestamps".
+    """
+    with IA_LOCK:
+        nodes = ia.remote_device.node_map
         try:
-            dict[node] = getattr(ia.remote_device.node_map, node).value
-        except Exception as e:
-            logging.debug(f"Error while getting node {node}'s value: {e}")
-    return dict
+            return (
+                bool(nodes.InfoFieldFrameCounterEnable.value)
+                and bool(nodes.InfoFieldTimeStampEnable.value)
+                and str(nodes.PixelFormat.value) == "Mono8"
+            )
+        except Exception:
+            return False
 
 def get_harvester_nodemap(ia: ImageAcquirer):
     return ia.remote_device.node_map
@@ -885,7 +1140,9 @@ def extract_frame_counter(img: np.ndarray) -> dict:
     Returns:
         int: The frame counter.
     """
-    pixels = img.flatten()[:4].astype(np.uint32)
+    # .flat[] picks the 4 pixels without copying the whole frame (flatten()
+    # copied every frame of a recording just to read 8 pixels).
+    pixels = np.asarray(img.flat[0:4]).astype(np.uint32)
 
     # Extract frame counter parts
     lsb = pixels[0]
@@ -913,7 +1170,7 @@ def extract_timestamp(img: np.ndarray) -> int:
     Returns:
         int: The timestamp in 40 ns.
     """
-    pixels = img.flatten()[4:8].astype(np.uint32)
+    pixels = np.asarray(img.flat[4:8]).astype(np.uint32)
 
     # Extract timestamp parts
     lsb = pixels[0]  # Pixel 4: bits 0-7
@@ -1005,19 +1262,21 @@ def set_resolution(
         if was_running:
             ia.stop()
         try:
-            for node_name, value in (
-                ("OffsetX", offset_x),
-                ("OffsetY", offset_y),
-                ("Width", width),
-                ("Height", height),
+            # SFNC couples each offset to its size (OffsetX + Width <= WidthMax).
+            # Writing the offset first fails while the current size is large;
+            # writing the size first clamps a saved offset to the room the old
+            # offset left (a camera starting at full size clamped every saved
+            # offset to 0). Zero the offset, set the size, then the offset.
+            for offset_name, offset_value, size_name, size_value in (
+                ("OffsetX", offset_x, "Width", width),
+                ("OffsetY", offset_y, "Height", height),
             ):
-                if value is None:
-                    continue
-                try:
-                    node = getattr(nodes, node_name)
-                    node.value = _snap_to_increment(node, value)
-                except Exception as e:
-                    logging.warning(f"Could not set {node_name} to {value}: {e}")
+                if offset_value is not None:
+                    _write_snapped(nodes, offset_name, 0)
+                if size_value is not None:
+                    _write_snapped(nodes, size_name, size_value)
+                if offset_value is not None:
+                    _write_snapped(nodes, offset_name, offset_value)
             applied: list[int | None] = [None, None, None, None]
             for i, node_name in enumerate(("Width", "Height", "OffsetX", "OffsetY")):
                 try:
@@ -1030,28 +1289,77 @@ def set_resolution(
     return tuple(applied)
 
 
-RESOLUTION_CONFIG_PATH = Path(__file__).resolve().parent / "camera_resolution.json"
+def _write_snapped(nodes, node_name: str, value: int) -> None:
+    """Write *value*, snapped to the node's grid; log instead of raising."""
+    try:
+        node = getattr(nodes, node_name)
+        node.value = _snap_to_increment(node, value)
+    except Exception as e:
+        logging.warning(f"Could not set {node_name} to {value}: {e}")
 
 
-def load_resolution_config() -> dict:
-    """Load the persisted camera resolution, if any.
+def _user_config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(base) / "harvesters_pg"
 
-    Returns:
-        dict: Mapping with optional keys width, height, offset_x, offset_y.
-    """
+
+# The applied AOI per camera. It used to be one global entry next to the code:
+# read-only in a system-wide install (Apply then raised PermissionError), and
+# one camera's AOI was applied, clamped, to every other camera.
+RESOLUTION_CONFIG_PATH = _user_config_dir() / "camera_resolution.json"
+
+
+def camera_config_key(ia: ImageAcquirer) -> str:
+    """Identify the connected camera for per-camera settings (vendor/model/serial)."""
+    parts = []
+    with IA_LOCK:
+        nodes = ia.remote_device.node_map
+        for name in ("DeviceVendorName", "DeviceModelName", "DeviceSerialNumber"):
+            try:
+                parts.append(str(getattr(nodes, name).value))
+            except Exception:
+                pass
+    if not parts:
+        try:
+            parts.append(str(ia.device.id_))
+        except Exception:
+            parts.append("unknown camera")
+    return "/".join(parts)
+
+
+def _read_resolution_file() -> dict:
     try:
         data = json.loads(RESOLUTION_CONFIG_PATH.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def save_resolution_config(resolution: dict) -> None:
-    """Persist the camera resolution so it can be reapplied on the next connect.
+def load_resolution_config(camera: str) -> dict:
+    """Load the resolution persisted for *camera*, if any.
 
     Args:
+        camera (str): The camera's key, see camera_config_key().
+
+    Returns:
+        dict: Mapping with optional keys width, height, offset_x, offset_y.
+    """
+    entry = _read_resolution_file().get(camera)
+    return entry if isinstance(entry, dict) else {}
+
+
+def save_resolution_config(camera: str, resolution: dict) -> None:
+    """Persist *camera*'s resolution so it can be reapplied on the next connect.
+
+    Args:
+        camera (str): The camera's key, see camera_config_key().
         resolution (dict): Mapping containing width/height (and optionally the
             sensor offsets). Non-integer entries are dropped.
+
+    Raises:
+        OSError: if the configuration file cannot be written.
     """
-    data = {k: v for k, v in resolution.items() if isinstance(v, int)}
+    data = _read_resolution_file()
+    data[camera] = {k: v for k, v in resolution.items() if isinstance(v, int)}
+    RESOLUTION_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     RESOLUTION_CONFIG_PATH.write_text(json.dumps(data, indent=2) + "\n")
