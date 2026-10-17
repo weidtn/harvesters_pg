@@ -45,6 +45,15 @@ _APP_MANAGED_COMMANDS = frozenset(
     {"AcquisitionStart", "AcquisitionStop", "AcquisitionAbort", "DeviceReset"}
 )
 
+# CoaXPress link-configuration nodes. Writing either makes the frame grabber
+# retrain the physical link (speed / connection count). On the FireBird rig
+# that caused a fatal PCIe fault on the grabber's root port - a whole-machine
+# hard lockup that needs a watchdog reboot: harvesters_pg.log on 2026-09-21
+# ends at 15:13:48 with "Setting ConnectionConfig to CONNECTION4SPEED12500",
+# three seconds after the settings panel was opened. The panel never reads
+# them, so it cannot write them either.
+_UNSAFE_NODES = frozenset({"ConnectionConfig", "CxpLinkConfiguration"})
+
 
 class _InputBlocker(QtCore.QObject):
     """Event filter that discards mouse and key input aimed at one window.
@@ -163,6 +172,9 @@ class SettingsWindow(QtWidgets.QMainWindow):
             widget.wheelEvent = lambda event: event.ignore()
 
         for node in dir(nodemap):
+            if node in _UNSAFE_NODES:
+                logging.debug(f"Not exposing unsafe node {node} in the settings panel")
+                continue
             self.settings[node] = {
                 "label": QtWidgets.QLabel(text=node),
                 "widget": None,

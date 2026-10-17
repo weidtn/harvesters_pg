@@ -1418,6 +1418,48 @@ class SettingsPanelTests(unittest.TestCase):
         finally:
             _reset_main_window(window)
 
+    def test_unsafe_cxp_link_nodes_are_never_exposed(self):
+        """ConnectionConfig/CxpLinkConfiguration must never reach the panel.
+
+        Writing either makes the frame grabber retrain the physical CoaXPress
+        link. On the rig that produced a fatal PCIe fault on the grabber's
+        root port - a whole-machine hard lockup, not a Python exception -
+        captured in harvesters_pg.log at 2026-09-21 15:13:48 ("Setting
+        ConnectionConfig to CONNECTION4SPEED12500", nothing logged after).
+        fill_settings() must skip them before reading them at all.
+        """
+        accessed = []
+        listed = ["ConnectionConfig", "CxpLinkConfiguration", "ExposureTime"]
+
+        class FakeNodeMap:
+            ConnectionConfig = "unsafe"
+            CxpLinkConfiguration = "unsafe"
+            ExposureTime = "safe"
+
+            def __dir__(self):
+                return list(listed)
+
+            def __getattribute__(self, name):
+                if name in listed:
+                    accessed.append(name)
+                return object.__getattribute__(self, name)
+
+        window = _shared_main_window()
+        panel = window.ui.settings_window
+        try:
+            window.videothread = MagicMock()
+            self._fill_with(panel, FakeNodeMap())
+            self.assertNotIn("ConnectionConfig", panel.settings)
+            self.assertNotIn("CxpLinkConfiguration", panel.settings)
+            # Not merely unexposed: never read, so the panel issues no GenCP
+            # transaction at all for them.
+            self.assertNotIn("ConnectionConfig", accessed)
+            self.assertNotIn("CxpLinkConfiguration", accessed)
+            # A normal node on the same node map is still read.
+            self.assertIn("ExposureTime", accessed)
+        finally:
+            _reset_main_window(window)
+
     def test_connect_defers_reading_the_node_map_until_the_panel_opens(self):
         window = _shared_main_window()
         panel = window.ui.settings_window
