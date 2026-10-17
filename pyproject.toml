@@ -14,12 +14,12 @@ dependencies = [
     "tqdm>=4.67.1",
 ]
 
-[build.system]
+[build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["ui", "MainWindow", "cam", "acquire", "VideoThread", "liveview", "settings", "importexport", "frametime", "saving", "reset", "get_attributes", "attributes", "harvester_test"]
+py-modules = ["ui", "MainWindow", "settings", "cam", "camera_profiles", "VideoThread", "importexport", "acquire", "frametime", "liveview"]
 
 [project.scripts]
 harvesters_pg = "ui:main"
