@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-import cam
-import numpy as np
-import h5py
-import tqdm
 import datetime
 import uuid
 
-from harvesters.core import Harvester, ImageAcquirer
+import h5py
+
+import cam
 
 FPS = 1000
 T = 1
@@ -14,29 +12,17 @@ PARTICLES = ""  # lab ids of the particle batches, comma-separated (optional)
 OBJECTIVE = ""  # lab id of the objective (optional)
 
 
-ctis = cam.find_common_cti_files()
-h, ia = cam.setup_cam(cti=ctis[0], fps=FPS)
-
-# Start the acquisition engine:
-
-width = ia.remote_device.node_map.Width.value
-height = ia.remote_device.node_map.Height.value
-frames = np.zeros([T*FPS, height, width], dtype=np.uint8)
-
-# warmup
-for i in tqdm.tqdm(range(10), desc="warmup"):
-    with ia.fetch() as buffer:
-        pass
-
-started = datetime.datetime.now()
+ctis = cam.load_cti_envvar()
+h, ia = cam.setup_cam(cti=ctis, fps=FPS, start=False)
 try:
-    for i in tqdm.tqdm(range(T*FPS), desc="Fetching frames"):
-        with ia.fetch() as buffer:
-            np.copyto(frames[i], buffer.payload.components[0].data.reshape(buffer.payload.components[0].height, buffer.payload.components[0].width))
-except Exception as e:
-    print(e)
+    started = datetime.datetime.now()
+    try:
+        frames = cam.record_harvester_frames(ia, T * FPS, None)
+    except cam.RecordingInterrupted as e:
+        frames = e.frames
+        print(f"Warning: {e}; keeping the {len(frames)} frames recorded before the camera stopped")
 finally:
-    cam.disconnect_cam(h, ia)
+    cam.teardown_cam(h, ia)
 
 timestamp = started.strftime("%Y%m%d%H%M%S")
 filename = f"{timestamp}_{FPS}fps.h5"
