@@ -519,6 +519,7 @@ def _reset_main_window(window):
     for widget in (window.ui.pb_connect, window.ui.cb_source):
         widget.setEnabled(True)
     window.ui.actionSelect_GenTLProducer.setEnabled(True)
+    window._update_roi_controls()  # leaves ROI mode, button disabled
 
 
 class UiRaceGuardTests(unittest.TestCase):
@@ -1818,6 +1819,233 @@ class RecordingAndSavingTests(unittest.TestCase):
         self.assertEqual(
             sorted(p.name for p in (self.tmp / "rec").iterdir()), ["rec_0.png", "rec_1.png"]
         )
+
+
+def _aoi_limits(
+    sensor=(2336, 1728), size_min=(16, 16), size_inc=(16, 16), offset_inc=(8, 8), offsets=True
+):
+    return cam.AoiLimits(
+        *(
+            cam.AoiAxis(
+                size_min=size_min[i],
+                size_inc=size_inc[i],
+                sensor=sensor[i],
+                offset_inc=offset_inc[i],
+                has_offset=offsets,
+            )
+            for i in (0, 1)
+        )
+    )
+
+
+class RoiToAoiTests(unittest.TestCase):
+    """A box dragged on the current frame -> the camera AOI (cam.roi_to_sensor_aoi)."""
+
+    def test_offsets_accumulate_on_an_already_cropped_aoi(self):
+        limits = _aoi_limits(size_min=(1, 1), size_inc=(1, 1), offset_inc=(1, 1))
+        aoi = cam.roi_to_sensor_aoi((100.2, 50.7, 300.0, 250.0), (1024, 1024), (656, 352), limits)
+        # Box pixels 100..299 x 50..249 of a frame that starts at (656, 352).
+        self.assertEqual(aoi, (200, 200, 756, 402))
+
+    def test_box_is_clamped_to_the_current_frame(self):
+        limits = _aoi_limits(size_min=(1, 1), size_inc=(1, 1), offset_inc=(1, 1))
+        # Frame 640 x 480 at (100, 60); the box overshoots on every side.
+        aoi = cam.roi_to_sensor_aoi((-50, -20, 5000, 3000), (480, 640), (100, 60), limits)
+        self.assertEqual(aoi, (640, 480, 100, 60))
+        # Overshooting one edge only keeps the other.
+        aoi = cam.roi_to_sensor_aoi((600, 400, 900, 700), (480, 640), (100, 60), limits)
+        self.assertEqual(aoi, (40, 80, 700, 460))
+
+    def test_aoi_snaps_onto_the_camera_grid_inside_the_box(self):
+        # Width inc 16, OffsetX inc 8; Height inc 4, OffsetY inc 2.
+        limits = _aoi_limits(size_min=(16, 8), size_inc=(16, 4), offset_inc=(8, 2))
+        width, height, offset_x, offset_y = cam.roi_to_sensor_aoi(
+            (13, 7, 250, 101), (1728, 2336), (0, 0), limits
+        )
+        self.assertEqual((width, height, offset_x, offset_y), (240, 92, 8, 6))
+        self.assertEqual((width % 16, offset_x % 8, height % 4, offset_y % 2), (0, 0, 0, 0))
+        # Offsets move down onto their grid, sizes down onto theirs: the AOI
+        # ends at or before the box's far edge.
+        self.assertLessEqual(offset_x + width, 250)
+        self.assertLessEqual(offset_y + height, 101)
+
+    def test_drag_direction_does_not_matter(self):
+        limits = _aoi_limits()
+        corners = (37.5, 21.0, 410.0, 333.3)
+        x0, y0, x1, y1 = corners
+        expected = cam.roi_to_sensor_aoi(corners, (1024, 1024), (64, 32), limits)
+        for box in ((x1, y1, x0, y0), (x1, y0, x0, y1), (x0, y1, x1, y0)):
+            self.assertEqual(cam.roi_to_sensor_aoi(box, (1024, 1024), (64, 32), limits), expected)
+
+    def test_box_below_the_minimum_grows_to_it_inside_the_frame(self):
+        limits = _aoi_limits(size_min=(16, 8), size_inc=(16, 4), offset_inc=(8, 2))
+        # One pixel in the bottom-right corner of a 640 x 480 frame at (64, 32).
+        aoi = cam.roi_to_sensor_aoi((638.2, 478.5, 639.0, 479.5), (480, 640), (64, 32), limits)
+        self.assertEqual(aoi, (16, 8, 64 + 624, 32 + 472))
+
+    def test_camera_without_offsets_keeps_the_origin(self):
+        # TLSimu: no OffsetX/OffsetY; Width/Height inc 4, min 8.
+        limits = _aoi_limits(
+            sensor=(4096, 4096), size_min=(8, 8), size_inc=(4, 4), offsets=False
+        )
+        aoi = cam.roi_to_sensor_aoi((100, 50, 300, 250), (512, 512), (0, 0), limits)
+        self.assertEqual(aoi, (300, 248, None, None))
+
+    def test_full_sensor_reset(self):
+        self.assertEqual(cam.full_sensor_aoi(_aoi_limits()), (2336, 1728, 0, 0))
+        limits = _aoi_limits(sensor=(4096, 4096), size_min=(8, 8), size_inc=(4, 4), offsets=False)
+        self.assertEqual(cam.full_sensor_aoi(limits), (4096, 4096, None, None))
+
+
+def _coupled_aoi_camera(state, sensor, size_inc, offset_inc, width_max_node=True):
+    """An ImageAcquirer stand-in whose AOI nodes are coupled as in SFNC.
+
+    *state* holds Width/Height/OffsetX/OffsetY and is updated by writes;
+    Width.max is WidthMax - OffsetX etc. Without *width_max_node* the camera
+    has no WidthMax/HeightMax nodes.
+    """
+    from harvesters.core import ImageAcquirer
+
+    incs = {"Width": size_inc[0], "Height": size_inc[1], "OffsetX": offset_inc[0], "OffsetY": offset_inc[1]}
+
+    class CoupledNode:
+        def __init__(self, name):
+            self.name = name
+            self.inc = incs[name]
+
+        @property
+        def min(self):
+            return 0 if self.name.startswith("Offset") else 16
+
+        @property
+        def max(self):
+            return {
+                "Width": sensor[0] - state["OffsetX"],
+                "Height": sensor[1] - state["OffsetY"],
+                "OffsetX": sensor[0] - state["Width"],
+                "OffsetY": sensor[1] - state["Height"],
+            }[self.name]
+
+        @property
+        def value(self):
+            return state[self.name]
+
+        @value.setter
+        def value(self, value):
+            if not self.min <= value <= self.max or (value - self.min) % self.inc:
+                raise ValueError(f"{self.name}={value} not allowed")
+            state[self.name] = value
+
+    nodes = {name: CoupledNode(name) for name in incs}
+    if width_max_node:
+        nodes["WidthMax"] = SimpleNamespace(value=sensor[0])
+        nodes["HeightMax"] = SimpleNamespace(value=sensor[1])
+    ia = MagicMock(spec=ImageAcquirer)
+    ia.is_acquiring.return_value = True
+    ia.remote_device.node_map = SimpleNamespace(**nodes)
+    return ia
+
+
+class RoiToolTests(unittest.TestCase):
+    """The ROI tool of the live view, with a mocked camera."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6 import QtWidgets
+
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def setUp(self):
+        self.window = _shared_main_window()
+        # A cropped 1024 x 512 AOI at (656, 352) on a 2336 x 1728 sensor.
+        self.state = {"Width": 1024, "Height": 512, "OffsetX": 656, "OffsetY": 352}
+        self.ia = _coupled_aoi_camera(self.state, (2336, 1728), (16, 1), (8, 1))
+
+    def tearDown(self):
+        _reset_main_window(self.window)
+
+    def _go_live(self, cap):
+        window = self.window
+        window.videothread = MagicMock()
+        window.videothread.cap = cap
+        window.is_running = True
+        window._update_roi_controls()
+        window.update_image(np.zeros((self.state["Height"], self.state["Width"]), np.uint8))
+
+    def test_tool_is_offered_only_while_a_harvester_camera_is_live(self):
+        import cv2
+
+        window = self.window
+        self._go_live(MagicMock(spec=cv2.VideoCapture))
+        self.assertFalse(window.ui.pb_roi.isEnabled(), "offered for an OpenCV camera")
+        self._go_live(self.ia)
+        self.assertTrue(window.ui.pb_roi.isEnabled())
+        window.ui.pb_roi.setChecked(True)
+        self.assertEqual(window.Image.getView().state["mouseEnabled"], [False, False])
+        # Pausing (also what recording and File > Open do first) leaves ROI mode.
+        window.pause_video()  # videothread is a MagicMock: stop() returns at once
+        self.assertFalse(window.ui.pb_roi.isEnabled())
+        self.assertFalse(window.ui.pb_roi.isChecked())
+        self.assertEqual(window.Image.getView().state["mouseEnabled"], [True, True])
+
+    def test_dragged_box_is_applied_as_the_camera_aoi(self):
+        window = self.window
+        self._go_live(self.ia)
+        # x is the frame's column, y its row: the view shows 1024 x 512.
+        item = window.Image.getImageItem()
+        self.assertEqual((item.width(), item.height()), (1024, 512))
+        window.ui.pb_roi.setChecked(True)
+        with (
+            patch("ui.cam.set_resolution", wraps=cam.set_resolution) as set_resolution,
+            patch("ui.cam.save_resolution_config") as save,
+        ):
+            # Dragged from bottom-right to top-left.
+            window._roi_overlay.sigBoxFinished.emit(401.0, 300.0, 100.5, 40.0)
+        # x: sensor 756..1057 -> OffsetX 752 (inc 8), Width 304 (inc 16);
+        # y: sensor 392..652 -> OffsetY 392, Height 260.
+        set_resolution.assert_called_once_with(
+            self.ia, width=304, height=260, offset_x=752, offset_y=392
+        )
+        self.assertEqual(self.state, {"Width": 304, "Height": 260, "OffsetX": 752, "OffsetY": 392})
+        self.assertEqual(
+            save.call_args.args[1], {"width": 304, "height": 260, "offset_x": 752, "offset_y": 392}
+        )
+        self.assertEqual((window.ui.sb_res_width.value(), window.ui.sb_res_height.value()), (304, 260))
+        self.assertFalse(window.ui.pb_roi.isChecked(), "ROI mode is one-shot")
+        self.assertEqual(window._autorange_shape, (260, 304))
+        window.update_image(np.zeros((260, 304), np.uint8))
+        self.assertIsNone(window._autorange_shape, "the view re-fits once at the new size")
+
+    def test_click_and_stale_frame_change_nothing(self):
+        window = self.window
+        self._go_live(self.ia)
+        window.ui.pb_roi.setChecked(True)
+        with patch("ui.cam.set_resolution") as set_resolution:
+            window.on_roi_box(10.0, 10.0, 10.5, 10.5)  # a click, not a box
+            self.assertTrue(window.ui.pb_roi.isChecked())
+            # A frame of the previous AOI still on screen: its offsets are unknown.
+            window.update_image(np.zeros((480, 640), np.uint8))
+            window.on_roi_box(10.0, 10.0, 200.0, 200.0)
+        set_resolution.assert_not_called()
+
+    def test_full_sensor_restores_the_whole_sensor(self):
+        window = self.window
+        self._go_live(self.ia)
+        window.ui.pb_full_sensor.setEnabled(True)
+        with patch("ui.cam.save_resolution_config") as save:
+            window.ui.pb_full_sensor.click()
+        self.assertEqual(self.state, {"Width": 2336, "Height": 1728, "OffsetX": 0, "OffsetY": 0})
+        self.assertEqual(
+            save.call_args.args[1], {"width": 2336, "height": 1728, "offset_x": 0, "offset_y": 0}
+        )
+
+    def test_sensor_size_without_widthmax_nodes(self):
+        # Width.max shrinks by the offset (SFNC coupling); add it back.
+        ia = _coupled_aoi_camera(self.state, (2336, 1728), (16, 1), (8, 1), width_max_node=False)
+        limits, current = cam.read_aoi(ia)
+        self.assertEqual((limits.x.sensor, limits.y.sensor), (2336, 1728))
+        self.assertEqual(current, (1024, 512, 656, 352))
+
 
 
 if __name__ == "__main__":

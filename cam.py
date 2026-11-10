@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QProgressBar
 from harvesters.core import Harvester, ImageAcquirer
 from cv2 import VideoCapture
 import cv2
+import math
 import numpy as np
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import re
 from tqdm import trange
 import time
 import threading
+from dataclasses import dataclass
 from typing import Callable
 
 from camera_profiles import detect_profile, max_frame_rate
@@ -1204,6 +1206,36 @@ def set_attribute(ia, attribute, value):
             logging.warning(f"Error while setting attribute {attribute} to {value}: {e}")
 
 
+def snap_value(value: int, lo: int, hi: int, inc: int = 1) -> int:
+    """Snap *value* down onto the grid ``lo + k * inc`` and clamp to [lo, hi].
+
+    The grid of a GenICam IInteger node: valid values are its min plus a
+    multiple of its increment.
+
+    Args:
+        value (int): The requested value.
+        lo (int): The node's minimum (the grid origin).
+        hi (int): The node's maximum.
+        inc (int): The node's increment; values below 1 count as 1.
+
+    Returns:
+        int: The largest grid value <= *value* within [lo, hi] (*lo* if
+        *value* is below it).
+    """
+    inc = max(int(inc), 1)
+    value = max(min(int(value), hi), lo)
+    snapped = lo + ((value - lo) // inc) * inc
+    return max(min(snapped, hi), lo)
+
+
+def _node_inc(node) -> int:
+    """A node's increment, 1 when it reports none."""
+    try:
+        return max(int(node.inc), 1)
+    except (AttributeError, TypeError):
+        return 1
+
+
 def _snap_to_increment(node, value: int) -> int:
     """Snap *value* to ``node``'s increment and clamp to [min, max].
 
@@ -1218,17 +1250,7 @@ def _snap_to_increment(node, value: int) -> int:
     Returns:
         int: The snapped value within [node.min, node.max].
     """
-    lo = int(node.min)
-    hi = int(node.max)
-    try:
-        inc = int(node.inc)
-    except (AttributeError, TypeError):
-        inc = 1
-    if inc < 1:
-        inc = 1
-    value = max(min(int(value), hi), lo)
-    snapped = lo + ((value - lo) // inc) * inc
-    return max(min(snapped, hi), lo)
+    return snap_value(value, int(node.min), int(node.max), _node_inc(node))
 
 
 def set_resolution(
@@ -1296,6 +1318,161 @@ def _write_snapped(nodes, node_name: str, value: int) -> None:
         node.value = _snap_to_increment(node, value)
     except Exception as e:
         logging.warning(f"Could not set {node_name} to {value}: {e}")
+
+
+@dataclass(frozen=True)
+class AoiAxis:
+    """The AOI constraints along one sensor axis (Width+OffsetX or Height+OffsetY).
+
+    Attributes:
+        size_min (int): Minimum Width/Height.
+        size_inc (int): Width/Height increment.
+        sensor (int): Full sensor extent (WidthMax/HeightMax).
+        offset_min (int): Minimum OffsetX/OffsetY.
+        offset_inc (int): OffsetX/OffsetY increment.
+        has_offset (bool): Whether the camera exposes the offset node at all
+            (TLSimu does not: its AOI always starts at the sensor origin).
+    """
+
+    size_min: int
+    size_inc: int
+    sensor: int
+    offset_min: int = 0
+    offset_inc: int = 1
+    has_offset: bool = True
+
+
+@dataclass(frozen=True)
+class AoiLimits:
+    """The AOI constraints of a camera, see read_aoi()."""
+
+    x: AoiAxis
+    y: AoiAxis
+
+
+def read_aoi(ia: ImageAcquirer) -> tuple[AoiLimits, tuple[int, int, int, int]]:
+    """Read the camera's AOI constraints and its current AOI.
+
+    The sensor extent comes from WidthMax/HeightMax. Cameras without those
+    report it through Width.max, which SFNC couples to the offset
+    (Width.max == WidthMax - OffsetX), so the current offset is added back.
+
+    Args:
+        ia (ImageAcquirer): The ImageAcquirer object.
+
+    Returns:
+        tuple: (limits, (width, height, offset_x, offset_y)); offsets are 0
+        on cameras without offset nodes.
+
+    Raises:
+        AttributeError: if the camera has no Width/Height node.
+    """
+    with IA_LOCK:
+        nodes = ia.remote_device.node_map
+        axes = []
+        current = []
+        for size_name, offset_name in (("Width", "OffsetX"), ("Height", "OffsetY")):
+            size = getattr(nodes, size_name)
+            try:
+                offset = getattr(nodes, offset_name)
+                offset_value = int(offset.value)
+            except Exception:
+                offset, offset_value = None, 0
+            try:
+                sensor = int(getattr(nodes, f"{size_name}Max").value)
+            except Exception:
+                sensor = int(size.max) + offset_value
+            axes.append(
+                AoiAxis(
+                    size_min=int(size.min),
+                    size_inc=_node_inc(size),
+                    sensor=sensor,
+                    offset_min=int(offset.min) if offset is not None else 0,
+                    offset_inc=_node_inc(offset) if offset is not None else 1,
+                    has_offset=offset is not None,
+                )
+            )
+            current.append((int(size.value), offset_value))
+    (width, offset_x), (height, offset_y) = current
+    return AoiLimits(*axes), (width, height, offset_x, offset_y)
+
+
+def _roi_axis(
+    a: float, b: float, frame_size: int, frame_offset: int, axis: AoiAxis
+) -> tuple[int, int | None]:
+    """Sensor (size, offset) of the span a..b of one axis of the current frame."""
+    lo, hi = sorted((a, b))
+    lo = min(max(lo, 0.0), float(frame_size))
+    hi = min(max(hi, 0.0), float(frame_size))
+    frame_end = frame_offset + frame_size  # the current frame, in sensor pixels
+    # Every pixel the box touches, in sensor coordinates (end exclusive).
+    start = frame_offset + math.floor(lo)
+    end = frame_offset + math.ceil(hi)
+    if axis.has_offset:
+        offset = snap_value(start, axis.offset_min, axis.sensor, axis.offset_inc)
+    else:
+        offset = frame_offset  # pinned: the AOI always starts at the origin
+    # Snapped down, so the AOI stays inside the selection - except where the
+    # minimum size forces it to grow.
+    room = max(axis.sensor - offset, axis.size_min)
+    size = snap_value(end - offset, axis.size_min, room, axis.size_inc)
+    if axis.has_offset and offset + size > frame_end:
+        # Grown to the minimum size past the frame's edge: slide it back in.
+        offset = snap_value(frame_end - size, axis.offset_min, axis.sensor, axis.offset_inc)
+    return size, offset if axis.has_offset else None
+
+
+def roi_to_sensor_aoi(
+    box: tuple[float, float, float, float],
+    frame_shape: tuple[int, int],
+    frame_offset: tuple[int, int],
+    limits: AoiLimits,
+) -> tuple[int, int, int | None, int | None]:
+    """Turn a box drawn on the current frame into a camera AOI.
+
+    The box is clamped to the frame, shifted by the frame's own sensor
+    offset (the frame may already be a cropped AOI), and snapped onto the
+    camera's grid: offsets down onto the OffsetX/OffsetY grid, sizes down
+    onto the Width/Height grid, so the AOI never reads out more than the box
+    covers. A box below the minimum size grows to it, staying inside the
+    frame. On a camera without offset nodes the AOI keeps starting at the
+    origin and extends to the box's far edge.
+
+    Args:
+        box (tuple[float, ...]): (x0, y0, x1, y1) in pixels of the current
+            frame - x along its columns, y along its rows; either corner may
+            come first (drag in any direction).
+        frame_shape (tuple[int, int]): The current frame's (height, width).
+        frame_offset (tuple[int, int]): The current (OffsetX, OffsetY).
+        limits (AoiLimits): The camera's AOI constraints, see read_aoi().
+
+    Returns:
+        tuple: (width, height, offset_x, offset_y) for set_resolution();
+        offsets are None on cameras without the respective offset node.
+    """
+    x0, y0, x1, y1 = box
+    frame_h, frame_w = frame_shape
+    width, offset_x = _roi_axis(x0, x1, frame_w, frame_offset[0], limits.x)
+    height, offset_y = _roi_axis(y0, y1, frame_h, frame_offset[1], limits.y)
+    return width, height, offset_x, offset_y
+
+
+def full_sensor_aoi(limits: AoiLimits) -> tuple[int, int, int | None, int | None]:
+    """The AOI that reads out the whole sensor: WidthMax x HeightMax at offset 0.
+
+    Args:
+        limits (AoiLimits): The camera's AOI constraints, see read_aoi().
+
+    Returns:
+        tuple: (width, height, offset_x, offset_y) for set_resolution();
+        offsets are None on cameras without the respective offset node.
+    """
+    sizes = [
+        snap_value(axis.sensor, axis.size_min, max(axis.sensor, axis.size_min), axis.size_inc)
+        for axis in (limits.x, limits.y)
+    ]
+    offsets = [axis.offset_min if axis.has_offset else None for axis in (limits.x, limits.y)]
+    return sizes[0], sizes[1], offsets[0], offsets[1]
 
 
 def _user_config_dir() -> Path:

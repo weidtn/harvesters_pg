@@ -14,6 +14,11 @@ Because feature node names differ between camera families (SFNC ~ExposureTime~ v
 
 The image size applied in the settings panel is stored per camera (vendor/model/serial) in =~/.config/harvesters_pg/camera_resolution.json= and re-applied when that camera connects again.
 
+* Region of interest (camera AOI)
+The camera can read out only part of its sensor, which raises the frame rate and shrinks recordings. Besides typing a size and pressing /Apply/, you can draw the region on the live view: press /Select ROI/ next to the image size (available while a GenICam camera is live, not for webcams, during a recording or while a loaded file is shown), then left-drag a box over the image. The label at the box shows its size and the camera AOI it becomes; Esc cancels. While the tool is active the view does not pan or zoom.
+
+On release the box is applied right away: it is clamped to the current frame, shifted by the current ~OffsetX~ / ~OffsetY~ (so a box drawn on an already cropped image lands on the right sensor pixels) and snapped to the camera's ~Width~ / ~Height~ / offset increments, rounding inwards; a box smaller than the camera's minimum size is enlarged to it. Cameras without offset nodes keep the AOI at the sensor origin and extend it to the box's far edge. The camera restarts with the new AOI, the view fits it once, and the AOI is saved per camera like the image size. /Full sensor/ restores ~WidthMax~ x ~HeightMax~ at offset 0.
+
 * Recording
 It is possible to record video. The frames can be inspected in the main window and saved as image sequence or in a h5 file.
 
