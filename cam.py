@@ -51,6 +51,10 @@ FETCH_SLICE_S = 0.1
 # to reach zero.
 _MIN_FETCH_S = 0.001
 
+# Pause between two empty fetch slices, with IA_LOCK released, so a thread
+# waiting for the lock gets it (see get_harvester_image).
+_LOCK_YIELD_S = 0.001
+
 
 class RecordingInterrupted(TimeoutError):
     """The camera stopped delivering in the middle of a recording.
@@ -232,6 +236,7 @@ def setup_cam(
     exposure: int = 999,
     search_key: int | dict | None = None,
     start: bool = True,
+    configure: bool = True,
 ) -> tuple[Harvester, ImageAcquirer]:
     """Set the camera up using the Harvester API.
 
@@ -249,6 +254,11 @@ def setup_cam(
             The GUI passes False: it starts acquisition itself when live view
             or a recording begins, and a start/warm-up/kill-stop cycle per
             connect is pure GenTL churn on the frame grabber.
+        configure (bool): Write the connect defaults (frame rate, exposure,
+            full-sensor AOI, TriggerMode Off, info fields, black level).
+            False only opens the device and keeps every camera setting as it
+            is: the GUI re-opens an already configured camera that way to
+            apply an AOI (see MainWindow._apply_aoi).
 
     Returns:
         tuple[Harvester, ImageAcquirer]: The Harvester object and the ImageAcquirer object.
@@ -292,7 +302,10 @@ def setup_cam(
             h.update()
             device = _find_device(h, search_key)
             ia = h.create(fallback_key if device is None else device)
-        _configure_cam(ia, height, width, fps, blacklevel, exposure, start=start)
+        if configure:
+            _configure_cam(ia, height, width, fps, blacklevel, exposure, start=start)
+        elif start:
+            ia.start()
         if start:
             warmup_cam(ia)
     except Exception:
@@ -348,27 +361,18 @@ def _configure_cam(
     except Exception as e:
         logging.warning(f"Could not set {profile.exposure_node} to {exposure}: {e}")
 
-    if height is not None:
+    for size_name, offset_name, value in (("Width", "OffsetX", width), ("Height", "OffsetY", height)):
+        if value is None:
+            # Whole sensor; a saved AOI is applied over it later (the GUI's
+            # setup_resolution_settings). The camera keeps the AOI of the last
+            # session, offsets included, until this resets it.
+            _full_sensor_axis(nodes, size_name, offset_name)
+            continue
         try:
-            nodes.Height.value = _snap_to_increment(nodes.Height, height)
+            size = getattr(nodes, size_name)
+            size.value = _snap_to_increment(size, value)
         except Exception as e:
-            logging.warning(f"Could not set Height to {height}: {e}")
-    else:
-        try:
-            nodes.Height.value = nodes.HeightMax.value
-        except Exception as e:
-            logging.debug(f"HeightMax not available, keeping camera Height: {e}")
-
-    if width is not None:
-        try:
-            nodes.Width.value = _snap_to_increment(nodes.Width, width)
-        except Exception as e:
-            logging.warning(f"Could not set Width to {width}: {e}")
-    else:
-        try:
-            nodes.Width.value = nodes.WidthMax.value
-        except Exception as e:
-            logging.debug(f"WidthMax not available, keeping camera Width: {e}")
+            logging.warning(f"Could not set {size_name} to {value}: {e}")
 
     try:
         nodes.TriggerMode.value = "Off"
@@ -897,6 +901,12 @@ def get_harvester_image(
             return None
         if time.monotonic() >= deadline:
             break
+        # Off the lock and the GIL for a moment. Releasing IA_LOCK alone is
+        # not enough: this thread re-took it before a waiting GUI thread got
+        # to run, so a node write (or the old AOI change) waited out the whole
+        # FETCH_TIMEOUT_S while the camera delivered nothing - most likely the
+        # ~5 s per AOI apply in the MC2066 rig's log.
+        time.sleep(_LOCK_YIELD_S)
     # Timed out instead of hanging: a camera that stops delivering degrades to
     # a black live view the user can still disconnect from.
     logging.warning(f"No frame within {timeout}s; showing a black image")
@@ -1260,16 +1270,21 @@ def set_resolution(
     offset_x: int | None = None,
     offset_y: int | None = None,
 ) -> tuple[int | None, int | None, int | None, int | None]:
-    """Set the camera AOI (Width/Height and sensor offsets) safely.
+    """Set the camera AOI (Width/Height and sensor offsets) on a stopped camera.
 
-    Many GenICam producers refuse to write Width/Height (and offsets) while
-    acquisition is running - TLSimu raises an AccessException - so the camera
-    is stopped for the writes and restarted only if it was acquiring. Values
+    Callers write it to a freshly created ImageAcquirer before its first start
+    (see MainWindow._apply_aoi and aoi_probe.py). harvesters keeps the data
+    stream open from create() to destroy() and sizes the buffers it announces
+    on start() from the stream's own payload size, which a frame grabber need
+    not update after a camera-side AOI write. The old stop -> write -> start
+    on the same ImageAcquirer gave a black live view on the Active Silicon
+    CoaXPress rig, and fatal PCIe machine checks followed. A camera that is
+    acquiring is therefore refused, never stopped and restarted here. Values
     are snapped to each node's increment and clamped to [min, max]; nodes the
     camera does not expose (e.g. offsets on TLSimu) are skipped.
 
     Args:
-        ia (ImageAcquirer): The ImageAcquirer object.
+        ia (ImageAcquirer): The ImageAcquirer object; must not be acquiring.
         width (int | None): New Width, or None to leave unchanged.
         height (int | None): New Height, or None to leave unchanged.
         offset_x (int | None): New OffsetX, or None to leave unchanged.
@@ -1277,37 +1292,38 @@ def set_resolution(
 
     Returns:
         tuple[int | None, ...]: The applied (width, height, offset_x, offset_y).
+
+    Raises:
+        RuntimeError: if *ia* is acquiring.
     """
     with IA_LOCK:
+        if ia.is_acquiring():
+            raise RuntimeError(
+                "The AOI is only written to a freshly opened, never started camera: "
+                "stop, destroy and re-create the ImageAcquirer first."
+            )
         nodes = ia.remote_device.node_map
-        was_running = bool(ia.is_acquiring())
-        if was_running:
-            ia.stop()
-        try:
-            # SFNC couples each offset to its size (OffsetX + Width <= WidthMax).
-            # Writing the offset first fails while the current size is large;
-            # writing the size first clamps a saved offset to the room the old
-            # offset left (a camera starting at full size clamped every saved
-            # offset to 0). Zero the offset, set the size, then the offset.
-            for offset_name, offset_value, size_name, size_value in (
-                ("OffsetX", offset_x, "Width", width),
-                ("OffsetY", offset_y, "Height", height),
-            ):
-                if offset_value is not None:
-                    _write_snapped(nodes, offset_name, 0)
-                if size_value is not None:
-                    _write_snapped(nodes, size_name, size_value)
-                if offset_value is not None:
-                    _write_snapped(nodes, offset_name, offset_value)
-            applied: list[int | None] = [None, None, None, None]
-            for i, node_name in enumerate(("Width", "Height", "OffsetX", "OffsetY")):
-                try:
-                    applied[i] = int(getattr(nodes, node_name).value)
-                except Exception:
-                    pass
-        finally:
-            if was_running:
-                ia.start()
+        # SFNC couples each offset to its size (OffsetX + Width <= WidthMax).
+        # Writing the offset first fails while the current size is large;
+        # writing the size first clamps a saved offset to the room the old
+        # offset left (a camera starting at full size clamped every saved
+        # offset to 0). Zero the offset, set the size, then the offset.
+        for offset_name, offset_value, size_name, size_value in (
+            ("OffsetX", offset_x, "Width", width),
+            ("OffsetY", offset_y, "Height", height),
+        ):
+            if offset_value is not None:
+                _write_snapped(nodes, offset_name, 0)
+            if size_value is not None:
+                _write_snapped(nodes, size_name, size_value)
+            if offset_value is not None:
+                _write_snapped(nodes, offset_name, offset_value)
+        applied: list[int | None] = [None, None, None, None]
+        for i, node_name in enumerate(("Width", "Height", "OffsetX", "OffsetY")):
+            try:
+                applied[i] = int(getattr(nodes, node_name).value)
+            except Exception:
+                pass
     return tuple(applied)
 
 
@@ -1327,7 +1343,7 @@ class AoiAxis:
     Attributes:
         size_min (int): Minimum Width/Height.
         size_inc (int): Width/Height increment.
-        sensor (int): Full sensor extent (WidthMax/HeightMax).
+        sensor (int): Full sensor extent, see sensor_extent().
         offset_min (int): Minimum OffsetX/OffsetY.
         offset_inc (int): OffsetX/OffsetY increment.
         has_offset (bool): Whether the camera exposes the offset node at all
@@ -1350,12 +1366,66 @@ class AoiLimits:
     y: AoiAxis
 
 
+def sensor_extent(nodes, size_name: str, offset_name: str) -> int:
+    """The full sensor extent along one axis, read without writing anything.
+
+    WidthMax/HeightMax if the camera has them, else SensorWidth/SensorHeight,
+    else Width.max plus the current offset: SFNC caps Width at
+    WidthMax - OffsetX, so Width.max alone shrinks with the offset (the
+    MC2066 reported Width.max 1120 = 1920 - 800 at OffsetX 800). On a camera
+    whose Width.max does not follow the offset that sum overshoots, which is
+    harmless where it is used: set_resolution zeroes the offset and clamps
+    the size to Width.max, and _full_sensor_axis zeroes the offset first.
+
+    Args:
+        nodes: The camera's node map.
+        size_name (str): "Width" or "Height".
+        offset_name (str): The matching "OffsetX" or "OffsetY".
+
+    Returns:
+        int: The sensor extent in pixels.
+
+    Raises:
+        AttributeError: if the camera has no *size_name* node.
+    """
+    for name in (f"{size_name}Max", f"Sensor{size_name}"):
+        try:
+            return int(getattr(nodes, name).value)
+        except Exception:
+            pass
+    try:
+        offset = int(getattr(nodes, offset_name).value)
+    except Exception:
+        offset = 0
+    return int(getattr(nodes, size_name).max) + offset
+
+
+def _full_sensor_axis(nodes, size_name: str, offset_name: str) -> None:
+    """Read out the whole sensor along one axis of a camera that is not acquiring.
+
+    The offset goes to its minimum first: SFNC couples it to the size, so
+    writing the full size under an old offset is out of range (the MC2066
+    refused Height 1080 under OffsetY 612: "must be equal or smaller than
+    Max = 468"). With the offset at 0, Width.max is the sensor width even on
+    a camera without WidthMax/SensorWidth.
+    """
+    try:
+        offset = getattr(nodes, offset_name)
+        offset.value = int(offset.min)
+    except Exception as e:
+        logging.debug(f"{offset_name} not reset (not available or not writable): {e}")
+    try:
+        size = getattr(nodes, size_name)
+        size.value = _snap_to_increment(size, sensor_extent(nodes, size_name, offset_name))
+    except Exception as e:
+        logging.warning(f"Could not set {size_name} to the full sensor: {e}")
+
+
 def read_aoi(ia: ImageAcquirer) -> tuple[AoiLimits, tuple[int, int, int, int]]:
     """Read the camera's AOI constraints and its current AOI.
 
-    The sensor extent comes from WidthMax/HeightMax. Cameras without those
-    report it through Width.max, which SFNC couples to the offset
-    (Width.max == WidthMax - OffsetX), so the current offset is added back.
+    Read-only (it runs while live): the sensor extent comes from
+    sensor_extent().
 
     Args:
         ia (ImageAcquirer): The ImageAcquirer object.
@@ -1378,10 +1448,7 @@ def read_aoi(ia: ImageAcquirer) -> tuple[AoiLimits, tuple[int, int, int, int]]:
                 offset_value = int(offset.value)
             except Exception:
                 offset, offset_value = None, 0
-            try:
-                sensor = int(getattr(nodes, f"{size_name}Max").value)
-            except Exception:
-                sensor = int(size.max) + offset_value
+            sensor = sensor_extent(nodes, size_name, offset_name)
             axes.append(
                 AoiAxis(
                     size_min=int(size.min),
@@ -1458,7 +1525,7 @@ def roi_to_sensor_aoi(
 
 
 def full_sensor_aoi(limits: AoiLimits) -> tuple[int, int, int | None, int | None]:
-    """The AOI that reads out the whole sensor: WidthMax x HeightMax at offset 0.
+    """The AOI that reads out the whole sensor: the sensor extent at offset 0.
 
     Args:
         limits (AoiLimits): The camera's AOI constraints, see read_aoi().
@@ -1473,6 +1540,95 @@ def full_sensor_aoi(limits: AoiLimits) -> tuple[int, int, int | None, int | None
     ]
     offsets = [axis.offset_min if axis.has_offset else None for axis in (limits.x, limits.y)]
     return sizes[0], sizes[1], offsets[0], offsets[1]
+
+
+# Node names worth logging around an AOI change, on the camera's frame grabber
+# (the GenTL device module) and on the data stream.
+AOI_NODE_PATTERN = re.compile(r"width|height|payload|offset|roi|aoi", re.IGNORECASE)
+
+
+def matching_node_values(node_map, pattern: re.Pattern = AOI_NODE_PATTERN) -> dict:
+    """Values of the readable nodes of *node_map* whose names match *pattern*.
+
+    Read-only and best effort: nodes that cannot be read are left out, and a
+    missing node map gives an empty dict.
+    """
+    values = {}
+    if node_map is None:
+        return values
+    try:
+        names = dir(node_map)
+    except Exception:
+        return values
+    for name in names:
+        if name.startswith("_") or not pattern.search(name):
+            continue
+        try:
+            values[name] = getattr(node_map, name).value
+        except Exception:
+            continue
+    return values
+
+
+def aoi_snapshot(ia: ImageAcquirer) -> dict[str, dict]:
+    """What the camera, its frame grabber and the data streams report about the AOI.
+
+    For the log of every AOI change: a frame grabber whose own image format
+    does not follow the camera's AOI shows up as a mismatch between the
+    camera's PayloadSize and the stream's payload_size, which harvesters
+    sizes the announced buffers from whenever defines_payload_size() is true.
+    Read-only; never raises (unreadable values are left out).
+
+    Args:
+        ia (ImageAcquirer): The ImageAcquirer object.
+
+    Returns:
+        dict: {"camera": {...}, "grabber": {...}, "stream0": {...}, ...}.
+    """
+    snapshot: dict[str, dict] = {}
+    with IA_LOCK:
+        camera = {}
+        for name in ("Width", "Height", "OffsetX", "OffsetY", "PayloadSize"):
+            try:
+                camera[name] = getattr(ia.remote_device.node_map, name).value
+            except Exception:
+                continue
+        snapshot["camera"] = camera
+        try:
+            snapshot["grabber"] = matching_node_values(ia.device.node_map)
+        except Exception:
+            snapshot["grabber"] = {}
+        try:
+            streams = list(ia.data_streams)
+        except Exception:
+            streams = []
+        for i, stream in enumerate(streams):
+            entry = {}
+            try:
+                entry.update(matching_node_values(stream.node_map))
+            except Exception:
+                pass
+            try:
+                defines = bool(stream.defines_payload_size())
+                entry["defines_payload_size()"] = defines
+                if defines:
+                    entry["payload_size"] = int(stream.payload_size)
+            except Exception as e:
+                entry["payload_size"] = f"unavailable ({type(e).__name__})"
+            snapshot[f"stream{i}"] = entry
+    return snapshot
+
+
+def describe_aoi_state(ia: ImageAcquirer) -> str:
+    """aoi_snapshot() as one log line, e.g. ``camera: Width=512, ...; stream0: ...``."""
+    try:
+        snapshot = aoi_snapshot(ia)
+    except Exception as e:  # never let logging break an AOI change
+        return f"unavailable ({e})"
+    return "; ".join(
+        f"{part}: " + (", ".join(f"{name}={value}" for name, value in values.items()) or "-")
+        for part, values in snapshot.items()
+    )
 
 
 def _user_config_dir() -> Path:

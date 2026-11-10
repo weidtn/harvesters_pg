@@ -50,7 +50,7 @@ class VideoThread(QtCore.QThread):
     # only comes into play when a driver call itself hangs.
     JOIN_TIMEOUT_S = 10.0
 
-    def __init__(self, source, ctis) -> None:
+    def __init__(self, source, ctis, configure: bool = True) -> None:
         super().__init__()
         self.source: str = source
         self._run_flag: bool = False
@@ -64,9 +64,9 @@ class VideoThread(QtCore.QThread):
             self.image_func = self._harvester_frame
         self.cap: cv2.VideoCapture | ImageAcquirer | None = None
         self.harvester: Harvester | None = None
-        self.set_cap(ctis)
+        self.set_cap(ctis, configure)
 
-    def set_cap(self, ctis) -> None:
+    def set_cap(self, ctis, configure: bool = True) -> None:
         if self.source == "random":
             self.cap = None
         elif "Webcam" in self.source:
@@ -86,8 +86,14 @@ class VideoThread(QtCore.QThread):
             # Starting and warming up here only to stop again right after the
             # connect was a full announce/start/kill-stop/revoke cycle on the
             # frame grabber per connect, for nothing.
+            # configure=False re-opens a camera that is already set up (an AOI
+            # change, see MainWindow._apply_aoi) without writing the connect
+            # defaults over the user's settings.
             self.harvester, self.cap = cam.setup_cam(
-                cti=ctis, search_key={"display_name": self.source}, start=False
+                cti=ctis,
+                search_key={"display_name": self.source},
+                start=False,
+                configure=configure,
             )
 
     def _harvester_frame(self, ia: ImageAcquirer) -> np.ndarray | None:

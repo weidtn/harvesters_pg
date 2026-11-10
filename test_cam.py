@@ -421,13 +421,19 @@ class TlSimuTests(unittest.TestCase):
             self.assertEqual(live.shape, (ia.remote_device.node_map.Height.value,
                                           ia.remote_device.node_map.Width.value))
             self.assertTrue(live.flags["OWNDATA"])
-            # AOI change WHILE acquiring: Width/Height are not writable during
-            # acquisition on TLSimu, so set_resolution must stop -> write ->
-            # start; the live path then delivers the new size.
-            w0 = int(ia.remote_device.node_map.Width.value)
-            h0 = int(ia.remote_device.node_map.Height.value)
+            # An AOI change never goes to a camera that is acquiring:
+            # set_resolution refuses. The safe path re-opens the camera and
+            # writes the AOI before its first start; the live path then
+            # delivers the new size.
+            nodes = ia.remote_device.node_map
+            w0, h0 = int(nodes.Width.value), int(nodes.Height.value)
+            with self.assertRaises(RuntimeError):
+                cam.set_resolution(ia, width=64, height=48)
+            self.assertEqual((int(nodes.Width.value), int(nodes.Height.value)), (w0, h0))
+            ia = self._reopen(ia)
             aw, ah, _, _ = cam.set_resolution(ia, width=64, height=48)
             self.assertEqual((aw, ah), (64, 48))  # 64/48 are on the inc=4 grid
+            ia.start()
             live2 = cam.get_harvester_image(ia)
             self.assertEqual(live2.shape, (ah, aw))
             # record at the new size: owned, C-contiguous (n, h, w) stack.
@@ -436,14 +442,21 @@ class TlSimuTests(unittest.TestCase):
             self.assertTrue(frames.flags["C_CONTIGUOUS"])
             self.assertTrue(frames.flags["OWNDATA"])
             self.assertFalse(np.isfortran(frames[0]))
-            # After record the camera is stopped; an off-grid request still
-            # snaps onto the increment grid and restores cleanly (no fetch).
+            # An off-grid request snaps onto the increment grid.
+            ia = self._reopen(ia)
             cam.set_resolution(ia, width=66, height=46)
             self.assertEqual(int(ia.remote_device.node_map.Width.value), 64)
             self.assertEqual(int(ia.remote_device.node_map.Height.value), 44)
             cam.set_resolution(ia, width=w0, height=h0)
         finally:
             cam.disconnect_cam(h, ia)
+
+    def _reopen(self, ia):
+        """The AOI-change path: release *ia*, open the same camera unconfigured."""
+        cam.teardown_cam(None, ia)
+        _, ia = cam.setup_cam(cti=str(self.cti), start=False, configure=False)
+        self.assertFalse(ia.is_acquiring())
+        return ia
 
     def test_reconnect_cycles_release_the_device(self):
         """Connect/disconnect repeatedly on a device that is not index 0.
@@ -519,7 +532,9 @@ def _reset_main_window(window):
     for widget in (window.ui.pb_connect, window.ui.cb_source):
         widget.setEnabled(True)
     window.ui.actionSelect_GenTLProducer.setEnabled(True)
-    window._update_roi_controls()  # leaves ROI mode, button disabled
+    window._aoi_cooldown.stop()  # no AOI cooldown carried over from another test
+    window._aoi_busy = False
+    window._update_aoi_controls()  # leaves ROI mode, AOI buttons disabled
 
 
 class UiRaceGuardTests(unittest.TestCase):
@@ -1111,6 +1126,9 @@ class VideoThreadTeardownTests(unittest.TestCase):
         thread = self._bare_thread()
         thread.cap = ia
         thread.image_func = thread._harvester_frame
+        # Released here, not by __del__ whenever the GC gets to it: that ran
+        # teardown_cam inside a later test's patch window.
+        self.addCleanup(thread.close)
         return thread
 
     def test_stop_waits_for_the_worker_to_hand_its_buffer_back(self):
@@ -1897,15 +1915,23 @@ class RoiToAoiTests(unittest.TestCase):
         self.assertEqual(cam.full_sensor_aoi(limits), (4096, 4096, None, None))
 
 
-def _coupled_aoi_camera(state, sensor, size_inc, offset_inc, width_max_node=True):
+def _coupled_aoi_camera(
+    state, sensor, size_inc, offset_inc, width_max_node=True, events=None, label="ia"
+):
     """An ImageAcquirer stand-in whose AOI nodes are coupled as in SFNC.
 
     *state* holds Width/Height/OffsetX/OffsetY and is updated by writes;
     Width.max is WidthMax - OffsetX etc. Without *width_max_node* the camera
-    has no WidthMax/HeightMax nodes.
+    has no WidthMax/HeightMax nodes. Stand-ins sharing one *state* are one
+    camera opened several times. Writes (of the AOI, ExposureTime and
+    AcquisitionFrameRate), start, stop and destroy are appended to *events*
+    as ``(label, what, ...)``. The AOI refuses writes while acquiring, as
+    TLSimu's does, and no frame is ever delivered.
     """
     from harvesters.core import ImageAcquirer
 
+    events = [] if events is None else events
+    acquiring = [False]
     incs = {"Width": size_inc[0], "Height": size_inc[1], "OffsetX": offset_inc[0], "OffsetY": offset_inc[1]}
 
     class CoupledNode:
@@ -1932,22 +1958,98 @@ def _coupled_aoi_camera(state, sensor, size_inc, offset_inc, width_max_node=True
 
         @value.setter
         def value(self, value):
+            if acquiring[0]:
+                raise RuntimeError(f"{self.name} is not writable while acquiring")
             if not self.min <= value <= self.max or (value - self.min) % self.inc:
                 raise ValueError(f"{self.name}={value} not allowed")
             state[self.name] = value
+            events.append((label, "write", self.name, value))
+
+    class SettingNode:
+        min, max = 1, 1000
+
+        def __init__(self, name, value):
+            self.name = name
+            self._value = value
+
+        @property
+        def value(self):
+            return self._value
+
+        @value.setter
+        def value(self, value):
+            self._value = value
+            events.append((label, "write", self.name, value))
 
     nodes = {name: CoupledNode(name) for name in incs}
+    nodes["ExposureTime"] = SettingNode("ExposureTime", 777.0)
+    nodes["AcquisitionFrameRate"] = SettingNode("AcquisitionFrameRate", 120.0)
     if width_max_node:
         nodes["WidthMax"] = SimpleNamespace(value=sensor[0])
         nodes["HeightMax"] = SimpleNamespace(value=sensor[1])
+
+    def start(*args, **kwargs):
+        acquiring[0] = True
+        events.append((label, "start"))
+
+    def stop():
+        if acquiring[0]:
+            events.append((label, "stop"))
+        acquiring[0] = False
+
+    def destroy():
+        stop()
+        events.append((label, "destroy"))
+
+    def try_fetch(timeout=0):
+        time.sleep(min(timeout, 0.01))
+        return None
+
     ia = MagicMock(spec=ImageAcquirer)
-    ia.is_acquiring.return_value = True
+    ia.is_acquiring.side_effect = lambda: acquiring[0]
+    ia.start.side_effect = start
+    ia.stop.side_effect = stop
+    ia.destroy.side_effect = destroy
+    ia.try_fetch.side_effect = try_fetch
     ia.remote_device.node_map = SimpleNamespace(**nodes)
     return ia
 
 
+class SensorExtentTests(unittest.TestCase):
+    """The sensor size of cameras whose Width.max shrinks with OffsetX."""
+
+    def test_sensor_size_without_widthmax_nodes(self):
+        # Width.max shrinks by the offset (SFNC coupling); add it back.
+        state = {"Width": 1024, "Height": 512, "OffsetX": 656, "OffsetY": 352}
+        ia = _coupled_aoi_camera(state, (2336, 1728), (16, 1), (8, 1), width_max_node=False)
+        limits, current = cam.read_aoi(ia)
+        self.assertEqual((limits.x.sensor, limits.y.sensor), (2336, 1728))
+        self.assertEqual(current, (1024, 512, 656, 352))
+        self.assertEqual(cam.full_sensor_aoi(limits), (2336, 1728, 0, 0))
+
+    def test_connect_resets_an_offset_aoi_to_the_full_sensor(self):
+        # The MC2066 after a session that left it at 128 x 60 at (800, 612):
+        # Width.max was 1120, Height.max 468, and writing 1080 to Height
+        # under OffsetY 612 was out of range.
+        for width_max_node in (True, False):
+            with self.subTest(width_max_node=width_max_node):
+                state = {"Width": 128, "Height": 60, "OffsetX": 800, "OffsetY": 612}
+                ia = _coupled_aoi_camera(
+                    state, (1920, 1080), (16, 4), (16, 4), width_max_node=width_max_node
+                )
+                cam._configure_cam(ia, None, None, 30, 125, 999, start=False)
+                self.assertEqual(state, {"Width": 1920, "Height": 1080, "OffsetX": 0, "OffsetY": 0})
+
+
+_AOI_SOURCE = "Coupled AOI camera"
+
+
 class RoiToolTests(unittest.TestCase):
-    """The ROI tool of the live view, with a mocked camera."""
+    """The AOI controls (Apply, ROI tool, Full sensor) with a mocked camera.
+
+    The camera is connected through the real MainWindow/VideoThread paths;
+    only cam.setup_cam is replaced, by stand-ins that share one AOI state.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -1956,21 +2058,72 @@ class RoiToolTests(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     def setUp(self):
-        self.window = _shared_main_window()
+        window = self.window = _shared_main_window()
         # A cropped 1024 x 512 AOI at (656, 352) on a 2336 x 1728 sensor.
         self.state = {"Width": 1024, "Height": 512, "OffsetX": 656, "OffsetY": 352}
-        self.ia = _coupled_aoi_camera(self.state, (2336, 1728), (16, 1), (8, 1))
+        self.events = []
+        self.opened = []  # (configure, search_key) of every cam.setup_cam call
+        self.open_error = None  # raised by the next cam.setup_cam call
+        self.ia = self._camera("ia0")
+        mocks = {}
+        for target, kwargs in (
+            ("cam.setup_cam", {"side_effect": self._setup_cam}),
+            ("cam.load_resolution_config", {"return_value": {}}),
+            ("cam.save_resolution_config", {}),
+        ):
+            patcher = patch(target, **kwargs)
+            mocks[target] = patcher.start()
+            self.addCleanup(patcher.stop)
+        self.save = mocks["cam.save_resolution_config"]
+        self.previous_source = window.ui.cb_source.currentText()
+        window.ui.cb_source.addItem(_AOI_SOURCE)
+        self.previous_ctis, window.ctis = window.ctis, ["fake.cti"]
 
     def tearDown(self):
-        _reset_main_window(self.window)
+        from VideoThread import VideoThread
+
+        window = self.window
+        if isinstance(window.videothread, VideoThread):
+            window.disconnect_video()
+        _reset_main_window(window)
+        window.ui.cb_source.removeItem(window.ui.cb_source.findText(_AOI_SOURCE))
+        window.ui.cb_source.setCurrentText(self.previous_source)
+        window.ctis = self.previous_ctis
+
+    def _camera(self, label):
+        return _coupled_aoi_camera(
+            self.state, (2336, 1728), (16, 1), (8, 1), events=self.events, label=label
+        )
+
+    def _setup_cam(self, cti, search_key=None, start=True, configure=True, **kwargs):
+        if self.open_error is not None:
+            raise self.open_error
+        self.opened.append((configure, search_key))
+        return MagicMock(), self._camera(f"ia{len(self.opened)}")
+
+    def _show_camera_frame(self):
+        self.window.update_image(np.zeros((self.state["Height"], self.state["Width"]), np.uint8))
+
+    def _connect(self, live):
+        """Connect the camera as ia1 and optionally go live; forget its events."""
+        window = self.window
+        window.ui.cb_source.setCurrentText(_AOI_SOURCE)
+        window.connect_video()
+        self.assertIsNotNone(window.videothread, "connect failed")
+        if live:
+            window.start_video()
+            self.assertTrue(window.is_running)
+        self._show_camera_frame()
+        self.events.clear()
+        return window.videothread.cap
 
     def _go_live(self, cap):
         window = self.window
         window.videothread = MagicMock()
         window.videothread.cap = cap
         window.is_running = True
-        window._update_roi_controls()
-        window.update_image(np.zeros((self.state["Height"], self.state["Width"]), np.uint8))
+        window._update_aoi_controls()
+        self._show_camera_frame()
 
     def test_tool_is_offered_only_while_a_harvester_camera_is_live(self):
         import cv2
@@ -1988,29 +2141,101 @@ class RoiToolTests(unittest.TestCase):
         self.assertFalse(window.ui.pb_roi.isChecked())
         self.assertEqual(window.Image.getView().state["mouseEnabled"], [True, True])
 
+    def test_live_aoi_change_reopens_the_camera_before_writing(self):
+        window = self.window
+        old = self._connect(live=True)
+        window._apply_aoi(304, 260, 752, 392)
+        new = window.videothread.cap
+        self.assertIsNot(new, old)
+        # The connect defaults are written on the first connect only.
+        self.assertEqual(
+            self.opened,
+            [(True, {"display_name": _AOI_SOURCE}), (False, {"display_name": _AOI_SOURCE})],
+        )
+        # Worker joined and old camera stopped + destroyed before anything is
+        # written; the AOI goes to the new one (offset 0 -> size -> offset)
+        # before its first start. Exposure and frame rate are left alone.
+        self.assertEqual(
+            self.events,
+            [
+                ("ia1", "stop"),
+                ("ia1", "destroy"),
+                ("ia2", "write", "OffsetX", 0),
+                ("ia2", "write", "Width", 304),
+                ("ia2", "write", "OffsetX", 752),
+                ("ia2", "write", "OffsetY", 0),
+                ("ia2", "write", "Height", 260),
+                ("ia2", "write", "OffsetY", 392),
+                ("ia2", "start"),
+            ],
+        )
+        self.assertTrue(window.is_running, "live view not restarted")
+        self.assertEqual(
+            self.save.call_args.args[1], {"width": 304, "height": 260, "offset_x": 752, "offset_y": 392}
+        )
+        self.assertEqual((window.ui.sb_res_width.value(), window.ui.sb_res_height.value()), (304, 260))
+        # One change at a time: during the cooldown nothing re-opens the camera.
+        for button in (window.ui.pb_res_apply, window.ui.pb_roi, window.ui.pb_full_sensor):
+            self.assertFalse(button.isEnabled(), button.text())
+        window._apply_aoi(2336, 1728, 0, 0)
+        self.assertEqual(len(self.opened), 2, "a second change re-opened the camera")
+        window._end_aoi_cooldown()
+        for button in (window.ui.pb_res_apply, window.ui.pb_roi, window.ui.pb_full_sensor):
+            self.assertTrue(button.isEnabled(), button.text())
+
+    def test_paused_aoi_change_does_not_start_the_camera(self):
+        window = self.window
+        self._connect(live=False)
+        window.ui.sb_res_width.setValue(512)
+        window.ui.sb_res_height.setValue(256)
+        window.ui.pb_res_apply.click()  # Apply: size only, offsets stay
+        self.assertEqual(
+            self.events,
+            [("ia1", "destroy"), ("ia2", "write", "Width", 512), ("ia2", "write", "Height", 256)],
+        )
+        self.assertFalse(window.is_running)
+        self.assertIsNotNone(window.videothread)
+        self.assertEqual(self.state, {"Width": 512, "Height": 256, "OffsetX": 656, "OffsetY": 352})
+        self.assertEqual(
+            self.save.call_args.args[1], {"width": 512, "height": 256, "offset_x": 656, "offset_y": 352}
+        )
+
+    def test_failed_reopen_leaves_the_camera_disconnected(self):
+        window = self.window
+        self._connect(live=True)
+        self.open_error = RuntimeError("device gone")
+        with patch("ui.QtWidgets.QMessageBox.critical") as box:
+            window._apply_aoi(304, 260, 752, 392)
+        box.assert_called_once()
+        self.assertIn("device gone", box.call_args.args[2])
+        self.assertIn(("ia1", "destroy"), self.events)
+        self.assertIsNone(window.videothread)
+        self.assertFalse(window.is_running)
+        self.assertEqual(window.ui.pb_connect.text(), "Connect")
+        self.assertTrue(window.ui.cb_source.isEnabled())
+        self.assertFalse(window.ui.pb_live.isEnabled())
+        window._end_aoi_cooldown()
+        for button in (window.ui.pb_res_apply, window.ui.pb_roi, window.ui.pb_full_sensor):
+            self.assertFalse(button.isEnabled(), button.text())
+        self.assertIn("not applied", window.statusBar().currentMessage())
+        self.save.assert_not_called()
+
     def test_dragged_box_is_applied_as_the_camera_aoi(self):
         window = self.window
-        self._go_live(self.ia)
+        self._connect(live=True)
         # x is the frame's column, y its row: the view shows 1024 x 512.
         item = window.Image.getImageItem()
         self.assertEqual((item.width(), item.height()), (1024, 512))
         window.ui.pb_roi.setChecked(True)
-        with (
-            patch("ui.cam.set_resolution", wraps=cam.set_resolution) as set_resolution,
-            patch("ui.cam.save_resolution_config") as save,
-        ):
+        with patch("ui.cam.set_resolution", wraps=cam.set_resolution) as set_resolution:
             # Dragged from bottom-right to top-left.
             window._roi_overlay.sigBoxFinished.emit(401.0, 300.0, 100.5, 40.0)
         # x: sensor 756..1057 -> OffsetX 752 (inc 8), Width 304 (inc 16);
         # y: sensor 392..652 -> OffsetY 392, Height 260.
         set_resolution.assert_called_once_with(
-            self.ia, width=304, height=260, offset_x=752, offset_y=392
+            window.videothread.cap, width=304, height=260, offset_x=752, offset_y=392
         )
         self.assertEqual(self.state, {"Width": 304, "Height": 260, "OffsetX": 752, "OffsetY": 392})
-        self.assertEqual(
-            save.call_args.args[1], {"width": 304, "height": 260, "offset_x": 752, "offset_y": 392}
-        )
-        self.assertEqual((window.ui.sb_res_width.value(), window.ui.sb_res_height.value()), (304, 260))
         self.assertFalse(window.ui.pb_roi.isChecked(), "ROI mode is one-shot")
         self.assertEqual(window._autorange_shape, (260, 304))
         window.update_image(np.zeros((260, 304), np.uint8))
@@ -2027,25 +2252,25 @@ class RoiToolTests(unittest.TestCase):
             window.update_image(np.zeros((480, 640), np.uint8))
             window.on_roi_box(10.0, 10.0, 200.0, 200.0)
         set_resolution.assert_not_called()
+        self.assertEqual(self.opened, [])
 
     def test_full_sensor_restores_the_whole_sensor(self):
         window = self.window
-        self._go_live(self.ia)
-        window.ui.pb_full_sensor.setEnabled(True)
-        with patch("ui.cam.save_resolution_config") as save:
-            window.ui.pb_full_sensor.click()
+        self._connect(live=True)
+        window.ui.pb_full_sensor.click()
         self.assertEqual(self.state, {"Width": 2336, "Height": 1728, "OffsetX": 0, "OffsetY": 0})
         self.assertEqual(
-            save.call_args.args[1], {"width": 2336, "height": 1728, "offset_x": 0, "offset_y": 0}
+            self.save.call_args.args[1], {"width": 2336, "height": 1728, "offset_x": 0, "offset_y": 0}
         )
 
-    def test_sensor_size_without_widthmax_nodes(self):
-        # Width.max shrinks by the offset (SFNC coupling); add it back.
-        ia = _coupled_aoi_camera(self.state, (2336, 1728), (16, 1), (8, 1), width_max_node=False)
-        limits, current = cam.read_aoi(ia)
-        self.assertEqual((limits.x.sensor, limits.y.sensor), (2336, 1728))
-        self.assertEqual(current, (1024, 512, 656, 352))
-
+    def test_no_frame_after_the_restart_is_reported(self):
+        window = self.window
+        self._connect(live=True)
+        with self.assertLogs(level="WARNING") as logs:
+            window._apply_aoi(304, 260, 752, 392)
+            window._check_first_aoi_frame(window._aoi_watch, (260, 304))
+        self.assertTrue(any("No 304 × 260 frame" in line for line in logs.output), logs.output)
+        self.assertIn("No 304 × 260 frame", window.statusBar().currentMessage())
 
 
 if __name__ == "__main__":

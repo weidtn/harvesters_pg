@@ -56,6 +56,15 @@ _APP_MANAGED_COMMANDS = frozenset(
 # them, so it cannot write them either.
 _UNSAFE_NODES = frozenset({"ConnectionConfig", "CxpLinkConfiguration"})
 
+# After an AOI change has finished, further AOI changes are ignored for this
+# long. Each one closes and re-opens the camera on the frame grabber; several
+# within seconds preceded the fatal PCIe machine checks on the CoaXPress rig.
+AOI_COOLDOWN_S = 1.0
+
+# A live view restarted for an AOI change warns once if no frame of the new
+# size has arrived after this long.
+AOI_FIRST_FRAME_S = 2.0
+
 
 class _InputBlocker(QtCore.QObject):
     """Event filter that discards mouse and key input aimed at one window.
@@ -541,6 +550,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # (height, width) of the AOI just applied: the first live frame of
         # that size re-fits the view once (see update_image).
         self._autorange_shape: tuple[int, int] | None = None
+        # An AOI change is running or has just finished (see _apply_aoi):
+        # further changes are ignored and the AOI controls disabled.
+        self._aoi_busy: bool = False
+        self._aoi_cooldown = QtCore.QTimer(self)
+        self._aoi_cooldown.setSingleShot(True)
+        self._aoi_cooldown.setInterval(int(AOI_COOLDOWN_S * 1000))
+        self._aoi_cooldown.timeout.connect(self._end_aoi_cooldown)
+        # Identifies the latest first-frame check of an AOI change, and when
+        # the camera was restarted for it.
+        self._aoi_watch: int = 0
+        self._aoi_started_at: float | None = None
         self.source: str = "random"
         self.recording: np.ndarray = np.array([])
         # Identity of self.recording: every file it is saved to carries both.
@@ -631,10 +651,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.lbl_black_level_min.setToolTip(self.ui.hsli_black_level.toolTip())
         self.ui.lbl_black_level_max.setToolTip(self.ui.hsli_black_level.toolTip())
 
-        # Resolution (AOI) row in the settings panel. Width/Height are only
-        # writable while acquisition is stopped on many producers, so the Apply
-        # button restarts the camera through cam.set_resolution and persists
-        # the chosen size for the next connect.
+        # Resolution (AOI) row in the settings panel. Apply, the ROI tool and
+        # Full sensor all go through _apply_aoi, which re-opens the camera to
+        # write the AOI before a first start, and persists the chosen size for
+        # the next connect.
         self.ui.lbl_resolution = QtWidgets.QLabel(text="Image Size [px]")
         self.ui.sb_res_width = QtWidgets.QSpinBox()
         self.ui.sb_res_width.setButtonSymbols(
@@ -835,11 +855,23 @@ class MainWindow(QtWidgets.QMainWindow):
         with self._dropping_queued_input():
             self._connect_video()
 
-    def _connect_video(self) -> None:
+    def _connect_video(
+        self, aoi: tuple[int, int, int | None, int | None] | None = None
+    ) -> bool:
+        """Open the selected source and put the UI into the paused state.
+
+        Args:
+            aoi (tuple | None): Re-open an already configured camera for an
+                AOI change: skip the connect defaults and write this AOI
+                before the first start (see _apply_aoi).
+
+        Returns:
+            bool: Whether the source was opened; a failure has been reported.
+        """
         self.source = self.ui.cb_source.currentText()
         logging.info(f"Connecting to {self.source!r}")
         try:
-            videothread = VideoThread(self.source, self.ctis)
+            videothread = VideoThread(self.source, self.ctis, configure=aoi is None)
         except Exception as e:
             # Report it and stay disconnected; setup_cam has already released
             # whatever it managed to open. (pyqtgraph replaces sys.excepthook,
@@ -851,7 +883,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Could not connect",
                 f"Connecting to {self.source!r} failed:\n\n{e}",
             )
-            return
+            return False
         self.videothread = videothread
         self.videothread.change_pixmap_signal.connect(self.update_image)
         self.ui.pb_live.setDisabled(False)
@@ -864,7 +896,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # connected without acquiring; live view or a recording starts it.
         self.pause_video()
         try:
-            self.on_source_connected()
+            self.on_source_connected(aoi)
         except Exception as e:
             # The camera is already open: keep the connection, drop the
             # settings panel, and tell the user.
@@ -879,6 +911,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"read:\n\n{e}",
             )
         logging.info(f"Connected to {self.source!r}")
+        return True
 
     def disconnect_video(self) -> None:
         """Stop the video thread, release the camera, and reset the UI."""
@@ -897,7 +930,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.videothread = None
             logging.info(f"Disconnected from {self.source!r}")
             self.is_running = False
-            self._update_roi_controls()
+            self._update_aoi_controls()
             self.ui.pb_live.setDisabled(True)
             self.ui.pb_connect.setText("Connect")
             self.ui.pb_connect.clicked.disconnect()
@@ -978,7 +1011,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is_running = True
         self.ui.pb_live.setText("Pause")
         self.ui.lbl_status.setStyleSheet("color: green;")
-        self._update_roi_controls()
+        self._update_aoi_controls()
 
     def pause_video(self) -> None:
         if not self.videothread:
@@ -989,7 +1022,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.lbl_status.setStyleSheet("color: orange;")
         # Start disabled Save; an unsaved recording must be saveable again.
         self.ui.pb_save.setEnabled(self.recording.size > 0)
-        self._update_roi_controls()
+        self._update_aoi_controls()
 
     def toggle_video(self) -> None:
         if not self.is_running:
@@ -1015,6 +1048,12 @@ class MainWindow(QtWidgets.QMainWindow):
             # and pan refer to the previous size.
             self._autorange_shape = None
             self.Image.getView().autoRange()
+            if self._aoi_started_at is not None:
+                logging.info(
+                    f"First {frame.shape[-1]}x{frame.shape[-2]} frame "
+                    f"{time.monotonic() - self._aoi_started_at:.2f} s after the restart"
+                )
+                self._aoi_started_at = None
         self.ui.lbl_img_minmax.setText(
             f"Pixelvalue Min: {disp.T[1::4,::4].min()} - Max: {disp.T[1::4,::4].max()}"
         )
@@ -1120,6 +1159,9 @@ class MainWindow(QtWidgets.QMainWindow):
             settings_window.setEnabled(True)
             if settings_window.isVisible():
                 settings_window.start_polling()
+            # The AOI controls follow the state after the recording, not the
+            # one before it (an AOI cooldown may have ended meanwhile).
+            self._update_aoi_controls()
 
     def _release_display(self) -> None:
         """Clear the view and let go of the array it shows."""
@@ -1299,14 +1341,23 @@ class MainWindow(QtWidgets.QMainWindow):
         fps = self.ui.sb_fps.value()
         self.ui.sb_frames.setValue(int(seconds * fps))
 
-    def on_source_connected(self) -> None:
-        """Update the source based on the combobox."""
+    def on_source_connected(
+        self, aoi: tuple[int, int, int | None, int | None] | None = None
+    ) -> None:
+        """Update the source based on the combobox.
+
+        Args:
+            aoi (tuple | None): The AOI to write before the first start; set
+                when the camera is re-opened for an AOI change, which also
+                leaves the camera's frame rate and exposure untouched.
+        """
         self.source = self.ui.cb_source.currentText()
         if "random" in self.source or "Webcam" in self.source:
             self.ui.settings.setHidden(True)
         else: # Harvester camera
-            self.setup_settings()  # get minmax values for settings
-            self.setup_resolution_settings()  # populate + re-apply saved image size
+            # The AOI first: the frame rate maximum read next depends on it.
+            self.setup_resolution_settings(aoi)  # write the new or saved AOI
+            self.setup_settings(push=aoi is None)  # get minmax values for settings
             self.ui.pb_settings.setDisabled(False)
             self.ui.settings.setHidden(False)
             # Built when the panel is first shown, not on every connect.
@@ -1319,12 +1370,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.profile.frame_rate_node,
             self.ui.sb_fps.value(),
         )
-        self.ui.lbl_exposure_minmax.setText(
-            f"(2 - {cam.get_max_exposure(self.ui.sb_fps.value())})"
-        )
+        self._show_exposure_range()
         self.on_exposure_changed()
-        self.ui.sb_exposure.setMaximum(cam.get_max_exposure(self.ui.sb_fps.value()))
         self.on_frames_changed()
+
+    def _show_exposure_range(self) -> None:
+        """The exposure label and spinbox maximum that the frame rate allows."""
+        max_exposure = cam.get_max_exposure(self.ui.sb_fps.value())
+        self.ui.lbl_exposure_minmax.setText(f"(2 - {max_exposure})")
+        self.ui.sb_exposure.setMaximum(max_exposure)
 
     def on_exposure_changed(self) -> None:
         """Update the exposure based on the settings."""
@@ -1352,7 +1406,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.videothread.cap, "BlackLevel", self.ui.hsli_black_level.value()
         )
 
-    def setup_settings(self) -> None:
+    def setup_settings(self, push: bool = True) -> None:
+        """Read the camera's ranges into the settings panel.
+
+        Args:
+            push (bool): Write the panel's frame rate and exposure to the
+                camera (a fresh connect). False when the camera is re-opened
+                for an AOI change: it keeps the settings it has.
+        """
         ia = self.videothread.cap
         node_map = ia.remote_device.node_map
         self.profile = camera_profiles.detect_profile(node_map)
@@ -1367,7 +1428,11 @@ class MainWindow(QtWidgets.QMainWindow):
             max_fps = int(max_fps)
         self.ui.sb_fps.setMaximum(max_fps)
         self.ui.lbl_fps_minmax.setText(f"(1 - {max_fps})")
-        self.on_fps_changed()
+        if push:
+            self.on_fps_changed()
+        else:
+            self._show_exposure_range()
+            self.on_frames_changed()
         self.setup_auto_boxes()
 
     def setup_auto_boxes(self) -> None:
@@ -1447,51 +1512,62 @@ class MainWindow(QtWidgets.QMainWindow):
         if not checked:
             self.on_analog_gain_changed()  # push the manual value again
 
-    def setup_resolution_settings(self) -> None:
-        """Populate the resolution row and re-apply a saved image size.
+    def setup_resolution_settings(
+        self, aoi: tuple[int, int, int | None, int | None] | None = None
+    ) -> None:
+        """Populate the resolution row and write the AOI of a fresh connect.
 
-        Runs after connecting a Harvester camera. Reads the Width/Height node
-        ranges, applies any resolution persisted by an earlier session, and
-        syncs the spinboxes to what the camera actually reports.
+        Runs after connecting a Harvester camera, before its first start:
+        the one place the AOI is written. Applies *aoi* if given (an AOI
+        change re-opening the camera, see _apply_aoi), else any resolution
+        persisted by an earlier session, and syncs the spinboxes to what the
+        camera actually reports.
+
+        Args:
+            aoi (tuple | None): (width, height, offset_x, offset_y) for
+                cam.set_resolution; None re-applies the saved resolution.
         """
         ia = self.videothread.cap
         node_map = ia.remote_device.node_map
-        for sb, node_name in (
-            (self.ui.sb_res_width, "Width"),
-            (self.ui.sb_res_height, "Height"),
+        for sb, node_name, offset_name in (
+            (self.ui.sb_res_width, "Width", "OffsetX"),
+            (self.ui.sb_res_height, "Height", "OffsetY"),
         ):
             try:
                 node = getattr(node_map, node_name)
                 sb.setMinimum(int(node.min))
-                sb.setMaximum(int(node.max))
+                # Not node.max: that is the room the current offset leaves.
+                sb.setMaximum(cam.sensor_extent(node_map, node_name, offset_name))
                 sb.setDisabled(False)
             except Exception as e:
                 logging.warning(f"Resolution {node_name} not available: {e}")
                 sb.setDisabled(True)
-        cfg = cam.load_resolution_config(cam.camera_config_key(ia))
-        if isinstance(cfg.get("width"), int) and isinstance(cfg.get("height"), int):
+        if aoi is None:
+            cfg = cam.load_resolution_config(cam.camera_config_key(ia))
+            if isinstance(cfg.get("width"), int) and isinstance(cfg.get("height"), int):
+                aoi = (cfg["width"], cfg["height"], cfg.get("offset_x"), cfg.get("offset_y"))
+                what = "Reapplied saved resolution"
+        else:
+            what = "Applied resolution"
+        if aoi is not None:
             w, h, ox, oy = cam.set_resolution(
-                ia,
-                width=cfg["width"],
-                height=cfg["height"],
-                offset_x=cfg.get("offset_x"),
-                offset_y=cfg.get("offset_y"),
+                ia, width=aoi[0], height=aoi[1], offset_x=aoi[2], offset_y=aoi[3]
             )
             self.ui.sb_res_width.setValue(w)
             self.ui.sb_res_height.setValue(h)
-            logging.info(f"Reapplied saved resolution {w}x{h}")
+            where = "" if ox is None and oy is None else f" at offset ({ox}, {oy})"
+            logging.info(f"{what} {w}x{h}{where}")
         else:
             try:
                 self.ui.sb_res_width.setValue(int(node_map.Width.value))
                 self.ui.sb_res_height.setValue(int(node_map.Height.value))
             except Exception as e:
                 logging.warning(f"Could not read resolution: {e}")
-        self.ui.pb_res_apply.setDisabled(False)
-        self.ui.pb_full_sensor.setDisabled(False)
+        self._update_aoi_controls()
 
     def on_resolution_apply(self) -> None:
         """Apply the Width x Height from the settings panel to the camera."""
-        if not self.videothread or type(self.videothread.cap) is not cam.ImageAcquirer:
+        if self._harvester_cap() is None:
             logging.debug("Resolution apply requires a Harvester camera")
             return
         self._apply_aoi(self.ui.sb_res_width.value(), self.ui.sb_res_height.value())
@@ -1506,9 +1582,18 @@ class MainWindow(QtWidgets.QMainWindow):
         """Apply an AOI to the connected Harvester camera and persist it.
 
         The one path for Apply, the ROI tool and Full sensor. The camera is
-        stopped for the AOI writes and restarted if it was acquiring; the
-        result is persisted so the chosen AOI survives reconnect/restart.
-        Live view, recordings, and saved files all follow the applied size.
+        re-opened exactly like Disconnect + Connect, the path that works on
+        the CoaXPress frame grabber: the worker is joined (no fetch in
+        flight), the ImageAcquirer is stopped and destroyed (data stream
+        closed, buffers revoked), a new one is created for the same camera,
+        the AOI is written before its first start, and live view restarts if
+        it was running. Stop -> write -> start on the same ImageAcquirer gave
+        a black live view there, and the machine died of fatal PCIe errors
+        soon after. The re-open skips the connect defaults, so exposure,
+        gain, frame rate etc. stay as they are on the camera.
+
+        One change at a time: the AOI controls stay disabled (and further
+        requests are ignored) until AOI_COOLDOWN_S after it finished.
 
         Args:
             width (int): New Width.
@@ -1516,10 +1601,86 @@ class MainWindow(QtWidgets.QMainWindow):
             offset_x (int | None): New OffsetX, or None to leave it unchanged.
             offset_y (int | None): New OffsetY, or None to leave it unchanged.
         """
-        ia = self.videothread.cap
-        w, h, ox, oy = cam.set_resolution(
-            ia, width=width, height=height, offset_x=offset_x, offset_y=offset_y
-        )
+        if self._aoi_busy:
+            logging.info("AOI change ignored: the previous one has not finished yet")
+            return
+        ia = self._harvester_cap()
+        if ia is None or self.is_recording:
+            return
+        requested = (width, height, offset_x, offset_y)
+        was_live = self.is_running
+        self._aoi_busy = True
+        self._update_aoi_controls()
+        try:
+            logging.info(
+                f"AOI change to {requested} (width, height, offset_x, offset_y): "
+                f"re-opening the camera. Before: {cam.describe_aoi_state(ia)}"
+            )
+            with self._dropping_queued_input():
+                ia = self._reopen_with_aoi(requested)
+                if ia is None:
+                    return
+                # Before the restart: the first frames are delivered as soon
+                # as the event loop runs, and must find _autorange_shape set.
+                shape = self._finish_aoi_change(ia)
+                if was_live:
+                    self.start_video()
+                    if self.is_running:
+                        logging.info(f"AOI after restart: {cam.describe_aoi_state(ia)}")
+                        if shape is not None:
+                            self._watch_first_aoi_frame(shape)
+        finally:
+            self._aoi_cooldown.start()  # -> _end_aoi_cooldown
+
+    def _reopen_with_aoi(
+        self, aoi: tuple[int, int, int | None, int | None]
+    ) -> cam.ImageAcquirer | None:
+        """Disconnect, then connect the same camera again with *aoi* written first.
+
+        Returns:
+            ImageAcquirer | None: The new camera, or None if it could not be
+            re-opened; the user has been told and the UI is disconnected.
+        """
+        self.disconnect_video()
+        if has_stuck_workers():
+            # Re-opening now would create a second ImageAcquirer under the
+            # call the old worker is still stuck in.
+            logging.error("AOI not applied: the capture worker did not stop")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Image size not applied",
+                "The camera driver did not return, so the camera could not be "
+                "re-opened with the new image size. It is disconnected; connect "
+                "again once it has been released (see the status bar).",
+            )
+            return None
+        if not self._connect_video(aoi=aoi):
+            self.statusBar().showMessage(
+                "Image size not applied: the camera could not be re-opened and "
+                "is disconnected.",
+                10000,
+            )
+            return None
+        return self._harvester_cap()
+
+    def _finish_aoi_change(self, ia: cam.ImageAcquirer) -> tuple[int, int] | None:
+        """Sync the UI to the AOI the re-opened camera reports and persist it.
+
+        Returns:
+            tuple[int, int] | None: The new (height, width), None if the AOI
+            could not be read back.
+        """
+        try:
+            limits, (w, h, ox, oy) = cam.read_aoi(ia)
+        except Exception as e:
+            logging.warning(f"Cannot read the camera AOI back: {e}")
+            self.statusBar().showMessage(f"Cannot read the camera AOI back: {e}", 10000)
+            return None
+        ox = ox if limits.x.has_offset else None
+        oy = oy if limits.y.has_offset else None
+        # PayloadSize next to the data streams' payload_size: whether the
+        # grabber followed the camera, for the next hardware test.
+        logging.info(f"AOI after re-open, before start: {cam.describe_aoi_state(ia)}")
         for sb, value in ((self.ui.sb_res_width, w), (self.ui.sb_res_height, h)):
             # The range read on connect is the room the offset left back then.
             sb.setMaximum(max(sb.maximum(), value))
@@ -1539,6 +1700,32 @@ class MainWindow(QtWidgets.QMainWindow):
         where = "" if ox is None and oy is None else f" at offset ({ox}, {oy})"
         logging.info(f"Resolution set to {w}x{h}{where}")
         self.statusBar().showMessage(f"Image size {w} × {h} px{where}", 10000)
+        return h, w
+
+    def _watch_first_aoi_frame(self, shape: tuple[int, int]) -> None:
+        """Warn once if no frame of *shape* arrives within AOI_FIRST_FRAME_S."""
+        self._aoi_watch += 1
+        token = self._aoi_watch
+        self._aoi_started_at = time.monotonic()
+        QtCore.QTimer.singleShot(
+            int(AOI_FIRST_FRAME_S * 1000), lambda: self._check_first_aoi_frame(token, shape)
+        )
+
+    def _check_first_aoi_frame(self, token: int, shape: tuple[int, int]) -> None:
+        if token != self._aoi_watch or not self.is_running or self._autorange_shape != shape:
+            return  # superseded, paused, or the frame has arrived
+        message = (
+            f"No {shape[1]} × {shape[0]} frame within {AOI_FIRST_FRAME_S:g} s of the "
+            f"image size change. Pause/Start, or Disconnect + Connect, to retry."
+        )
+        ia = self._harvester_cap()
+        state = cam.describe_aoi_state(ia) if ia is not None else "no camera"
+        logging.warning(f"{message} Camera state: {state}")
+        self.statusBar().showMessage(message)
+
+    def _end_aoi_cooldown(self) -> None:
+        self._aoi_busy = False
+        self._update_aoi_controls()
 
     def _harvester_cap(self) -> cam.ImageAcquirer | None:
         """The connected Harvester camera, or None (OpenCV/random/disconnected)."""
@@ -1547,14 +1734,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _roi_allowed(self) -> bool:
         """Whether the ROI tool may be used: a Harvester camera is live."""
-        return self._harvester_cap() is not None and self.is_running and not self.is_recording
+        return self._aoi_allowed() and self.is_running
 
-    def _update_roi_controls(self) -> None:
-        """Offer the ROI tool only while it is allowed; leave ROI mode otherwise."""
+    def _aoi_allowed(self) -> bool:
+        """Whether an AOI change may start: a Harvester camera, idle, not recording."""
+        return self._harvester_cap() is not None and not self.is_recording and not self._aoi_busy
+
+    def _update_aoi_controls(self) -> None:
+        """Enable the AOI controls only while allowed; leave ROI mode otherwise."""
         allowed = self._roi_allowed()
         if not allowed and self.ui.pb_roi.isChecked():
             self.ui.pb_roi.setChecked(False)  # -> on_roi_toggled(False)
         self.ui.pb_roi.setEnabled(allowed)
+        for button in (self.ui.pb_res_apply, self.ui.pb_full_sensor):
+            button.setEnabled(self._aoi_allowed())
 
     def on_roi_toggled(self, checked: bool) -> None:
         """Enter or leave ROI mode, in which a left drag selects the camera AOI."""
