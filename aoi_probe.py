@@ -6,20 +6,28 @@ few frames, shrinks its Width/Height a little, streams again, and restores
 the original AOI. Close harvesters_pg (or any other program using the camera)
 first.
 
-Every AOI change takes the safe path only: stop -> destroy the
-ImageAcquirer (closes the data stream, revokes the buffers) -> create a new
-one for the same camera -> write the AOI -> start. Stop -> write -> start on
-one ImageAcquirer, which preceded fatal PCIe machine checks on the CoaXPress
-rig, is never done.
+Every AOI change takes the safe order only (cam.change_aoi, as in the GUI):
+quiesced stop (camera AcquisitionStop, drain until no frame arrives, then
+the stream stop) -> write the AOI to the stopped camera -> destroy the
+ImageAcquirer -> create a new one, at whose open the frame grabber latches
+the camera's new size -> check camera == grabber. Before every start the
+check is printed (`start check: ... -> OK/REFUSED`); when it is refused,
+nothing is started and the probe ends. On exit the original AOI is restored
+the same way, so camera and grabber agree again.
+
+--try-grabber-write (off by default; UNVERIFIED on the crash-prone rig)
+adds one step that writes the grabber's own ROI nodes (Width/Height,
+PHX_ROI_XLENGTH/PHX_ROI_YLENGTH) on the stopped, still open camera instead
+of re-opening it. That step starts only if the check passes afterwards.
 
 At every step it prints what the camera (Width, Height, OffsetX, OffsetY,
 PayloadSize), the frame grabber (GenTL device module) and the data streams
-report, so a grabber that does not follow the camera's AOI shows up.
-Nothing on the grabber is written; the camera keeps its other settings.
+report. The camera keeps its other settings.
 
-Run:  uv run aoi_probe.py
+Run:  uv run aoi_probe.py [--try-grabber-write]
 """
 
+import argparse
 import logging
 import sys
 import time
@@ -66,36 +74,58 @@ def fetch_frames(ia, label: str) -> bool:
     return ok
 
 
-def open_camera(ctis, name: str):
-    """Open *name* without writing any connect defaults to it."""
-    _, ia = cam.setup_cam(
-        cti=ctis, search_key={"display_name": name}, start=False, configure=False
-    )
-    return ia
+def start(ia, label: str) -> bool:
+    """Start after the camera == grabber check; False (nothing started) if refused."""
+    print(f"--- start ({label})")
+    try:
+        cam.start_acquisition(ia)  # logs the `start check: ...` line
+    except cam.StartRefused as e:
+        print(f"  NOT STARTED: {e}")
+        return False
+    show(ia, f"after start ({label})")
+    return True
 
 
-def reopen_with_aoi(ia, ctis, name: str, aoi):
-    """The safe AOI change: stop -> destroy -> create -> write AOI -> start.
+def change(h, ia, key, aoi):
+    """The safe AOI change, see cam.change_aoi. Returns the new ImageAcquirer.
 
-    Returns the new ImageAcquirer; *ia* is unusable afterwards.
+    *ia* is unusable afterwards, also when this raises (both are released).
     """
     print(f"=== AOI change to {aoi} (width, height, offset_x, offset_y)")
     # The GUI's AOI cooldown: no back-to-back re-opens on the frame grabber.
     time.sleep(COOLDOWN_S)
-    print("  stop + destroy the image acquirer (closes the data stream, revokes buffers)")
-    cam.teardown_cam(None, ia)
-    print("  create a new image acquirer for the same camera")
-    ia = open_camera(ctis, name)
-    show(ia, "re-opened, before the AOI write")
-    applied = cam.set_resolution(
-        ia, width=aoi[0], height=aoi[1], offset_x=aoi[2], offset_y=aoi[3]
-    )
+    print("  quiesced stop -> write the AOI to the stopped camera -> destroy -> create -> check")
+    previous = ia
+    ia, applied = cam.change_aoi(h, ia, aoi, key)
     print(f"  applied {applied}")
-    show(ia, "after the AOI write, before start")
-    with cam.IA_LOCK:
-        ia.start()
-    show(ia, "after start")
+    show(ia, "re-opened, before start" if ia is not previous else "AOI unchanged, not re-opened")
     return ia
+
+
+def try_grabber_write(ia, aoi) -> bool:
+    """Opt-in: write the camera AOI and the grabber's ROI nodes without re-opening.
+
+    Returns True if the check passed and every frame arrived.
+    """
+    print(f"=== --try-grabber-write: AOI {aoi} WITHOUT a re-open (unverified)")
+    time.sleep(COOLDOWN_S)
+    cam.quiesce_and_stop(ia, destroy=False)
+    print(f"  camera AOI written: {cam.set_resolution(ia, *aoi)}")
+    with cam.IA_LOCK:
+        grabber = ia.device.node_map
+        for names in (("Width", "Height"), ("PHX_ROI_XLENGTH", "PHX_ROI_YLENGTH")):
+            for name, value in zip(names, aoi[:2]):
+                try:
+                    node = getattr(grabber, name)
+                    before = node.value
+                    node.value = value
+                    print(f"  grabber {name}: {before} -> {node.value}")
+                except Exception as e:
+                    print(f"  grabber {name}: not written ({type(e).__name__}: {e})")
+    show(ia, "after the grabber write, before start")
+    if not start(ia, "grabber write"):
+        return False
+    return fetch_frames(ia, f"grabber write {aoi[0]}x{aoi[1]}")
 
 
 def smaller(value: int, axis: cam.AoiAxis) -> int:
@@ -104,11 +134,21 @@ def smaller(value: int, axis: cam.AoiAxis) -> int:
     return cam.snap_value(value - step, axis.size_min, value, axis.size_inc)
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--try-grabber-write",
+        action="store_true",
+        help="also try writing the grabber ROI nodes directly (unverified, off by default)",
+    )
+    args = parser.parse_args(argv)
     print(__doc__.split("\n\n")[1])
+    if args.try_grabber_write:
+        print("--try-grabber-write is ON: one step writes the frame grabber's ROI nodes directly.")
     print("Starting in 3 s - Ctrl+C to abort.")
     time.sleep(3)
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+    # INFO: the quiesce steps and every `start check: ...` line.
+    logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s", stream=sys.stdout)
 
     ctis = cam.load_cti_envvar()
     if not ctis:
@@ -123,11 +163,14 @@ def main() -> int:
         print("No camera found.")
         return 2
     name = names[0]
+    key = {"display_name": name}
     print(f"Using the first camera: {name!r}")
 
-    ia = open_camera(ctis, name)
+    # Opened as it is: no connect defaults, so no re-open either.
+    _, ia = cam.setup_cam(cti=ctis, search_key=key, start=False, configure=False)
     original = None
     ok = True
+    grabber_written = False
     try:
         nodes = ia.remote_device.node_map
         for context in ("DeviceModelName", "PixelFormat", "TriggerMode", "AcquisitionMode"):
@@ -145,31 +188,73 @@ def main() -> int:
         print(f"  AOI limits: {limits}")
         print(f"  original AOI: {original}")
         show(ia, "connected, never started")
-        with cam.IA_LOCK:
-            ia.start()
-        show(ia, "after start at the original AOI")
+        if not start(ia, "original AOI"):
+            ok = False
+            return 1
         ok &= fetch_frames(ia, "original AOI")
 
         target = (smaller(width, limits.x), smaller(height, limits.y), None, None)
-        ia = reopen_with_aoi(ia, ctis, name, target)
+        ia, previous = None, ia  # change() releases it, also on failure
+        ia = change(h, previous, key, target)
+        if not start(ia, f"new AOI {target[0]}x{target[1]}"):
+            ok = False
+            return 1
         ok &= fetch_frames(ia, f"new AOI {target[0]}x{target[1]}")
         show(ia, "after fetching at the new AOI")
+
+        if args.try_grabber_write:
+            grabber_written = True
+            ok &= try_grabber_write(ia, original)
     except KeyboardInterrupt:
         print("Interrupted.")
         ok = False
+    except Exception as e:
+        print(f"FAILED: {type(e).__name__}: {e}")
+        ok = False
     finally:
-        if original is not None:
-            try:
-                print("=== restoring the original AOI")
-                ia = reopen_with_aoi(ia, ctis, name, original)
-                ok &= fetch_frames(ia, "restored AOI")
-            except Exception as e:
-                print(f"Restoring the original AOI failed: {type(e).__name__}: {e}")
-                ok = False
-        cam.teardown_cam(None, ia)
+        ok &= restore(h, ia, ctis, key, original, grabber_written)
         cam.release_harvester()
-    print("RESULT:", "all frames arrived" if ok else "SOME FRAMES MISSING - see above")
+        print("RESULT:", "all frames arrived" if ok else "FAILED or SOME FRAMES MISSING - see above")
     return 0 if ok else 1
+
+
+def restore(h, ia, ctis, key, original, force_reopen: bool) -> bool:
+    """Leave camera and grabber consistent at *original*; True if verified.
+
+    Re-opens after the restore write (cam.change_aoi), unless the camera is
+    already at *original* and the grabber agrees - fewer open/close cycles.
+    After --try-grabber-write (*force_reopen*) it always re-opens once, so
+    the grabber is set up from scratch again.
+    """
+    if original is None:
+        cam.quiesce_and_stop(ia)
+        return True
+    print("=== restoring the original AOI")
+    try:
+        if ia is None:  # an AOI change failed and released everything
+            _, ia = cam.setup_cam(cti=ctis, search_key=key, start=False, configure=False)
+        current = cam.current_aoi(ia)
+        at_original = all(want is None or got == want for want, got in zip(original, current))
+        if at_original and not force_reopen and cam.check_start(ia)[0]:
+            print("  camera already at the original AOI and the grabber agrees; no re-open")
+            return True
+        ia, previous = None, ia
+        if at_original and force_reopen:
+            print("  camera at the original AOI; re-opening once to reset the grabber")
+            time.sleep(COOLDOWN_S)
+            cam.quiesce_and_stop(previous)
+            _, ia = cam.setup_cam(cti=ctis, search_key=key, start=False, configure=False)
+            show(ia, "re-opened, before start")
+        else:
+            ia = change(h, previous, key, original)
+        if not start(ia, "restored AOI"):
+            return False
+        return fetch_frames(ia, "restored AOI")
+    except Exception as e:
+        print(f"Restoring the original AOI failed: {type(e).__name__}: {e}")
+        return False
+    finally:
+        cam.quiesce_and_stop(ia)
 
 
 if __name__ == "__main__":

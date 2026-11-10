@@ -26,7 +26,7 @@ import importexport
 import logging
 from MainWindow import Ui_MainWindow
 from settings import Ui_SettingsWindow
-from VideoThread import VideoThread, has_stuck_workers
+from VideoThread import VideoThread, WorkerStuck, has_stuck_workers
 import argparse
 from genicam.genapi import (
     IInteger,
@@ -855,15 +855,12 @@ class MainWindow(QtWidgets.QMainWindow):
         with self._dropping_queued_input():
             self._connect_video()
 
-    def _connect_video(
-        self, aoi: tuple[int, int, int | None, int | None] | None = None
-    ) -> bool:
+    def _connect_video(self) -> bool:
         """Open the selected source and put the UI into the paused state.
 
-        Args:
-            aoi (tuple | None): Re-open an already configured camera for an
-                AOI change: skip the connect defaults and write this AOI
-                before the first start (see _apply_aoi).
+        A Harvester camera comes back with its saved AOI written and, if that
+        changed its image size, re-opened once so the frame grabber follows
+        (cam.setup_cam); a failure there is reported here like any other.
 
         Returns:
             bool: Whether the source was opened; a failure has been reported.
@@ -871,7 +868,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source = self.ui.cb_source.currentText()
         logging.info(f"Connecting to {self.source!r}")
         try:
-            videothread = VideoThread(self.source, self.ctis, configure=aoi is None)
+            videothread = VideoThread(self.source, self.ctis)
         except Exception as e:
             # Report it and stay disconnected; setup_cam has already released
             # whatever it managed to open. (pyqtgraph replaces sys.excepthook,
@@ -896,7 +893,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # connected without acquiring; live view or a recording starts it.
         self.pause_video()
         try:
-            self.on_source_connected(aoi)
+            self.on_source_connected()
         except Exception as e:
             # The camera is already open: keep the connection, drop the
             # settings panel, and tell the user.
@@ -922,38 +919,44 @@ class MainWindow(QtWidgets.QMainWindow):
             # release it explicitly. Dropping the reference and leaving the
             # teardown to __del__ kept the camera opened for an unpredictable
             # stretch, so a quick reconnect hit a device the producer still
-            # held.
+            # held. close() stops the camera quiesced (cam.quiesce_and_stop)
+            # and keeps the producer loaded for the next connect.
             logging.info(f"Disconnecting from {self.source!r}")
             self.ui.settings_window.teardown()
             worker = self.videothread
             worker.close()
             self.videothread = None
             logging.info(f"Disconnected from {self.source!r}")
-            self.is_running = False
-            self._update_aoi_controls()
-            self.ui.pb_live.setDisabled(True)
-            self.ui.pb_connect.setText("Connect")
-            self.ui.pb_connect.clicked.disconnect()
-            self.ui.pb_connect.clicked.connect(self.connect_video)
-            self.ui.cb_source.setDisabled(False)
-            self.ui.pb_acquire.setDisabled(True)
-            self.ui.pb_live.setText("Start")
-            self.ui.lbl_status.setStyleSheet("color: red;")
-            self.ui.settings.setHidden(True)
-            # Reset the per-camera row extensions until the next connect.
-            for checkbox, spinbox in (
-                (self.ui.cb_auto_exposure, self.ui.sb_exposure),
-                (self.ui.cb_auto_gain, self.ui.sb_analog_gain),
-            ):
-                checkbox.blockSignals(True)
-                checkbox.setChecked(False)
-                checkbox.setVisible(False)
-                checkbox.blockSignals(False)
-                spinbox.setEnabled(True)
-            self.profile = camera_profiles.SFNC_DEFAULT
-            self.ui.pb_settings.setDisabled(True)
+            self._show_disconnected()
             if worker.isRunning():
                 self._hold_until_released(worker)
+        cam.sync_log()
+
+    def _show_disconnected(self) -> None:
+        """Put the controls into the disconnected state."""
+        self.is_running = False
+        self._update_aoi_controls()
+        self.ui.pb_live.setDisabled(True)
+        self.ui.pb_connect.setText("Connect")
+        self.ui.pb_connect.clicked.disconnect()
+        self.ui.pb_connect.clicked.connect(self.connect_video)
+        self.ui.cb_source.setDisabled(False)
+        self.ui.pb_acquire.setDisabled(True)
+        self.ui.pb_live.setText("Start")
+        self.ui.lbl_status.setStyleSheet("color: red;")
+        self.ui.settings.setHidden(True)
+        # Reset the per-camera row extensions until the next connect.
+        for checkbox, spinbox in (
+            (self.ui.cb_auto_exposure, self.ui.sb_exposure),
+            (self.ui.cb_auto_gain, self.ui.sb_analog_gain),
+        ):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.setVisible(False)
+            checkbox.blockSignals(False)
+            spinbox.setEnabled(True)
+        self.profile = camera_profiles.SFNC_DEFAULT
+        self.ui.pb_settings.setDisabled(True)
 
     def _hold_until_released(self, worker: VideoThread) -> None:
         """Keep camera access closed until a stuck worker has really exited.
@@ -1017,6 +1020,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.videothread:
             raise ValueError("Video thread not started")
         self.videothread.stop()
+        self._show_paused()
+
+    def _show_paused(self) -> None:
+        """Put the controls into the paused (connected, not acquiring) state."""
         self.is_running = False
         self.ui.pb_live.setText("Start")
         self.ui.lbl_status.setStyleSheet("color: orange;")
@@ -1127,6 +1134,20 @@ class MainWindow(QtWidgets.QMainWindow):
         fps then no longer matched). A dialog opened from inside the loop would
         stall it while the camera keeps streaming.
         """
+        with self._camera_controls_held():
+            self.is_recording = True
+            try:
+                yield
+            finally:
+                self.is_recording = False
+
+    @contextlib.contextmanager
+    def _camera_controls_held(self):
+        """Disable every control that touches the camera; restore them afterwards.
+
+        For a recording and for an AOI change. The node-map poll of the
+        settings panel pauses as well.
+        """
         widgets = (
             self.ui.pb_acquire,
             self.ui.pb_connect,
@@ -1149,18 +1170,16 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_window.setEnabled(False)
         for widget in widgets:
             widget.setEnabled(False)
-        self.is_recording = True
         try:
             yield
         finally:
-            self.is_recording = False
             for widget, enabled in was_enabled.items():
                 widget.setEnabled(enabled)
             settings_window.setEnabled(True)
             if settings_window.isVisible():
                 settings_window.start_polling()
-            # The AOI controls follow the state after the recording, not the
-            # one before it (an AOI cooldown may have ended meanwhile).
+            # The AOI controls follow the state afterwards, not the one
+            # before (an AOI cooldown may have ended meanwhile).
             self._update_aoi_controls()
 
     def _release_display(self) -> None:
@@ -1341,23 +1360,16 @@ class MainWindow(QtWidgets.QMainWindow):
         fps = self.ui.sb_fps.value()
         self.ui.sb_frames.setValue(int(seconds * fps))
 
-    def on_source_connected(
-        self, aoi: tuple[int, int, int | None, int | None] | None = None
-    ) -> None:
-        """Update the source based on the combobox.
-
-        Args:
-            aoi (tuple | None): The AOI to write before the first start; set
-                when the camera is re-opened for an AOI change, which also
-                leaves the camera's frame rate and exposure untouched.
-        """
+    def on_source_connected(self) -> None:
+        """Update the source based on the combobox."""
         self.source = self.ui.cb_source.currentText()
         if "random" in self.source or "Webcam" in self.source:
             self.ui.settings.setHidden(True)
         else: # Harvester camera
-            # The AOI first: the frame rate maximum read next depends on it.
-            self.setup_resolution_settings(aoi)  # write the new or saved AOI
-            self.setup_settings(push=aoi is None)  # get minmax values for settings
+            # The saved AOI is already on the camera (cam.setup_cam); the
+            # frame rate maximum read next depends on it.
+            self.setup_resolution_settings()
+            self.setup_settings()  # get minmax values for settings
             self.ui.pb_settings.setDisabled(False)
             self.ui.settings.setHidden(False)
             # Built when the panel is first shown, not on every connect.
@@ -1512,20 +1524,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not checked:
             self.on_analog_gain_changed()  # push the manual value again
 
-    def setup_resolution_settings(
-        self, aoi: tuple[int, int, int | None, int | None] | None = None
-    ) -> None:
-        """Populate the resolution row and write the AOI of a fresh connect.
+    def setup_resolution_settings(self) -> None:
+        """Populate the resolution row from a freshly connected camera.
 
-        Runs after connecting a Harvester camera, before its first start:
-        the one place the AOI is written. Applies *aoi* if given (an AOI
-        change re-opening the camera, see _apply_aoi), else any resolution
-        persisted by an earlier session, and syncs the spinboxes to what the
-        camera actually reports.
-
-        Args:
-            aoi (tuple | None): (width, height, offset_x, offset_y) for
-                cam.set_resolution; None re-applies the saved resolution.
+        Read-only: the AOI saved by an earlier session has already been
+        written (and the frame grabber re-opened for it) by cam.setup_cam.
         """
         ia = self.videothread.cap
         node_map = ia.remote_device.node_map
@@ -1542,27 +1545,11 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 logging.warning(f"Resolution {node_name} not available: {e}")
                 sb.setDisabled(True)
-        if aoi is None:
-            cfg = cam.load_resolution_config(cam.camera_config_key(ia))
-            if isinstance(cfg.get("width"), int) and isinstance(cfg.get("height"), int):
-                aoi = (cfg["width"], cfg["height"], cfg.get("offset_x"), cfg.get("offset_y"))
-                what = "Reapplied saved resolution"
-        else:
-            what = "Applied resolution"
-        if aoi is not None:
-            w, h, ox, oy = cam.set_resolution(
-                ia, width=aoi[0], height=aoi[1], offset_x=aoi[2], offset_y=aoi[3]
-            )
-            self.ui.sb_res_width.setValue(w)
-            self.ui.sb_res_height.setValue(h)
-            where = "" if ox is None and oy is None else f" at offset ({ox}, {oy})"
-            logging.info(f"{what} {w}x{h}{where}")
-        else:
-            try:
-                self.ui.sb_res_width.setValue(int(node_map.Width.value))
-                self.ui.sb_res_height.setValue(int(node_map.Height.value))
-            except Exception as e:
-                logging.warning(f"Could not read resolution: {e}")
+        try:
+            self.ui.sb_res_width.setValue(int(node_map.Width.value))
+            self.ui.sb_res_height.setValue(int(node_map.Height.value))
+        except Exception as e:
+            logging.warning(f"Could not read resolution: {e}")
         self._update_aoi_controls()
 
     def on_resolution_apply(self) -> None:
@@ -1581,16 +1568,21 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Apply an AOI to the connected Harvester camera and persist it.
 
-        The one path for Apply, the ROI tool and Full sensor. The camera is
-        re-opened exactly like Disconnect + Connect, the path that works on
-        the CoaXPress frame grabber: the worker is joined (no fetch in
-        flight), the ImageAcquirer is stopped and destroyed (data stream
-        closed, buffers revoked), a new one is created for the same camera,
-        the AOI is written before its first start, and live view restarts if
-        it was running. Stop -> write -> start on the same ImageAcquirer gave
-        a black live view there, and the machine died of fatal PCIe errors
-        soon after. The re-open skips the connect defaults, so exposure,
-        gain, frame rate etc. stay as they are on the camera.
+        The one path for Apply, the ROI tool and Full sensor, and one action
+        for the user: the connection stays shown as connected, the camera
+        controls are disabled while it runs, and live view resumes by itself
+        if it was live (paused stays paused). Underneath, VideoThread.change_aoi
+        joins the worker (no fetch in flight) and cam.change_aoi does: quiesced
+        stop -> write the AOI to the stopped camera -> destroy -> create, so
+        the frame grabber latches the new size at open -> check camera ==
+        grabber. The old order (re-open, then write) left the grabber at the
+        previous size: frames of the wrong geometry, which made the change
+        look as if it had not happened until Apply was pressed a second time,
+        and camera frames larger than the grabber's buffers - followed by
+        fatal PCIe machine checks. Camera settings stay as they are.
+
+        On any failure the camera is left stopped and released and the UI
+        disconnected, with an error; nothing is started unverified.
 
         One change at a time: the AOI controls stay disabled (and further
         requests are ignored) until AOI_COOLDOWN_S after it finished.
@@ -1604,64 +1596,65 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._aoi_busy:
             logging.info("AOI change ignored: the previous one has not finished yet")
             return
-        ia = self._harvester_cap()
-        if ia is None or self.is_recording:
+        if self._harvester_cap() is None or self.is_recording:
             return
         requested = (width, height, offset_x, offset_y)
         was_live = self.is_running
         self._aoi_busy = True
         self._update_aoi_controls()
         try:
-            logging.info(
-                f"AOI change to {requested} (width, height, offset_x, offset_y): "
-                f"re-opening the camera. Before: {cam.describe_aoi_state(ia)}"
-            )
-            with self._dropping_queued_input():
-                ia = self._reopen_with_aoi(requested)
-                if ia is None:
-                    return
-                # Before the restart: the first frames are delivered as soon
-                # as the event loop runs, and must find _autorange_shape set.
-                shape = self._finish_aoi_change(ia)
-                if was_live:
-                    self.start_video()
-                    if self.is_running:
-                        logging.info(f"AOI after restart: {cam.describe_aoi_state(ia)}")
-                        if shape is not None:
-                            self._watch_first_aoi_frame(shape)
+            error = None
+            with self._dropping_queued_input(), self._camera_controls_held():
+                try:
+                    self.videothread.change_aoi(requested)
+                except Exception as e:
+                    error = e
+            if error is not None:
+                self._abort_aoi_change(error)
+                return
+            # The worker is stopped and the new camera not started yet.
+            self._show_paused()
+            ia = self._harvester_cap()
+            # Before the restart: the first frames are delivered as soon as
+            # the event loop runs, and must find _autorange_shape set.
+            shape = self._finish_aoi_change(ia)
+            try:
+                self.setup_settings(push=False)  # the frame rate range follows the AOI
+            except Exception as e:
+                logging.warning(f"Could not refresh the frame rate range: {e}")
+            if was_live:
+                self.start_video()
+                if self.is_running:
+                    logging.info(f"AOI after restart: {cam.describe_aoi_state(ia)}")
+                    if shape is not None:
+                        self._watch_first_aoi_frame(shape)
         finally:
+            cam.sync_log()
             self._aoi_cooldown.start()  # -> _end_aoi_cooldown
 
-    def _reopen_with_aoi(
-        self, aoi: tuple[int, int, int | None, int | None]
-    ) -> cam.ImageAcquirer | None:
-        """Disconnect, then connect the same camera again with *aoi* written first.
+    def _abort_aoi_change(self, error: Exception) -> None:
+        """Report a failed AOI change and show the camera as disconnected.
 
-        Returns:
-            ImageAcquirer | None: The new camera, or None if it could not be
-            re-opened; the user has been told and the UI is disconnected.
+        VideoThread.change_aoi has left the camera stopped and released (or,
+        for a stuck worker, untouched); disconnect_video drops the worker.
         """
+        logging.error(f"AOI change failed: {error}", exc_info=error)
+        if isinstance(error, WorkerStuck):
+            message = (
+                "The camera driver did not return, so the image size was not "
+                "changed. The camera is disconnected; connect again once it has "
+                "been released (see the status bar)."
+            )
+        else:
+            message = (
+                f"Changing the image size failed:\n\n{error}\n\nThe camera has "
+                f"been stopped and disconnected; connect again to continue."
+            )
         self.disconnect_video()
-        if has_stuck_workers():
-            # Re-opening now would create a second ImageAcquirer under the
-            # call the old worker is still stuck in.
-            logging.error("AOI not applied: the capture worker did not stop")
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Image size not applied",
-                "The camera driver did not return, so the camera could not be "
-                "re-opened with the new image size. It is disconnected; connect "
-                "again once it has been released (see the status bar).",
-            )
-            return None
-        if not self._connect_video(aoi=aoi):
-            self.statusBar().showMessage(
-                "Image size not applied: the camera could not be re-opened and "
-                "is disconnected.",
-                10000,
-            )
-            return None
-        return self._harvester_cap()
+        QtWidgets.QMessageBox.critical(self, "Image size not applied", message)
+        self.statusBar().showMessage(
+            "Image size not applied: the camera has been stopped and disconnected.", 10000
+        )
 
     def _finish_aoi_change(self, ia: cam.ImageAcquirer) -> tuple[int, int] | None:
         """Sync the UI to the AOI the re-opened camera reports and persist it.
@@ -1678,9 +1671,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         ox = ox if limits.x.has_offset else None
         oy = oy if limits.y.has_offset else None
-        # PayloadSize next to the data streams' payload_size: whether the
-        # grabber followed the camera, for the next hardware test.
-        logging.info(f"AOI after re-open, before start: {cam.describe_aoi_state(ia)}")
         for sb, value in ((self.ui.sb_res_width, w), (self.ui.sb_res_height, h)):
             # The range read on connect is the room the offset left back then.
             sb.setMaximum(max(sb.maximum(), value))
@@ -1979,7 +1969,11 @@ def configure_logging(verbose: int = 0, log_file: str = "harvesters_pg.log") -> 
 
     The thread name is in the format on purpose: when the app hangs, the last
     line tells you whether the GUI thread or the capture worker got there last.
-    FileHandler flushes on every record, so nothing is lost to a hard freeze.
+    FileHandler flushes on every record, which survives an app freeze but not
+    a machine check: that resets the PC with the page cache unwritten (the
+    whole log of a crashed session was lost). cam.sync_log() therefore
+    fsyncs this file after every camera stop/teardown step, AOI change and
+    start check.
     A crash inside a GenTL producer (SIGSEGV) leaves no Python traceback at
     all, so faulthandler dumps every thread's stack into the same log first.
     """

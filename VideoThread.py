@@ -26,6 +26,10 @@ def has_stuck_workers() -> bool:
     return any(worker.isRunning() for worker in _STUCK_WORKERS)
 
 
+class WorkerStuck(RuntimeError):
+    """The capture worker did not stop: a call inside the driver never returned."""
+
+
 class VideoThread(QtCore.QThread):
     """Worker thread for capturing video frames.
 
@@ -50,7 +54,7 @@ class VideoThread(QtCore.QThread):
     # only comes into play when a driver call itself hangs.
     JOIN_TIMEOUT_S = 10.0
 
-    def __init__(self, source, ctis, configure: bool = True) -> None:
+    def __init__(self, source, ctis) -> None:
         super().__init__()
         self.source: str = source
         self._run_flag: bool = False
@@ -64,9 +68,14 @@ class VideoThread(QtCore.QThread):
             self.image_func = self._harvester_frame
         self.cap: cv2.VideoCapture | ImageAcquirer | None = None
         self.harvester: Harvester | None = None
-        self.set_cap(ctis, configure)
+        self.set_cap(ctis)
 
-    def set_cap(self, ctis, configure: bool = True) -> None:
+    @property
+    def search_key(self) -> dict:
+        """Which enumerated device this worker's camera is (see cam.setup_cam)."""
+        return {"display_name": self.source}
+
+    def set_cap(self, ctis) -> None:
         if self.source == "random":
             self.cap = None
         elif "Webcam" in self.source:
@@ -86,15 +95,41 @@ class VideoThread(QtCore.QThread):
             # Starting and warming up here only to stop again right after the
             # connect was a full announce/start/kill-stop/revoke cycle on the
             # frame grabber per connect, for nothing.
-            # configure=False re-opens a camera that is already set up (an AOI
-            # change, see MainWindow._apply_aoi) without writing the connect
-            # defaults over the user's settings.
+            # saved_aoi: the AOI of the last session is written before the
+            # first start, and setup_cam re-opens the device once if that
+            # changed the camera's size, so the frame grabber follows it.
             self.harvester, self.cap = cam.setup_cam(
                 cti=ctis,
-                search_key={"display_name": self.source},
+                search_key=self.search_key,
                 start=False,
-                configure=configure,
+                saved_aoi=True,
             )
+
+    def change_aoi(
+        self, aoi: tuple[int | None, int | None, int | None, int | None]
+    ) -> tuple[int | None, int | None, int | None, int | None]:
+        """Change the camera AOI: stop the worker, then cam.change_aoi.
+
+        The worker is joined first, so no fetch is in flight; cam.change_aoi
+        then stops the camera (quiesced), writes the AOI, destroys the
+        ImageAcquirer and opens a new, verified one, which becomes ``cap``.
+        Nothing is started.
+
+        Returns:
+            tuple: The applied (width, height, offset_x, offset_y).
+
+        Raises:
+            WorkerStuck: the worker did not stop; the camera was not touched.
+            Exception: from cam.change_aoi; the camera is then stopped and
+                released and ``cap`` is None.
+        """
+        if not self._stop_and_join():
+            raise WorkerStuck(
+                "The capture worker did not stop, so the camera was not touched."
+            )
+        ia, self.cap = self.cap, None
+        self.cap, applied = cam.change_aoi(self.harvester, ia, aoi, self.search_key)
+        return applied
 
     def _harvester_frame(self, ia: ImageAcquirer) -> np.ndarray | None:
         # Give up waiting for a frame as soon as a stop is requested.
@@ -138,12 +173,9 @@ class VideoThread(QtCore.QThread):
                 return False
         # Stop even if the worker never ran: a camera started by
         # setup_cam(start=True) or left acquiring must not keep streaming.
+        # Quiesced (camera stop, drain, then the stream), see cam.
         if isinstance(self.cap, ImageAcquirer):
-            with cam.IA_LOCK:
-                try:
-                    self.cap.stop()
-                except Exception as e:
-                    logging.debug(f"Error stopping camera after joining the worker: {e}")
+            cam.quiesce_and_stop(self.cap, destroy=False)
         return True
 
     def close(self) -> None:
@@ -184,7 +216,7 @@ class VideoThread(QtCore.QThread):
         elif isinstance(cap, cv2.VideoCapture):
             cap.release()
         else:
-            cam.teardown_cam(None, cap)
+            cam.quiesce_and_stop(cap)
 
     def _release_after_stuck_exit(self) -> None:
         """finished-slot of a worker that close() had to leave running."""
@@ -248,8 +280,9 @@ class VideoThread(QtCore.QThread):
         self._run_flag = True
         if isinstance(self.cap, ImageAcquirer):
             try:
-                with cam.IA_LOCK:
-                    self.cap.start()
+                # Refused (cam.StartRefused) when the frame grabber does not
+                # match the camera's image size.
+                cam.start_acquisition(self.cap)
             except Exception:
                 self._run_flag = False
                 raise

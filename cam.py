@@ -150,7 +150,7 @@ def _forget_shared_harvester(harvester: Harvester) -> None:
 
     Stops get_harvester() from later handing out an already-reset object, which
     is what would happen when a standalone script tears its camera down with
-    disconnect_cam().
+    teardown_cam(h, ia).
     """
     global _SHARED_HARVESTER, _SHARED_HARVESTER_CTIS
     if harvester is _SHARED_HARVESTER:
@@ -237,8 +237,18 @@ def setup_cam(
     search_key: int | dict | None = None,
     start: bool = True,
     configure: bool = True,
+    saved_aoi: bool = False,
 ) -> tuple[Harvester, ImageAcquirer]:
     """Set the camera up using the Harvester API.
+
+    A frame grabber takes the camera's image size over once, when the device
+    is opened (the Active Silicon CoaXPress grabber latched Width/Height and
+    the stream payload size there and ignored every later camera write).
+    Whatever this function writes to the camera's size therefore needs one
+    more destroy + create before the first start: when Width, Height or
+    PayloadSize differ from what the camera reported at open, the device is
+    re-opened exactly once (see _reopen) and checked (see check_start).
+    Nothing is ever started with a grabber that disagrees with the camera.
 
     Args:
         cti (str | list[str]): Path(s) to the GenTL Producer file(s).
@@ -257,13 +267,15 @@ def setup_cam(
         configure (bool): Write the connect defaults (frame rate, exposure,
             full-sensor AOI, TriggerMode Off, info fields, black level).
             False only opens the device and keeps every camera setting as it
-            is: the GUI re-opens an already configured camera that way to
-            apply an AOI (see MainWindow._apply_aoi).
+            is (aoi_probe.py opens the camera that way).
+        saved_aoi (bool): Write the AOI saved for this camera by an earlier
+            session (see load_resolution_config) after the defaults.
 
     Returns:
         tuple[Harvester, ImageAcquirer]: The Harvester object and the ImageAcquirer object.
 
     Raises:
+        StartRefused: if the re-opened grabber still disagrees with the camera.
         Exception: whatever the producer raised. The camera is always released
             before the exception leaves this function.
     """
@@ -272,41 +284,25 @@ def setup_cam(
     h = get_harvester(ctis)
     ia = None
     try:
-        # Enumerate only when the cached device list cannot serve the request.
-        device = _find_device(h, search_key)
-        enumerated = device is None
-        if enumerated:
-            h.update()
-            device = _find_device(h, search_key)
-
-        # Open exactly the device that was picked. Opening index 0 regardless
-        # of what the user picked meant a second camera (or a camera behind a
-        # second producer) silently opened the wrong device - possibly one
-        # another process already holds. With nothing found, harvesters raises
-        # its own "no device" error from the original key.
-        fallback_key = 0 if search_key is None else search_key
-        try:
-            ia = h.create(fallback_key if device is None else device)
-        except Exception:
-            if enumerated:
-                raise
-            # The cached entry may be stale: a camera that was unplugged,
-            # power-cycled or re-linked since the last scan keeps failing to
-            # open from it until something re-enumerates. Do that once here
-            # instead of leaving every further Connect failing the same way.
-            logging.warning(
-                "Opening the camera from the cached device list failed; "
-                "re-enumerating and retrying once",
-                exc_info=True,
-            )
-            h.update()
-            device = _find_device(h, search_key)
-            ia = h.create(fallback_key if device is None else device)
+        ia = _open_device(h, search_key, rescan=True)
+        opened = camera_size(ia)
         if configure:
-            _configure_cam(ia, height, width, fps, blacklevel, exposure, start=start)
-        elif start:
-            ia.start()
+            _configure_cam(ia, height, width, fps, blacklevel, exposure)
+        if saved_aoi:
+            _reapply_saved_aoi(ia)
+        now = camera_size(ia)
+        if now != opened:
+            logging.info(
+                f"Camera size changed since the device was opened "
+                f"({_describe_size(opened)} -> {_describe_size(now)}); re-opening "
+                f"once so the frame grabber takes it over"
+            )
+            previous, ia = ia, None  # _reopen releases it, also on failure
+            ia = _reopen(h, previous, search_key, current_aoi(previous))
+        else:
+            logging.info(f"Camera size unchanged since open ({_describe_size(now)}); no re-open")
         if start:
+            start_acquisition(ia)
             warmup_cam(ia)
     except Exception:
         # Never let a half-configured camera escape. An ImageAcquirer dropped
@@ -317,9 +313,196 @@ def setup_cam(
         # Release the device but keep the shared harvester: the producers stay
         # loaded for the next attempt, and nothing else is using this one.
         logging.exception("Camera setup failed; releasing the device")
-        teardown_cam(None, ia)
+        quiesce_and_stop(ia)
         raise
     return h, ia
+
+
+def _open_device(h: Harvester, search_key, rescan: bool) -> ImageAcquirer:
+    """Create the ImageAcquirer for *search_key* from the shared Harvester.
+
+    Args:
+        h (Harvester): The shared Harvester.
+        search_key: See setup_cam.
+        rescan (bool): Re-enumerate when the cached device list cannot serve
+            the request. h.update() unloads and reloads every producer, so a
+            re-open of a camera that was open a moment ago never does it.
+    """
+    # Enumerate only when the cached device list cannot serve the request.
+    device = _find_device(h, search_key)
+    enumerated = device is None and rescan
+    if enumerated:
+        h.update()
+        device = _find_device(h, search_key)
+
+    # Open exactly the device that was picked. Opening index 0 regardless
+    # of what the user picked meant a second camera (or a camera behind a
+    # second producer) silently opened the wrong device - possibly one
+    # another process already holds. With nothing found, harvesters raises
+    # its own "no device" error from the original key.
+    fallback_key = 0 if search_key is None else search_key
+    started = time.monotonic()
+    try:
+        ia = h.create(fallback_key if device is None else device)
+    except Exception:
+        if enumerated or not rescan:
+            raise
+        # The cached entry may be stale: a camera that was unplugged,
+        # power-cycled or re-linked since the last scan keeps failing to
+        # open from it until something re-enumerates. Do that once here
+        # instead of leaving every further Connect failing the same way.
+        logging.warning(
+            "Opening the camera from the cached device list failed; "
+            "re-enumerating and retrying once",
+            exc_info=True,
+        )
+        h.update()
+        device = _find_device(h, search_key)
+        ia = h.create(fallback_key if device is None else device)
+    logging.info(
+        f"Device opened in {time.monotonic() - started:.3f} s: {describe_aoi_state(ia)}"
+    )
+    return ia
+
+
+def _reapply_saved_aoi(ia: ImageAcquirer) -> None:
+    """Write the AOI an earlier session saved for this camera, if any."""
+    cfg = load_resolution_config(camera_config_key(ia))
+    if not (isinstance(cfg.get("width"), int) and isinstance(cfg.get("height"), int)):
+        return
+    w, h, ox, oy = set_resolution(
+        ia,
+        width=cfg["width"],
+        height=cfg["height"],
+        offset_x=cfg.get("offset_x"),
+        offset_y=cfg.get("offset_y"),
+    )
+    where = "" if ox is None and oy is None else f" at offset ({ox}, {oy})"
+    logging.info(f"Reapplied saved resolution {w}x{h}{where}")
+
+
+def camera_size(ia: ImageAcquirer) -> tuple[int | None, int | None, int | None]:
+    """The camera's (Width, Height, PayloadSize); None where unreadable."""
+    with IA_LOCK:
+        nodes = ia.remote_device.node_map
+        return tuple(_read_int(nodes, name) for name in ("Width", "Height", "PayloadSize"))
+
+
+def current_aoi(ia: ImageAcquirer) -> tuple[int | None, int | None, int | None, int | None]:
+    """The camera's (Width, Height, OffsetX, OffsetY); None where it has no such node."""
+    with IA_LOCK:
+        nodes = ia.remote_device.node_map
+        return tuple(_read_int(nodes, name) for name in ("Width", "Height", "OffsetX", "OffsetY"))
+
+
+def _read_int(node_map, name: str) -> int | None:
+    """A node's numeric value as int; None if missing, unreadable or not a number."""
+    value = _read_number(node_map, name)
+    return None if value is None else int(value)
+
+
+def _describe_size(size: tuple[int | None, int | None, int | None]) -> str:
+    w, h, payload = (("-" if v is None else v) for v in size)
+    return f"{w}x{h} payload {payload}"
+
+
+def _reopen(
+    h: Harvester,
+    ia: ImageAcquirer,
+    search_key,
+    aoi: tuple[int | None, int | None, int | None, int | None],
+) -> ImageAcquirer:
+    """Release *ia* and open the same camera again, so the grabber latches *aoi*.
+
+    The one destroy + create of an AOI change (and of a connect whose AOI
+    changed the camera's size). The camera keeps its registers across the
+    close/open on real hardware (the MC2066 kept its OffsetY); a producer
+    that resets them (TLSimu does) gets *aoi* written again on the new,
+    never-started ImageAcquirer - check_start then refuses it if a frame
+    grabber latched something else meanwhile.
+
+    Args:
+        h (Harvester): The shared Harvester (never reset or updated here).
+        ia (ImageAcquirer): The camera to release; always destroyed.
+        search_key: The device to open again, see setup_cam.
+        aoi (tuple): (width, height, offset_x, offset_y) the camera must report.
+
+    Returns:
+        ImageAcquirer: The new, verified, not acquiring camera.
+
+    Raises:
+        StartRefused: if the new grabber still disagrees with the camera; the
+            new camera has been released as well.
+        Exception: whatever create() raised.
+    """
+    quiesce_and_stop(ia)
+    new = _open_device(h, search_key, rescan=False)
+    try:
+        reported = current_aoi(new)
+        if any(want is not None and got != want for want, got in zip(aoi, reported)):
+            logging.warning(
+                f"The camera did not keep its AOI across the re-open ({reported} instead "
+                f"of {aoi}); writing it again before the first start"
+            )
+            set_resolution(new, *aoi)
+        logging.info(f"AOI after re-open, before start: {describe_aoi_state(new)}")
+        ok, line = check_start(new)
+        if not ok:
+            raise StartRefused(line)
+    except Exception:
+        quiesce_and_stop(new)
+        raise
+    finally:
+        sync_log()
+    return new
+
+
+def change_aoi(
+    h: Harvester,
+    ia: ImageAcquirer,
+    aoi: tuple[int | None, int | None, int | None, int | None],
+    search_key,
+) -> tuple[ImageAcquirer, tuple[int | None, int | None, int | None, int | None]]:
+    """Change the camera AOI so that the frame grabber follows it.
+
+    The order is: quiesced stop (see quiesce_and_stop) -> write the AOI to
+    the camera on this stopped ImageAcquirer -> destroy it -> create a new
+    one, at whose open the grabber latches the camera's new size -> check
+    camera == grabber (check_start). Exactly one destroy + create, and none
+    when the camera already has *aoi* and the grabber agrees (every open
+    and close is a crash risk on the CoaXPress rig). Writing the AOI after
+    the re-open (the old order) left the grabber at the previous size:
+    frames of the wrong geometry, or a camera frame larger than the
+    grabber's DMA buffers, followed by a fatal PCIe machine check.
+
+    The caller must have stopped every thread that fetches from *ia*. On
+    any failure both ImageAcquirers are stopped and destroyed before the
+    exception propagates; nothing is started here.
+
+    Args:
+        h (Harvester): The shared Harvester.
+        ia (ImageAcquirer): The open camera; unusable afterwards unless it is
+            returned again (AOI unchanged).
+        aoi (tuple): (width, height, offset_x, offset_y) for set_resolution.
+        search_key: The device, see setup_cam.
+
+    Returns:
+        tuple: (the new ImageAcquirer, the applied (w, h, offset_x, offset_y)).
+    """
+    logging.info(f"AOI change to {aoi} (width, height, offset_x, offset_y). Before: {describe_aoi_state(ia)}")
+    try:
+        quiesce_and_stop(ia, destroy=False)
+        current = current_aoi(ia)
+        if all(want is None or got == want for want, got in zip(aoi, current)) and check_start(ia)[0]:
+            logging.info("AOI unchanged and the grabber agrees; no re-open")
+            return ia, current
+        applied = set_resolution(ia, *aoi)
+        logging.info(f"AOI written to the stopped camera: {describe_aoi_state(ia)}")
+    except Exception:
+        quiesce_and_stop(ia)
+        sync_log()
+        raise
+    return _reopen(h, ia, search_key, applied), applied
 
 
 def _configure_cam(
@@ -329,9 +512,8 @@ def _configure_cam(
     fps: int,
     blacklevel: int,
     exposure: int,
-    start: bool = True,
 ) -> None:
-    """Apply the node-map settings to a fresh camera, then optionally start it.
+    """Apply the node-map settings to a fresh camera that is not acquiring.
 
     Split out of setup_cam so the whole create -> configure -> warm-up sequence
     fits under a single try/except there: every step below can raise, and a
@@ -363,9 +545,9 @@ def _configure_cam(
 
     for size_name, offset_name, value in (("Width", "OffsetX", width), ("Height", "OffsetY", height)):
         if value is None:
-            # Whole sensor; a saved AOI is applied over it later (the GUI's
-            # setup_resolution_settings). The camera keeps the AOI of the last
-            # session, offsets included, until this resets it.
+            # Whole sensor; a saved AOI is applied over it next (setup_cam's
+            # saved_aoi). The camera keeps the AOI of the last session,
+            # offsets included, until this resets it.
             _full_sensor_axis(nodes, size_name, offset_name)
             continue
         try:
@@ -388,8 +570,6 @@ def _configure_cam(
         except Exception as e:
             logging.warning(f"Could not set {node_name} = {node_value}: {e}")
 
-    if start:
-        ia.start()
     try:
         logging.info(f"Camera pixel format: {nodes.PixelFormat.value}")
     except Exception as e:
@@ -486,12 +666,16 @@ def get_camera_indices() -> list[int]:
 
 
 def teardown_cam(h: Harvester | None, ia: ImageAcquirer | None) -> None:
-    """Release a camera and unload its GenTL producer, best effort.
+    """Release a camera, then unload its GenTL producer, best effort.
 
-    Each step is guarded on its own: a raising ia.stop() must not skip
-    ia.destroy(), and a raising ia.destroy() must not skip h.reset(). Skipping
-    any of them leaves the device exclusively opened or the producer loaded,
-    which is exactly what makes the *next* connect hang.
+    The camera goes through quiesce_and_stop (camera stop, drain, stream
+    stop, settle, destroy) before h.reset() unloads the producer; each step
+    is guarded, so a failing one never skips the next. Skipping any of them
+    leaves the device exclusively opened or the producer loaded, which is
+    exactly what makes the *next* connect hang.
+
+    Pass *h* only at process exit (release_harvester, the standalone
+    scripts): the GUI keeps the producer loaded for the whole session.
 
     Callers must make sure no thread is still inside a fetch() on ``ia``:
     resetting the harvester under an in-flight fetch unloads the producer out
@@ -500,21 +684,8 @@ def teardown_cam(h: Harvester | None, ia: ImageAcquirer | None) -> None:
     Args:
         h (Harvester | None): The Harvester object, if any.
         ia (ImageAcquirer | None): The ImageAcquirer object, if any.
-
-    Returns:
-        None
     """
-    if ia is not None:
-        try:
-            logging.debug("teardown: stopping acquisition")
-            ia.stop()
-        except Exception as e:
-            logging.debug(f"Error stopping camera during teardown: {e}")
-        try:
-            logging.debug("teardown: destroying the image acquirer")
-            ia.destroy()
-        except Exception as e:
-            logging.warning(f"Error destroying camera during teardown: {e}")
+    quiesce_and_stop(ia)
     if h is not None:
         _forget_shared_harvester(h)
         try:
@@ -522,24 +693,283 @@ def teardown_cam(h: Harvester | None, ia: ImageAcquirer | None) -> None:
             # here, the log stops after this line: some vendor producers keep
             # threads or device handles alive across a reset and do not
             # survive being unloaded and reloaded per connect.
-            logging.debug("teardown: resetting the harvester (unloads the producer)")
+            logging.info("teardown: resetting the harvester (unloads the producer)")
+            sync_log()
             h.reset()
         except Exception as e:
             logging.warning(f"Error resetting harvester during teardown: {e}")
     logging.debug("teardown: done")
 
 
-def disconnect_cam(h: Harvester, ia: ImageAcquirer) -> None:
-    """Disconnect the camera.
+# quiesce_and_stop: after the camera's own AcquisitionStop, wait until no
+# buffer has arrived for QUIESCE_FRAME_PERIODS frame periods, at least
+# QUIESCE_MIN_QUIET_S, and give up after QUIESCE_MAX_S in total. Fetches use
+# QUIESCE_SLICE_S timeouts. QUIESCE_SETTLE_S separates the stream stop from
+# destroy().
+QUIESCE_FRAME_PERIODS = 3
+QUIESCE_MIN_QUIET_S = 0.2
+QUIESCE_MAX_S = 2.0
+QUIESCE_SLICE_S = 0.02
+QUIESCE_SETTLE_S = 0.1
 
-    Args:
-        h (Harvester): The Harvester object.
-        ia (ImageAcquirer): The ImageAcquirer object.
+
+def sync_log() -> None:
+    """Flush the log files and fsync them to disk.
+
+    A fatal machine check resets the PC without writing back the page cache:
+    the whole log of the last crashed session was lost. Called after every
+    stop/teardown step, AOI change and start check.
+    """
+    for handler in logging.getLogger().handlers:
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        try:
+            handler.flush()
+            if handler.stream is not None:
+                os.fsync(handler.stream.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+def _frame_period_s(nodes) -> float | None:
+    """The camera's frame period from its frame rate and exposure (µs), if readable."""
+    profile = detect_profile(nodes)
+    periods = []
+    fps = _read_number(nodes, profile.frame_rate_node)
+    if fps is not None and fps > 0:
+        periods.append(1.0 / fps)
+    exposure_us = _read_number(nodes, profile.exposure_node)
+    if exposure_us is not None and exposure_us > 0:
+        periods.append(exposure_us / 1e6)
+    return max(periods) if periods else None
+
+
+def _read_number(node_map, name: str) -> float | None:
+    try:
+        value = getattr(node_map, name).value
+    except Exception:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _acquisition_active(nodes) -> bool:
+    """Whether the camera's AcquisitionStatus says it is still acquiring."""
+    try:
+        value = nodes.AcquisitionStatus.value
+    except Exception:
+        return False
+    return isinstance(value, (bool, int)) and bool(value)
+
+
+def _drain(ia: ImageAcquirer, nodes, quiet_s: float, deadline: float) -> tuple[int, int, bool]:
+    """Fetch and requeue until nothing arrived for *quiet_s*, or *deadline*.
+
+    harvesters requeues an incomplete buffer itself and returns None at once,
+    so a None well before the fetch timeout is also a delivery.
 
     Returns:
-        None
+        tuple: (complete buffers requeued, incomplete deliveries, capped).
     """
-    teardown_cam(h, ia)
+    complete = incomplete = 0
+    last = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            return complete, incomplete, True
+        if now - last >= quiet_s and not _acquisition_active(nodes):
+            return complete, incomplete, False
+        timeout = max(min(QUIESCE_SLICE_S, deadline - now), _MIN_FETCH_S)
+        asked = time.monotonic()
+        try:
+            buffer = ia.try_fetch(timeout=timeout)
+        except Exception as e:
+            logging.warning(f"quiesce: fetch failed while draining ({e}); not draining further")
+            return complete, incomplete, False
+        if buffer is not None:
+            try:
+                buffer.queue()
+            except Exception as e:
+                logging.warning(f"quiesce: could not requeue a drained buffer: {e}")
+            complete += 1
+            last = time.monotonic()
+        elif time.monotonic() - asked < timeout / 2:
+            incomplete += 1
+            last = time.monotonic()
+
+
+def quiesce_and_stop(ia: ImageAcquirer | None, destroy: bool = True) -> None:
+    """Stop a camera so no DMA can reach a buffer after it is revoked.
+
+    harvesters' ImageAcquirer.stop() executes the camera's AcquisitionStop
+    and then at once kills the data stream, flushes and revokes the buffers.
+    A CoaXPress camera keeps sending until it has really stopped, so a frame
+    still in flight could be DMA'd by the grabber into revoked (and, with
+    the IOMMU on, unmapped) memory - the suspected trigger of the fatal PCIe
+    machine checks on Disconnect + Connect. So, in this order:
+
+    1. the camera's AcquisitionStop, executed here first;
+    2. fetch and requeue with short timeouts until no buffer has arrived for
+       max(QUIESCE_FRAME_PERIODS frame periods, QUIESCE_MIN_QUIET_S) and
+       AcquisitionStatus (if the camera has it) reads false - at most
+       QUIESCE_MAX_S in total;
+    3. ia.stop(): data stream stop, flush, revoke;
+    4. with *destroy*: QUIESCE_SETTLE_S of settle time, then ia.destroy().
+
+    Every step is logged at INFO with its timing and the log is fsynced.
+    Never raises. The one path for every stop and teardown of an
+    ImageAcquirer (pause, disconnect, AOI change, recording end, app exit,
+    the standalone scripts). The caller must have stopped every thread that
+    fetches from *ia*.
+
+    Args:
+        ia (ImageAcquirer | None): The camera; None does nothing.
+        destroy (bool): Destroy it afterwards (closes stream and device).
+    """
+    if ia is None:
+        return
+    with IA_LOCK:
+        began = time.monotonic()
+        try:
+            acquiring = bool(ia.is_acquiring())
+        except Exception:
+            acquiring = True  # unknown: take the careful path
+        if acquiring:
+            try:
+                nodes = ia.remote_device.node_map
+            except Exception:
+                nodes = None
+            period = _frame_period_s(nodes) if nodes is not None else None
+            quiet = max(QUIESCE_FRAME_PERIODS * (period or 0.0), QUIESCE_MIN_QUIET_S)
+            step = time.monotonic()
+            try:
+                nodes.AcquisitionStop.execute()
+                logging.info(f"quiesce: camera AcquisitionStop executed ({time.monotonic() - step:.3f} s)")
+            except Exception as e:
+                logging.info(f"quiesce: no camera AcquisitionStop ({type(e).__name__}: {e})")
+            sync_log()
+            step = time.monotonic()
+            complete, incomplete, capped = _drain(ia, nodes, quiet, began + QUIESCE_MAX_S)
+            frame = "unknown" if period is None else f"{period:.4f} s"
+            message = (
+                f"quiesce: drained {complete} buffer(s) + {incomplete} incomplete in "
+                f"{time.monotonic() - step:.3f} s (quiet period {quiet:.3f} s, frame period {frame})"
+            )
+            if capped:
+                logging.warning(f"{message}; still not quiet after {QUIESCE_MAX_S:g} s, stopping anyway")
+            else:
+                logging.info(message)
+        else:
+            logging.info("quiesce: not acquiring, nothing to drain")
+        step = time.monotonic()
+        try:
+            ia.stop()
+            logging.info(f"quiesce: stream stopped, buffers revoked ({time.monotonic() - step:.3f} s)")
+        except Exception as e:
+            logging.warning(f"quiesce: ia.stop() failed: {e}")
+        sync_log()
+        if destroy:
+            time.sleep(QUIESCE_SETTLE_S)
+            step = time.monotonic()
+            try:
+                ia.destroy()
+                logging.info(
+                    f"quiesce: destroyed after {QUIESCE_SETTLE_S:g} s settle "
+                    f"({time.monotonic() - step:.3f} s)"
+                )
+            except Exception as e:
+                logging.warning(f"quiesce: ia.destroy() failed: {e}")
+        logging.info(f"quiesce: done in {time.monotonic() - began:.3f} s")
+    sync_log()
+
+
+class StartRefused(RuntimeError):
+    """Acquisition was not started: the frame grabber disagrees with the camera."""
+
+
+def check_start(ia: ImageAcquirer) -> tuple[bool, str]:
+    """Whether *ia* may start: the grabber and stream buffers fit the camera.
+
+    harvesters sizes the buffers it announces on start() from the data
+    stream's payload_size whenever the stream defines one, and the grabber
+    lays frames out by its own Width/Height - both latched when the device
+    was opened. A camera frame larger than that is a DMA overrun (the
+    suspected cause of the fatal PCIe errors); a smaller one gives timeouts
+    or frames of the wrong geometry. Refused when:
+
+    - the grabber (GenTL device module) has Width/Height nodes and they
+      differ from the camera's Width/Height;
+    - a stream's payload_size is smaller than the camera's PayloadSize.
+
+    Producers without grabber nodes (TLSimu, GigE, USB3) skip the first
+    check. Logs ``start check: camera WxH payload P, grabber WxH, stream
+    payload S -> OK/REFUSED`` and fsyncs the log.
+
+    Returns:
+        tuple[bool, str]: (may start, that log line).
+    """
+    with IA_LOCK:
+        cam_w, cam_h, cam_payload = camera_size(ia)
+        try:
+            grabber_nodes = ia.device.node_map
+        except Exception:
+            grabber_nodes = None
+        grabber = (
+            (_read_int(grabber_nodes, "Width"), _read_int(grabber_nodes, "Height"))
+            if grabber_nodes is not None
+            else (None, None)
+        )
+        payloads = []
+        try:
+            streams = list(ia.data_streams)
+        except Exception:
+            streams = []
+        for stream in streams:
+            try:
+                if stream.defines_payload_size():
+                    payloads.append(int(stream.payload_size))
+            except Exception as e:
+                logging.warning(f"start check: stream payload size unreadable: {e}")
+    problems = []
+    for axis, got, want in (("Width", grabber[0], cam_w), ("Height", grabber[1], cam_h)):
+        if got is not None and got != want:
+            problems.append(f"grabber {axis} {got} != camera {axis} {want}")
+    for payload in payloads:
+        if cam_payload is not None and payload < cam_payload:
+            problems.append(f"stream payload {payload} < camera PayloadSize {cam_payload}")
+
+    def dash(value):
+        return "-" if value is None else value
+
+    grabber_text = "-" if grabber == (None, None) else f"{dash(grabber[0])}x{dash(grabber[1])}"
+    stream_text = "/".join(str(p) for p in payloads) or "-"
+    line = (
+        f"start check: camera {dash(cam_w)}x{dash(cam_h)} payload {dash(cam_payload)}, "
+        f"grabber {grabber_text}, stream payload {stream_text} -> "
+        + ("OK" if not problems else f"REFUSED ({'; '.join(problems)})")
+    )
+    (logging.info if not problems else logging.error)(line)
+    sync_log()
+    return not problems, line
+
+
+def start_acquisition(ia: ImageAcquirer) -> None:
+    """Start acquisition, but only after check_start has passed.
+
+    The one way anything in this code base starts an ImageAcquirer.
+
+    Raises:
+        StartRefused: the check failed; nothing was started.
+    """
+    with IA_LOCK:
+        ok, line = check_start(ia)
+        if not ok:
+            raise StartRefused(
+                f"Acquisition not started: the frame grabber is not set up for the "
+                f"camera's image size. {line}"
+            )
+        ia.start()
 
 
 # A recording (or a loaded file) may use at most this share of the RAM that is
@@ -1035,7 +1465,9 @@ def record_harvester_frames(
     # fetch() interleave with them (see ui.on_btn_acquire_clicked). IA_LOCK is
     # reentrant, so _harvester_frame_into's own per-frame lock nests fine here.
     with IA_LOCK:
-        ia.start()
+        # Checked: refused (StartRefused) when the frame grabber was set up
+        # for another image size than the camera's.
+        start_acquisition(ia)
         try:
             for i in trange(n_frames):
                 incomplete += _harvester_frame_into(ia, frames[i])
@@ -1058,10 +1490,9 @@ def record_harvester_frames(
             # Stop on every exit, including a fetch timeout. A camera left
             # acquiring keeps filling buffers nobody drains, and the next
             # start() would then run against an already-started device.
-            try:
-                ia.stop()
-            except Exception as e:
-                logging.warning(f"Error stopping camera after recording: {e}")
+            # Quiesced: the frames still in flight are drained before the
+            # buffers are revoked. Never raises.
+            quiesce_and_stop(ia, destroy=False)
     if incomplete:
         logging.warning(
             f"{incomplete} incomplete frame(s) were dropped by the producer during "
@@ -1272,16 +1703,17 @@ def set_resolution(
 ) -> tuple[int | None, int | None, int | None, int | None]:
     """Set the camera AOI (Width/Height and sensor offsets) on a stopped camera.
 
-    Callers write it to a freshly created ImageAcquirer before its first start
-    (see MainWindow._apply_aoi and aoi_probe.py). harvesters keeps the data
-    stream open from create() to destroy() and sizes the buffers it announces
-    on start() from the stream's own payload size, which a frame grabber need
-    not update after a camera-side AOI write. The old stop -> write -> start
-    on the same ImageAcquirer gave a black live view on the Active Silicon
-    CoaXPress rig, and fatal PCIe machine checks followed. A camera that is
-    acquiring is therefore refused, never stopped and restarted here. Values
-    are snapped to each node's increment and clamped to [min, max]; nodes the
-    camera does not expose (e.g. offsets on TLSimu) are skipped.
+    Only half of an AOI change: a frame grabber takes the camera's image
+    size over when the device is opened, and harvesters sizes the buffers it
+    announces on start() from the stream's payload size, which a grabber
+    does not update after a camera-side write. So the camera must be
+    re-opened between this write and the next start - see change_aoi (the
+    GUI, aoi_probe.py) and setup_cam, which check the grabber before any
+    start. The old stop -> write -> start on the same ImageAcquirer gave a
+    black live view on the Active Silicon CoaXPress rig, and fatal PCIe
+    machine checks followed; a camera that is acquiring is refused here.
+    Values are snapped to each node's increment and clamped to [min, max];
+    nodes the camera does not expose (e.g. offsets on TLSimu) are skipped.
 
     Args:
         ia (ImageAcquirer): The ImageAcquirer object; must not be acquiring.
@@ -1299,8 +1731,8 @@ def set_resolution(
     with IA_LOCK:
         if ia.is_acquiring():
             raise RuntimeError(
-                "The AOI is only written to a freshly opened, never started camera: "
-                "stop, destroy and re-create the ImageAcquirer first."
+                "The AOI is only written to a stopped camera, which is then "
+                "re-opened before it starts again (see change_aoi)."
             )
         nodes = ia.remote_device.node_map
         # SFNC couples each offset to its size (OffsetX + Width <= WidthMax).
