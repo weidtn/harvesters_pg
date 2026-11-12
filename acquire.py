@@ -8,8 +8,6 @@ import cam
 
 FPS = 1000
 T = 1
-PARTICLES = ""  # lab ids of the particle batches, comma-separated (optional)
-OBJECTIVE = ""  # lab id of the objective (optional)
 
 
 ctis = cam.load_cti_envvar()
@@ -30,7 +28,3 @@ with h5py.File(filename, "w") as f:
     f.create_dataset("frames", data=frames, compression="gzip", compression_opts=9)
     f.attrs["recording_id"] = str(uuid.uuid4())
     f.attrs["timestamp"] = timestamp  # start of the recording
-    if PARTICLES:
-        f.attrs["particles"] = PARTICLES
-    if OBJECTIVE:
-        f.attrs["objective"] = OBJECTIVE

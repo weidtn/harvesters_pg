@@ -1770,6 +1770,33 @@ class RecordingAndSavingTests(unittest.TestCase):
         self.assertEqual(metadata["fps"], 500)
         self.assertEqual(list(metadata["frame_counters"]), [1, 2, 3])
 
+    def test_resaving_a_loaded_recording_keeps_every_root_attribute(self):
+        import h5py
+
+        source = self.tmp / "lab.h5"
+        attrs = {
+            "recording_id": "L",
+            "timestamp": "20250101120000",
+            "particles": "M270-2024-03, M450-2023-01",
+            "objective": "OBJ-20x",
+            "operator": "someone",
+            "temperature_C": 21.5,
+            "n_wells": np.int64(96),
+            "roi_px": np.array([1, 2, 3, 4]),
+        }
+        with h5py.File(source, "w") as f:
+            f.create_dataset("frames", data=np.ones((2, 4, 4), np.uint8))
+            f.attrs.update(attrs)
+        with patch("ui.QtWidgets.QFileDialog.getOpenFileName", return_value=(str(source), "")):
+            self.window.open_file()
+        out = self.tmp / "again.h5"
+        self._save_as(out)
+        with h5py.File(out, "r") as f:
+            saved = dict(f.attrs)
+        self.assertEqual(sorted(saved), sorted(attrs))
+        for name, value in attrs.items():
+            np.testing.assert_array_equal(saved[name], value, err_msg=name)
+
     def test_cancelled_dialogs_change_nothing(self):
         window = self.window
         worker = MagicMock()
@@ -2321,7 +2348,7 @@ _AOI_SOURCE = "Coupled AOI camera"
 
 
 class RoiToolTests(unittest.TestCase):
-    """The AOI controls (Apply, ROI tool, Full sensor) and the connect, with a
+    """The AOI actions (Image size..., ROI tool, Full sensor) and the connect, with a
     mocked camera behind a frame grabber.
 
     The camera is connected through the real MainWindow/VideoThread/cam
@@ -2434,6 +2461,28 @@ class RoiToolTests(unittest.TestCase):
         window._update_aoi_controls()
         self._show_camera_frame()
 
+    def _enter_image_size(self, width, height):
+        """Settings > Image size...: check what the dialog offers, enter a size, OK."""
+        from PyQt6 import QtWidgets
+
+        offered = []
+
+        def accept(dialog):
+            offered.extend(
+                (sb.minimum(), sb.maximum(), sb.value()) for sb in (dialog.sb_width, dialog.sb_height)
+            )
+            dialog.sb_width.setValue(width)
+            dialog.sb_height.setValue(height)
+            return QtWidgets.QDialog.DialogCode.Accepted.value
+
+        with patch("ui.ImageSizeDialog.exec", new=accept):  # a method: gets the dialog
+            self.window.ui.actionImage_size.trigger()
+        return offered
+
+    def _aoi_actions(self):
+        ui = self.window.ui
+        return (ui.actionImage_size, ui.actionSelect_ROI, ui.actionFull_sensor)
+
     def _assert_disconnected_after_a_failed_change(self, box, *message_parts):
         window = self.window
         box.assert_called_once()
@@ -2445,8 +2494,8 @@ class RoiToolTests(unittest.TestCase):
         self.assertTrue(window.ui.cb_source.isEnabled())
         self.assertFalse(window.ui.pb_live.isEnabled())
         window._end_aoi_cooldown()
-        for button in (window.ui.pb_res_apply, window.ui.pb_roi, window.ui.pb_full_sensor):
-            self.assertFalse(button.isEnabled(), button.text())
+        for action in self._aoi_actions():
+            self.assertFalse(action.isEnabled(), action.text())
         self.assertIn("not applied", window.statusBar().currentMessage())
         self.save.assert_not_called()
         # Every camera opened has been destroyed, and none was left started.
@@ -2455,18 +2504,25 @@ class RoiToolTests(unittest.TestCase):
 
     def test_tool_is_offered_only_while_a_harvester_camera_is_live(self):
         import cv2
+        from PyQt6 import QtGui, QtWidgets
+
+        import ui
 
         window = self.window
         self._go_live(MagicMock(spec=cv2.VideoCapture))
-        self.assertFalse(window.ui.pb_roi.isEnabled(), "offered for an OpenCV camera")
+        self.assertFalse(window.ui.actionSelect_ROI.isEnabled(), "offered for an OpenCV camera")
         self._go_live(self.ia)
-        self.assertTrue(window.ui.pb_roi.isEnabled())
-        window.ui.pb_roi.setChecked(True)
+        self.assertTrue(window.ui.actionSelect_ROI.isEnabled())
+        window.ui.actionSelect_ROI.setChecked(True)
+        self.assertEqual(window.statusBar().currentMessage(), ui.ROI_HINT)
+        # Leaving a hovered menu entry clears the status bar; not the hint.
+        QtWidgets.QApplication.sendEvent(window.menuBar(), QtGui.QStatusTipEvent(""))
+        self.assertEqual(window.statusBar().currentMessage(), ui.ROI_HINT)
         self.assertEqual(window.Image.getView().state["mouseEnabled"], [False, False])
         # Pausing (also what recording and File > Open do first) leaves ROI mode.
         window.pause_video()  # videothread is a MagicMock: stop() returns at once
-        self.assertFalse(window.ui.pb_roi.isEnabled())
-        self.assertFalse(window.ui.pb_roi.isChecked())
+        self.assertFalse(window.ui.actionSelect_ROI.isEnabled())
+        self.assertFalse(window.ui.actionSelect_ROI.isChecked())
         self.assertEqual(window.Image.getView().state["mouseEnabled"], [True, True])
 
     def test_connect_with_the_saved_aoi_already_on_the_camera_opens_once(self):
@@ -2492,7 +2548,7 @@ class RoiToolTests(unittest.TestCase):
         self.assertLess(self.events.index(("ia1", "destroy")), self.events.index(("ia2", "open")))
         self.assertEqual(self.events[-1], ("ia2", "start"))
         self.assertEqual(self._grabber(window.videothread.cap), (304, 260))
-        self.assertEqual((window.ui.sb_res_width.value(), window.ui.sb_res_height.value()), (304, 260))
+        self.assertEqual(window.ui.lbl_aoi.text(), "304 × 260 @ (752, 392)")
 
     def test_live_aoi_change_writes_the_stopped_camera_then_reopens_once(self):
         window = self.window
@@ -2531,22 +2587,23 @@ class RoiToolTests(unittest.TestCase):
         self.assertEqual(
             self.save.call_args.args[1], {"width": 304, "height": 260, "offset_x": 752, "offset_y": 392}
         )
-        self.assertEqual((window.ui.sb_res_width.value(), window.ui.sb_res_height.value()), (304, 260))
+        self.assertEqual(window.ui.lbl_aoi.text(), "304 × 260 @ (752, 392)")
         # One change at a time: during the cooldown nothing re-opens the camera.
-        for button in (window.ui.pb_res_apply, window.ui.pb_roi, window.ui.pb_full_sensor):
-            self.assertFalse(button.isEnabled(), button.text())
+        for action in self._aoi_actions():
+            self.assertFalse(action.isEnabled(), action.text())
         window._apply_aoi(2336, 1728, 0, 0)
         self.assertEqual(self.opened, ["ia1", "ia2"], "a second change re-opened the camera")
         window._end_aoi_cooldown()
-        for button in (window.ui.pb_res_apply, window.ui.pb_roi, window.ui.pb_full_sensor):
-            self.assertTrue(button.isEnabled(), button.text())
+        for action in self._aoi_actions():
+            self.assertTrue(action.isEnabled(), action.text())
 
     def test_paused_aoi_change_needs_no_second_apply(self):
         window = self.window
         self._connect(live=False)
-        window.ui.sb_res_width.setValue(512)
-        window.ui.sb_res_height.setValue(256)
-        window.ui.pb_res_apply.click()  # Apply: size only, offsets stay
+        offered = self._enter_image_size(512, 256)  # size only, offsets stay
+        # Ranges read when the dialog opens: up to the sensor, not the room
+        # the current offset leaves.
+        self.assertEqual([o[1:] for o in offered], [(2336, 1024), (1728, 512)])
         self.assertEqual(
             self.events,
             [
@@ -2669,7 +2726,7 @@ class RoiToolTests(unittest.TestCase):
         # x is the frame's column, y its row: the view shows 1024 x 512.
         item = window.Image.getImageItem()
         self.assertEqual((item.width(), item.height()), (1024, 512))
-        window.ui.pb_roi.setChecked(True)
+        window.ui.actionSelect_ROI.setChecked(True)
         with patch("cam.set_resolution", wraps=cam.set_resolution) as set_resolution:
             # Dragged from bottom-right to top-left.
             window._roi_overlay.sigBoxFinished.emit(401.0, 300.0, 100.5, 40.0)
@@ -2678,7 +2735,7 @@ class RoiToolTests(unittest.TestCase):
         # stopped camera, before the re-open.
         set_resolution.assert_called_once_with(old, 304, 260, 752, 392)
         self.assertEqual(self.state, {"Width": 304, "Height": 260, "OffsetX": 752, "OffsetY": 392})
-        self.assertFalse(window.ui.pb_roi.isChecked(), "ROI mode is one-shot")
+        self.assertFalse(window.ui.actionSelect_ROI.isChecked(), "ROI mode is one-shot")
         self.assertEqual(window._autorange_shape, (260, 304))
         window.update_image(np.zeros((260, 304), np.uint8))
         self.assertIsNone(window._autorange_shape, "the view re-fits once at the new size")
@@ -2686,10 +2743,10 @@ class RoiToolTests(unittest.TestCase):
     def test_click_and_stale_frame_change_nothing(self):
         window = self.window
         self._go_live(self.ia)
-        window.ui.pb_roi.setChecked(True)
+        window.ui.actionSelect_ROI.setChecked(True)
         with patch("ui.cam.set_resolution") as set_resolution:
             window.on_roi_box(10.0, 10.0, 10.5, 10.5)  # a click, not a box
-            self.assertTrue(window.ui.pb_roi.isChecked())
+            self.assertTrue(window.ui.actionSelect_ROI.isChecked())
             # A frame of the previous AOI still on screen: its offsets are unknown.
             window.update_image(np.zeros((480, 640), np.uint8))
             window.on_roi_box(10.0, 10.0, 200.0, 200.0)
@@ -2699,7 +2756,7 @@ class RoiToolTests(unittest.TestCase):
     def test_full_sensor_restores_the_whole_sensor(self):
         window = self.window
         self._connect(live=True)
-        window.ui.pb_full_sensor.click()
+        window.ui.actionFull_sensor.trigger()
         self.assertEqual(self.state, {"Width": 2336, "Height": 1728, "OffsetX": 0, "OffsetY": 0})
         self.assertEqual(self._grabber(window.videothread.cap), (2336, 1728))
         self.assertEqual(

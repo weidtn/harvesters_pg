@@ -176,6 +176,51 @@ class RoiDragOverlay(pg.GraphicsObject):
         self._label.setVisible(True)
 
 
+class ImageSizeDialog(QtWidgets.QDialog):
+    """Settings > Image size / ROI > Image size...: Width x Height of the AOI.
+
+    The ranges come from the camera when the dialog opens: the minimum is the
+    Width/Height node's, the maximum the sensor extent (not the node's max,
+    which is the room the current offset leaves).
+    """
+
+    def __init__(
+        self,
+        limits: cam.AoiLimits,
+        size: tuple[int, int],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Image size")
+        self.sb_width = QtWidgets.QSpinBox()
+        self.sb_height = QtWidgets.QSpinBox()
+        for sb, axis, value in (
+            (self.sb_width, limits.x, size[0]),
+            (self.sb_height, limits.y, size[1]),
+        ):
+            sb.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+            sb.setRange(axis.size_min, max(axis.sensor, value))
+            sb.setValue(value)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.sb_width)
+        row.addWidget(QtWidgets.QLabel(text="×"))
+        row.addWidget(self.sb_height)
+        row.addWidget(QtWidgets.QLabel(text="px"))
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(row)
+        layout.addWidget(buttons)
+
+
+# Status-bar hint while ROI mode is active.
+ROI_HINT = "Drag a box on the live view to set the camera ROI, Esc to cancel"
+
+
 class SettingsWindow(QtWidgets.QMainWindow):
     """Settings window to change camera settings.
 
@@ -651,49 +696,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.lbl_black_level_min.setToolTip(self.ui.hsli_black_level.toolTip())
         self.ui.lbl_black_level_max.setToolTip(self.ui.hsli_black_level.toolTip())
 
-        # Resolution (AOI) row in the settings panel. Apply, the ROI tool and
-        # Full sensor all go through _apply_aoi, which re-opens the camera to
-        # write the AOI before a first start, and persists the chosen size for
-        # the next connect.
-        self.ui.lbl_resolution = QtWidgets.QLabel(text="Image Size [px]")
-        self.ui.sb_res_width = QtWidgets.QSpinBox()
-        self.ui.sb_res_width.setButtonSymbols(
-            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
-        )
-        self.ui.lbl_res_x = QtWidgets.QLabel(text="×")
-        self.ui.sb_res_height = QtWidgets.QSpinBox()
-        self.ui.sb_res_height.setButtonSymbols(
-            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
-        )
-        self.ui.pb_res_apply = QtWidgets.QPushButton(text="Apply")
-        self.ui.pb_res_apply.setDisabled(True)  # until a Harvester camera connects
+        # Image size / ROI, under the Settings menu. Select ROI, Full sensor
+        # and Image size... all go through _apply_aoi, which re-opens the
+        # camera to write the AOI before a first start, and persists the chosen
+        # size for the next connect. All three stay disabled until a Harvester
+        # camera connects (see _update_aoi_controls).
+        self.ui.menuImageSize = self.ui.menuSettings.addMenu("Image size / ROI")
         # ROI tool: drag a box over the live view, and the camera reads out
-        # only that region (applied through the same path as Apply).
-        self.ui.pb_roi = QtWidgets.QPushButton(text="Select ROI")
-        self.ui.pb_roi.setCheckable(True)
-        self.ui.pb_roi.setDisabled(True)  # only while a Harvester camera is live
-        self.ui.pb_roi.setToolTip(
+        # only that region.
+        self.ui.actionSelect_ROI = QtGui.QAction("Select ROI on live view", self)
+        self.ui.actionSelect_ROI.setCheckable(True)
+        self.ui.actionSelect_ROI.setShortcut(QtGui.QKeySequence("Ctrl+R"))
+        self.ui.actionSelect_ROI.setToolTip(
             "Drag a box over the live view; the camera then reads out only that "
             "region (snapped to its AOI grid). Esc cancels."
         )
-        self.ui.pb_full_sensor = QtWidgets.QPushButton(text="Full sensor")
-        self.ui.pb_full_sensor.setDisabled(True)  # until a Harvester camera connects
-        self.ui.pb_full_sensor.setToolTip("Read out the whole sensor again (offsets 0).")
-        self.ui.hLay_resolution = QtWidgets.QHBoxLayout()
-        for widget in (
-            self.ui.lbl_resolution,
-            self.ui.sb_res_width,
-            self.ui.lbl_res_x,
-            self.ui.sb_res_height,
-            self.ui.pb_res_apply,
-            self.ui.pb_roi,
-            self.ui.pb_full_sensor,
+        self.ui.actionFull_sensor = QtGui.QAction("Full sensor", self)
+        self.ui.actionFull_sensor.setToolTip("Read out the whole sensor again (offsets 0).")
+        self.ui.actionImage_size = QtGui.QAction("Image size…", self)
+        for action in (
+            self.ui.actionSelect_ROI,
+            self.ui.actionFull_sensor,
+            self.ui.actionImage_size,
         ):
-            self.ui.hLay_resolution.addWidget(widget)
-        self.ui.vLay_settings.addLayout(self.ui.hLay_resolution)
-        self.ui.pb_res_apply.clicked.connect(self.on_resolution_apply)
-        self.ui.pb_roi.toggled.connect(self.on_roi_toggled)
-        self.ui.pb_full_sensor.clicked.connect(self.on_full_sensor)
+            action.setEnabled(False)
+            self.ui.menuImageSize.addAction(action)
+        # Ctrl+R works with the menu closed too.
+        self.addAction(self.ui.actionSelect_ROI)
+        self.ui.menuImageSize.setToolTipsVisible(True)
+        self.ui.actionSelect_ROI.toggled.connect(self.on_roi_toggled)
+        self.ui.actionFull_sensor.triggered.connect(self.on_full_sensor)
+        self.ui.actionImage_size.triggered.connect(self.on_image_size)
+        # The camera's current AOI, kept in the status bar.
+        self.ui.lbl_aoi = QtWidgets.QLabel()
+        self.ui.lbl_aoi.setToolTip("Camera image size (AOI) @ (OffsetX, OffsetY)")
+        self.statusBar().addPermanentWidget(self.ui.lbl_aoi)
         self._roi_overlay = RoiDragOverlay(self.Image.getImageItem())
         self._roi_overlay.setVisible(False)
         self._roi_overlay.describe = self._describe_roi_box
@@ -702,30 +739,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.Image.getView().addItem(self._roi_overlay, ignoreBounds=True)
         self._roi_escape = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Escape), self)
         self._roi_escape.setEnabled(False)
-        self._roi_escape.activated.connect(lambda: self.ui.pb_roi.setChecked(False))
+        self._roi_escape.activated.connect(lambda: self.ui.actionSelect_ROI.setChecked(False))
         # Camera AOI constraints and AOI, read when ROI mode starts; used for
         # the live preview of the AOI the box will become.
         self._roi_aoi: tuple[cam.AoiLimits, tuple[int, int, int, int]] | None = None
-
-        # Lab ids of the particles and of the objective, saved with every
-        # recording (attributes particles and objective); NOMAD links them to
-        # the inventory entries with these ids. Next to the frames/seconds rows.
-        self.ui.le_particles = QtWidgets.QLineEdit()
-        self.ui.le_particles.setPlaceholderText("e.g. M270-2024-03, M450-2023-01")
-        self.ui.le_particles.setToolTip(
-            "Lab ids of the particle batches in the recording, comma-separated "
-            "(optional). Saved with each recording as attribute 'particles'."
-        )
-        self.ui.le_objective = QtWidgets.QLineEdit()
-        self.ui.le_objective.setPlaceholderText("e.g. OBJ-20x")
-        self.ui.le_objective.setToolTip(
-            "Lab id of the objective (optional). Saved with each recording as "
-            "attribute 'objective'."
-        )
-        self.ui.form_inventory = QtWidgets.QFormLayout()
-        self.ui.form_inventory.addRow("Particles", self.ui.le_particles)
-        self.ui.form_inventory.addRow("Objective", self.ui.le_objective)
-        self.ui.horizontalLayout_4.insertLayout(1, self.ui.form_inventory)
 
         self.populate_video_sources()
 
@@ -787,6 +804,21 @@ class MainWindow(QtWidgets.QMainWindow):
             index = self.ui.cb_source.findText(previous)
             if index != -1:
                 self.ui.cb_source.setCurrentIndex(index)
+
+    def event(self, event: QtCore.QEvent) -> bool:
+        """Keep the ROI hint in the status bar while ROI mode is active.
+
+        Hovering a menu entry (Settings > Image size / ROI, say) clears the
+        status bar when the pointer leaves it.
+        """
+        if (
+            event.type() == QtCore.QEvent.Type.StatusTip
+            and not event.tip()
+            and self.ui.actionSelect_ROI.isChecked()
+        ):
+            self.statusBar().showMessage(ROI_HINT)
+            return True
+        return super().event(event)
 
     def closeEvent(self, event) -> None:
         """Orderly stop the camera before the window closes.
@@ -957,6 +989,7 @@ class MainWindow(QtWidgets.QMainWindow):
             spinbox.setEnabled(True)
         self.profile = camera_profiles.SFNC_DEFAULT
         self.ui.pb_settings.setDisabled(True)
+        self._show_aoi(None)
 
     def _hold_until_released(self, worker: VideoThread) -> None:
         """Keep camera access closed until a stuck worker has really exited.
@@ -1152,9 +1185,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ui.pb_acquire,
             self.ui.pb_connect,
             self.ui.pb_live,
-            self.ui.pb_res_apply,
-            self.ui.pb_roi,
-            self.ui.pb_full_sensor,
+            self.ui.actionSelect_ROI,
+            self.ui.actionFull_sensor,
+            self.ui.actionImage_size,
             self.ui.pb_settings,
             self.ui.pb_save,
             self.ui.pb_save_frame,
@@ -1271,7 +1304,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filename = "."
 
     def _metadata_for_saving(self) -> dict:
-        """The recording's own metadata plus its identity and the lab ids."""
+        """The recording's own metadata plus its identity.
+
+        Every attribute of a loaded file is kept as it was.
+        """
         if self.recording_id is None:  # loaded from a file saved without an id
             self.recording_id = str(uuid.uuid4())
         metadata = dict(self.recording_metadata)
@@ -1279,18 +1315,6 @@ class MainWindow(QtWidgets.QMainWindow):
         metadata["timestamp"] = (
             self.recording_timestamp or datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         )
-        # The fields win (open_file shows a loaded file's values there), so an
-        # id the user cleared is dropped instead of resurrected from the file.
-        metadata.pop("particles", None)
-        metadata.pop("objective", None)
-        particles = ", ".join(
-            p.strip() for p in self.ui.le_particles.text().split(",") if p.strip()
-        )
-        if particles:
-            metadata["particles"] = particles
-        objective = self.ui.le_objective.text().strip()
-        if objective:
-            metadata["objective"] = objective
         return metadata
 
     def save(self) -> None:
@@ -1525,39 +1549,45 @@ class MainWindow(QtWidgets.QMainWindow):
             self.on_analog_gain_changed()  # push the manual value again
 
     def setup_resolution_settings(self) -> None:
-        """Populate the resolution row from a freshly connected camera.
+        """Show the AOI of a freshly connected camera; enable the AOI actions.
 
         Read-only: the AOI saved by an earlier session has already been
         written (and the frame grabber re-opened for it) by cam.setup_cam.
         """
-        ia = self.videothread.cap
-        node_map = ia.remote_device.node_map
-        for sb, node_name, offset_name in (
-            (self.ui.sb_res_width, "Width", "OffsetX"),
-            (self.ui.sb_res_height, "Height", "OffsetY"),
-        ):
-            try:
-                node = getattr(node_map, node_name)
-                sb.setMinimum(int(node.min))
-                # Not node.max: that is the room the current offset leaves.
-                sb.setMaximum(cam.sensor_extent(node_map, node_name, offset_name))
-                sb.setDisabled(False)
-            except Exception as e:
-                logging.warning(f"Resolution {node_name} not available: {e}")
-                sb.setDisabled(True)
         try:
-            self.ui.sb_res_width.setValue(int(node_map.Width.value))
-            self.ui.sb_res_height.setValue(int(node_map.Height.value))
+            _, aoi = cam.read_aoi(self.videothread.cap)
         except Exception as e:
             logging.warning(f"Could not read resolution: {e}")
+            aoi = None
+        self._show_aoi(aoi)
         self._update_aoi_controls()
 
-    def on_resolution_apply(self) -> None:
-        """Apply the Width x Height from the settings panel to the camera."""
-        if self._harvester_cap() is None:
-            logging.debug("Resolution apply requires a Harvester camera")
+    def _show_aoi(self, aoi: tuple[int, int, int, int] | None) -> None:
+        """Show the camera's (width, height, offset_x, offset_y) in the status bar."""
+        if aoi is None:
+            self.ui.lbl_aoi.clear()
             return
-        self._apply_aoi(self.ui.sb_res_width.value(), self.ui.sb_res_height.value())
+        w, h, ox, oy = aoi
+        self.ui.lbl_aoi.setText(f"{w} × {h} @ ({ox}, {oy})")
+
+    def on_image_size(self) -> None:
+        """Settings > Image size...: apply the Width x Height entered in a dialog."""
+        ia = self._harvester_cap()
+        if ia is None:
+            logging.debug("Image size requires a Harvester camera")
+            return
+        try:
+            limits, (width, height, _, _) = cam.read_aoi(ia)
+        except Exception as e:
+            logging.warning(f"Cannot read the camera AOI: {e}")
+            QtWidgets.QMessageBox.warning(
+                self, "Image size", f"The camera AOI could not be read:\n\n{e}"
+            )
+            return
+        dialog = ImageSizeDialog(limits, (width, height), self)
+        if not dialog.exec():
+            return  # cancelled
+        self._apply_aoi(dialog.sb_width.value(), dialog.sb_height.value())
 
     def _apply_aoi(
         self,
@@ -1568,7 +1598,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Apply an AOI to the connected Harvester camera and persist it.
 
-        The one path for Apply, the ROI tool and Full sensor, and one action
+        The one path for Image size..., the ROI tool and Full sensor, and one action
         for the user: the connection stays shown as connected, the camera
         controls are disabled while it runs, and live view resumes by itself
         if it was live (paused stays paused). Underneath, VideoThread.change_aoi
@@ -1671,10 +1701,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         ox = ox if limits.x.has_offset else None
         oy = oy if limits.y.has_offset else None
-        for sb, value in ((self.ui.sb_res_width, w), (self.ui.sb_res_height, h)):
-            # The range read on connect is the room the offset left back then.
-            sb.setMaximum(max(sb.maximum(), value))
-            sb.setValue(value)
+        self._show_aoi((w, h, ox or 0, oy or 0))
         self._autorange_shape = (h, w)
         resolution = {"width": w, "height": h, "offset_x": ox, "offset_y": oy}
         try:
@@ -1733,11 +1760,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_aoi_controls(self) -> None:
         """Enable the AOI controls only while allowed; leave ROI mode otherwise."""
         allowed = self._roi_allowed()
-        if not allowed and self.ui.pb_roi.isChecked():
-            self.ui.pb_roi.setChecked(False)  # -> on_roi_toggled(False)
-        self.ui.pb_roi.setEnabled(allowed)
-        for button in (self.ui.pb_res_apply, self.ui.pb_full_sensor):
-            button.setEnabled(self._aoi_allowed())
+        if not allowed and self.ui.actionSelect_ROI.isChecked():
+            self.ui.actionSelect_ROI.setChecked(False)  # -> on_roi_toggled(False)
+        self.ui.actionSelect_ROI.setEnabled(allowed)
+        for action in (self.ui.actionImage_size, self.ui.actionFull_sensor):
+            action.setEnabled(self._aoi_allowed())
 
     def on_roi_toggled(self, checked: bool) -> None:
         """Enter or leave ROI mode, in which a left drag selects the camera AOI."""
@@ -1750,14 +1777,12 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 logging.warning(f"Cannot select an ROI: {e}")
                 self.statusBar().showMessage(f"Cannot select an ROI: {e}", 10000)
-                self.ui.pb_roi.setChecked(False)
+                self.ui.actionSelect_ROI.setChecked(False)
                 return
             view.setMouseEnabled(False, False)  # no pan/zoom while selecting
             self._roi_overlay.setVisible(True)
             self._roi_escape.setEnabled(True)
-            self.statusBar().showMessage(
-                "Drag a box over the live view to read out only that region; Esc cancels."
-            )
+            self.statusBar().showMessage(ROI_HINT)
         else:
             self._roi_overlay.cancel()
             self._roi_overlay.setVisible(False)
@@ -1797,11 +1822,11 @@ class MainWindow(QtWidgets.QMainWindow):
             x0, y0, x1, y1 (float): The box corners in pixels of the displayed
                 frame (x = column, y = row), in drag order.
         """
-        if not self.ui.pb_roi.isChecked():
+        if not self.ui.actionSelect_ROI.isChecked():
             return
         shape = self._live_frame_shape()
         if not self._roi_allowed() or shape is None:
-            self.ui.pb_roi.setChecked(False)
+            self.ui.actionSelect_ROI.setChecked(False)
             return
         if abs(x1 - x0) < 2 or abs(y1 - y0) < 2:
             # A click, not a box: keep the AOI and stay in ROI mode.
@@ -1812,7 +1837,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             logging.warning(f"Cannot read the camera AOI: {e}")
             self.statusBar().showMessage(f"Cannot read the camera AOI: {e}", 10000)
-            self.ui.pb_roi.setChecked(False)
+            self.ui.actionSelect_ROI.setChecked(False)
             return
         if shape != (height, width):
             # The offsets describe the camera's AOI, not the frame on screen.
@@ -1827,7 +1852,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"ROI ({x0:.1f}, {y0:.1f})-({x1:.1f}, {y1:.1f}) on {width}x{height} "
             f"at ({offset_x}, {offset_y}) -> AOI {aoi}"
         )
-        self.ui.pb_roi.setChecked(False)
+        self.ui.actionSelect_ROI.setChecked(False)
         self._apply_aoi(*aoi)
 
     def on_full_sensor(self) -> None:
@@ -1877,16 +1902,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.metadata = metadata
         self.recording_id = metadata.get("recording_id")
         self.recording_timestamp = metadata.get("timestamp")
-        # The file's own metadata goes with it when it is saved again, instead
-        # of the connected camera's attributes and the last recording's
-        # timestamps.
+        # The file's own metadata goes with it, unchanged, when it is saved
+        # again, instead of the connected camera's attributes and the last
+        # recording's timestamps.
         self.recording_metadata = {
             k: v for k, v in metadata.items() if k not in ("recording_id", "timestamp")
         }
-        # Show the loaded recording's own values, so that saving it again
-        # keeps them and does not stamp it with another recording's.
-        self.ui.le_particles.setText(str(metadata.get("particles", "")))
-        self.ui.le_objective.setText(str(metadata.get("objective", "")))
         self.update_image(self.recording)
         self.filename = filename
         self.ui.pb_save.setDisabled(False)
